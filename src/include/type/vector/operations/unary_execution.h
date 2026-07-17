@@ -50,6 +50,20 @@ struct GenericUnaryWrapper {
 };
 
 /**
+ * @brief Like GenericUnaryWrapper, but also hands the row index to the op.
+ *
+ * A cast needs the index so that a per-row conversion failure can clear that row's validity
+ * bit in the result — turning the failed row into a genuine NULL rather than a plausible
+ * NullValue<RESULT_TYPE>() sentinel.
+ */
+struct GenericUnaryWrapperWithIndex {
+  template <class OP, class INPUT_TYPE, class RESULT_TYPE>
+  static inline auto Operation(INPUT_TYPE input, idx_t idx, void *dataptr) -> RESULT_TYPE {
+    return OP::template Operation<INPUT_TYPE, RESULT_TYPE>(input, idx, dataptr);
+  }
+};
+
+/**
  * @brief Call a string operator, handing it the result Vector.
  *
  * A string result has to be written into the target's heap, so the operator needs the
@@ -352,6 +366,12 @@ struct UnaryExecution {
   template <class INPUT_TYPE, class RESULT_TYPE, class OP>
   static void GenericExecute(Vector &input, Vector &result, idx_t count, void *dataptr) {
     ExecuteStandard<INPUT_TYPE, RESULT_TYPE, GenericUnaryWrapper, OP>(input, result, count, dataptr);
+  }
+
+  /** @brief Like GenericExecute, but the OP also receives the row index. */
+  template <class INPUT_TYPE, class RESULT_TYPE, class OP>
+  static void GenericExecuteWithIndex(Vector &input, Vector &result, idx_t count, void *dataptr) {
+    ExecuteStandard<INPUT_TYPE, RESULT_TYPE, GenericUnaryWrapperWithIndex, OP>(input, result, count, dataptr);
   }
 
   /** @brief Apply a string-producing OP, handing it `result` so it can use its heap. */

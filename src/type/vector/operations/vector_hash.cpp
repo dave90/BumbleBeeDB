@@ -20,7 +20,20 @@ namespace bumblebee {
 namespace {
 
 /**
+ * @brief The hash of a NULL element, at any nesting level.
+ *
+ * A NULL row hashes to this fixed constant rather than to whatever bit pattern happens to
+ * sit in its (logically absent) data slot. That keeps two NULL keys colliding into the same
+ * hash bucket — the actual key equality is still decided separately by the comparison ops,
+ * which treat NULL correctly — and keeps [NULL] apart from an empty list. Distinct from the
+ * hash of any real element.
+ */
+constexpr hash_t NULL_HASH = UINT64_C(0x9e3779b97f4a7c15);
+
+/**
  * @brief Hash `count` rows, writing each hash at the row's own index.
+ *
+ * A row that is NULL according to `validity` hashes to NULL_HASH instead of its data slot.
  *
  * @tparam HAS_RSEL Whether only the rows named by `rsel` are to be hashed. Note the hash
  *         still lands at the SELECTED index, not at i — the caller reads the result
@@ -28,11 +41,12 @@ namespace {
  */
 template <bool HAS_RSEL, class T>
 inline void TightLoopHash(T *__restrict ldata, hash_t *__restrict rdata, const SelectionVector *rsel, idx_t count,
-                          const SelectionVector *__restrict lsel) {
+                          const SelectionVector *__restrict lsel, const ValidityMask *validity) {
+  const bool has_nulls = validity != nullptr && !validity->AllValid();
   for (idx_t i = 0; i < count; i++) {
     auto ridx = HAS_RSEL ? rsel->GetIndex(i) : i;
     auto lidx = lsel->GetIndex(ridx);
-    rdata[ridx] = Hash<T>(ldata[lidx]);
+    rdata[ridx] = (has_nulls && !validity->RowIsValid(lidx)) ? NULL_HASH : Hash<T>(ldata[lidx]);
   }
 }
 
@@ -42,9 +56,8 @@ inline void TemplatedLoopHash(Vector &input, Vector &result, const SelectionVect
     // One value, so one hash: the result stays a constant.
     result.SetVectorType(VectorType::CONSTANT_VECTOR);
 
-    auto *ldata = ConstantVector::GetData<T>(input);
     auto *result_data = ConstantVector::GetData<hash_t>(result);
-    *result_data = Hash<T>(*ldata);
+    *result_data = ConstantVector::IsNull(input) ? NULL_HASH : Hash<T>(*ConstantVector::GetData<T>(input));
   } else {
     result.SetVectorType(VectorType::FLAT_VECTOR);
 
@@ -52,7 +65,7 @@ inline void TemplatedLoopHash(Vector &input, Vector &result, const SelectionVect
     input.Orrify(count, idata);
 
     TightLoopHash<HAS_RSEL, T>(reinterpret_cast<T *>(idata.data_), FlatVector::GetData<hash_t>(result), rsel, count,
-                               idata.sel_);
+                               idata.sel_, idata.validity_);
   }
 }
 
@@ -64,9 +77,6 @@ inline void TemplatedLoopHash(Vector &input, Vector &result, const SelectionVect
  * collide, which a bare XOR would.
  */
 inline auto CombineHashScalar(hash_t a, hash_t b) -> hash_t { return (a * UINT64_C(0xbf58476d1ce4e5b9)) ^ b; }
-
-/** The hash of a NULL element inside a list. Distinct from the hash of any real element. */
-constexpr hash_t NESTED_NULL_HASH = UINT64_C(0x9e3779b97f4a7c15);
 
 /**
  * @brief Hash one row of any vector, recursing into a LIST / ARRAY element by element.
@@ -89,7 +99,7 @@ auto HashNestedRow(const Vector &vector, idx_t index) -> hash_t {
       throw NotImplementedException("hash: a nested vector cannot hold a sequence");
   }
   if (!vector.RowIsValid(index)) {
-    return NESTED_NULL_HASH;
+    return NULL_HASH;
   }
   switch (vector.GetType()) {
     case PhysicalType::TINYINT:
@@ -198,22 +208,24 @@ inline void HashTypeSwitch(Vector &input, Vector &result, const SelectionVector 
 template <bool HAS_RSEL, class T>
 inline void TightLoopCombineHashConstant(T *__restrict ldata, hash_t constant_hash, hash_t *__restrict hash_data,
                                          const SelectionVector *rsel, idx_t count,
-                                         const SelectionVector *__restrict lsel) {
+                                         const SelectionVector *__restrict lsel, const ValidityMask *validity) {
+  const bool has_nulls = validity != nullptr && !validity->AllValid();
   for (idx_t i = 0; i < count; i++) {
     auto ridx = HAS_RSEL ? rsel->GetIndex(i) : i;
     auto idx = lsel->GetIndex(ridx);
-    auto other_hash = Hash<T>(ldata[idx]);
+    auto other_hash = (has_nulls && !validity->RowIsValid(idx)) ? NULL_HASH : Hash<T>(ldata[idx]);
     hash_data[ridx] = CombineHashScalar(constant_hash, other_hash);
   }
 }
 
 template <bool HAS_RSEL, class T>
 inline void TightLoopCombineHash(T *__restrict ldata, hash_t *__restrict hash_data, const SelectionVector *rsel,
-                                 idx_t count, const SelectionVector *__restrict lsel) {
+                                 idx_t count, const SelectionVector *__restrict lsel, const ValidityMask *validity) {
+  const bool has_nulls = validity != nullptr && !validity->AllValid();
   for (idx_t i = 0; i < count; i++) {
     auto ridx = HAS_RSEL ? rsel->GetIndex(i) : i;
     auto idx = lsel->GetIndex(ridx);
-    auto other_hash = Hash<T>(ldata[idx]);
+    auto other_hash = (has_nulls && !validity->RowIsValid(idx)) ? NULL_HASH : Hash<T>(ldata[idx]);
     hash_data[ridx] = CombineHashScalar(hash_data[ridx], other_hash);
   }
 }
@@ -223,9 +235,8 @@ void TemplatedLoopCombineHash(Vector &input, Vector &hashes, const SelectionVect
   if (input.GetVectorType() == VectorType::CONSTANT_VECTOR &&
       hashes.GetVectorType() == VectorType::CONSTANT_VECTOR) {
     // Both sides are a single value, so the combination is too.
-    auto *ldata = ConstantVector::GetData<T>(input);
     auto *hash = ConstantVector::GetData<hash_t>(hashes);
-    auto other_hash = Hash<T>(*ldata);
+    auto other_hash = ConstantVector::IsNull(input) ? NULL_HASH : Hash<T>(*ConstantVector::GetData<T>(input));
     *hash = CombineHashScalar(*hash, other_hash);
     return;
   }
@@ -239,12 +250,13 @@ void TemplatedLoopCombineHash(Vector &input, Vector &hashes, const SelectionVect
     auto hash = *ConstantVector::GetData<hash_t>(hashes);
     hashes.SetVectorType(VectorType::FLAT_VECTOR);
     TightLoopCombineHashConstant<HAS_RSEL, T>(reinterpret_cast<T *>(idata.data_), hash,
-                                              FlatVector::GetData<hash_t>(hashes), rsel, count, idata.sel_);
+                                              FlatVector::GetData<hash_t>(hashes), rsel, count, idata.sel_,
+                                              idata.validity_);
     return;
   }
   BUMBLEBEE_ASSERT(hashes.GetVectorType() == VectorType::FLAT_VECTOR, "the hash accumulator must be flat");
   TightLoopCombineHash<HAS_RSEL, T>(reinterpret_cast<T *>(idata.data_), FlatVector::GetData<hash_t>(hashes), rsel,
-                                    count, idata.sel_);
+                                    count, idata.sel_, idata.validity_);
 }
 
 /** @brief Fold the hash of every row of a LIST / ARRAY vector into `hashes`. */

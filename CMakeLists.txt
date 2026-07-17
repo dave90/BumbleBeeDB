@@ -64,11 +64,16 @@ if(NOT MSVC)
     add_compile_options(-include ${CMAKE_SOURCE_DIR}/src/include/std_prelude.hpp)
 endif()
 
-# Enable AddressSanitizer only for Debug builds
+# Enable a sanitizer in Debug builds. Select with -DSANITIZER=address (default) or -DSANITIZER=thread.
+# AddressSanitizer and ThreadSanitizer are mutually exclusive, so pick one: ASan catches memory bugs,
+# TSan catches data races / deadlocks (the gate for the concurrency milestone). Release has none.
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    message(STATUS "Building with AddressSanitizer in Debug mode")
-    add_compile_options(-fsanitize=address -O0 -g -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
+    if(NOT DEFINED SANITIZER)
+        set(SANITIZER address)
+    endif()
+    message(STATUS "Building in Debug mode with -fsanitize=${SANITIZER}")
+    add_compile_options(-fsanitize=${SANITIZER} -O0 -g -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${SANITIZER})
 endif()
 
 # Third-party includes

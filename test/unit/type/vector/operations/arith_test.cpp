@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/config.h"
+#include "common/limits.h"
 #include "common/numeric_utils.h"
 #include "gtest/gtest.h"
 #include "null_test_base.h"
@@ -188,6 +189,111 @@ TEST_F(VectorOperationsArithTest, DecimalDivisionDifferentScales) {
     auto expected_raw = static_cast<int64_t>(num / den);
     EXPECT_EQ(Decimal::ToString(expected_raw, result_scale), out_str.GetValue(i).GetString())
         << "mismatch at index " << i;
+  }
+}
+
+// Plain integer division truncates toward zero — the decimal path has its own test, this
+// pins the ordinary integer case that had none.
+TEST_F(VectorOperationsArithTest, IntegerDivisionFlatVectors) {
+  std::vector<int32_t> num = {10, -10, 7, -7};
+  std::vector<int32_t> den = {3, 3, -2, -2};
+  Vector v1 = GenerateVector(PhysicalType::INTEGER, num);
+  Vector v2 = GenerateVector(PhysicalType::INTEGER, den);
+  Vector v3(PhysicalType::INTEGER);
+
+  VectorOperations::Division(v1, v2, v3, num.size());
+  for (idx_t i = 0; i < num.size(); i++) {
+    EXPECT_EQ(num[i] / den[i], v3.GetValue(i).GetAs<int32_t>()) << "row " << i;
+  }
+}
+
+// Integer modulo had zero coverage; it also truncates toward zero (the sign follows the
+// dividend).
+TEST_F(VectorOperationsArithTest, ModuloIntegerVectors) {
+  std::vector<int32_t> num = {10, -10, 17, -17};
+  std::vector<int32_t> den = {3, 3, 5, 5};
+  Vector v1 = GenerateVector(PhysicalType::INTEGER, num);
+  Vector v2 = GenerateVector(PhysicalType::INTEGER, den);
+  Vector v3(PhysicalType::INTEGER);
+
+  VectorOperations::Modulo(v1, v2, v3, num.size());
+  for (idx_t i = 0; i < num.size(); i++) {
+    EXPECT_EQ(num[i] % den[i], v3.GetValue(i).GetAs<int32_t>()) << "row " << i;
+  }
+}
+
+// Float modulo goes through std::fmod.
+TEST_F(VectorOperationsArithTest, ModuloFloatVectors) {
+  std::vector<float> num = {10.5F, -10.5F, 7.0F, 5.5F};
+  std::vector<float> den = {3.0F, 3.0F, 2.5F, 2.0F};
+  Vector v1 = GenerateVector(PhysicalType::FLOAT, num);
+  Vector v2 = GenerateVector(PhysicalType::FLOAT, den);
+  Vector v3(PhysicalType::FLOAT);
+
+  VectorOperations::Modulo(v1, v2, v3, num.size());
+  for (idx_t i = 0; i < num.size(); i++) {
+    EXPECT_FLOAT_EQ(std::fmod(num[i], den[i]), v3.GetValue(i).GetAs<float>()) << "row " << i;
+  }
+}
+
+// A zero integer divisor is undefined behavior in C++ (a SIGFPE trap on x86). The kernel
+// guards it and saturates to the type maximum, matching the DECIMAL division path. Before
+// the guard this test crashes the process rather than failing.
+TEST_F(VectorOperationsArithTest, IntegerDivisionByZeroSaturates) {
+  std::vector<int32_t> num = {10, 20, 30, 40};
+  std::vector<int32_t> den = {2, 0, 5, 0};  // rows 1 and 3 divide by zero
+  Vector v1 = GenerateVector(PhysicalType::INTEGER, num);
+  Vector v2 = GenerateVector(PhysicalType::INTEGER, den);
+  Vector v3(PhysicalType::INTEGER);
+
+  VectorOperations::Division(v1, v2, v3, num.size());
+  EXPECT_EQ(5, v3.GetValue(0).GetAs<int32_t>());
+  EXPECT_EQ(NumericLimits<int32_t>::Maximum(), v3.GetValue(1).GetAs<int32_t>());
+  EXPECT_EQ(6, v3.GetValue(2).GetAs<int32_t>());
+  EXPECT_EQ(NumericLimits<int32_t>::Maximum(), v3.GetValue(3).GetAs<int32_t>());
+}
+
+// Modulo by a zero divisor is guarded the same way.
+TEST_F(VectorOperationsArithTest, ModuloByZeroSaturates) {
+  std::vector<int64_t> num = {10, 20, 30};
+  std::vector<int64_t> den = {3, 0, 7};  // row 1 mods by zero
+  Vector v1 = GenerateVector(PhysicalType::BIGINT, num);
+  Vector v2 = GenerateVector(PhysicalType::BIGINT, den);
+  Vector v3(PhysicalType::BIGINT);
+
+  VectorOperations::Modulo(v1, v2, v3, num.size());
+  EXPECT_EQ(10 % 3, v3.GetValue(0).GetAs<int64_t>());
+  EXPECT_EQ(NumericLimits<int64_t>::Maximum(), v3.GetValue(1).GetAs<int64_t>());
+  EXPECT_EQ(30 % 7, v3.GetValue(2).GetAs<int64_t>());
+}
+
+// A CONSTANT zero divisor exercises the constant/flat path of the guard rather than the
+// flat/flat one.
+TEST_F(VectorOperationsArithTest, DivisionByConstantZeroSaturates) {
+  std::vector<int32_t> num = {10, 20, 30, 40};
+  Vector v1 = GenerateVector(PhysicalType::INTEGER, num);
+  Vector zero(Value(static_cast<int32_t>(0)));
+  Vector v3(PhysicalType::INTEGER);
+
+  VectorOperations::Division(v1, zero, v3, num.size());
+  for (idx_t i = 0; i < num.size(); i++) {
+    EXPECT_EQ(NumericLimits<int32_t>::Maximum(), v3.GetValue(i).GetAs<int32_t>()) << "row " << i;
+  }
+}
+
+// Unsigned multiply overflow wraps around modulo 2^width — a well-defined result that pins
+// the (previously untested) overflow behavior of Dot on integers.
+TEST_F(VectorOperationsArithTest, DotUnsignedOverflowWraps) {
+  std::vector<uint8_t> a = {200, 16, 255, 100};
+  std::vector<uint8_t> b = {2, 16, 2, 3};
+  Vector v1 = GenerateVector(PhysicalType::UTINYINT, a);
+  Vector v2 = GenerateVector(PhysicalType::UTINYINT, b);
+  Vector v3(PhysicalType::UTINYINT);
+
+  VectorOperations::Dot(v1, v2, v3, a.size());
+  for (idx_t i = 0; i < a.size(); i++) {
+    auto expected = static_cast<uint8_t>(static_cast<uint8_t>(a[i] * b[i]));
+    EXPECT_EQ(expected, v3.GetValue(i).GetAs<uint8_t>()) << "row " << i;
   }
 }
 

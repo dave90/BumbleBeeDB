@@ -23,8 +23,7 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 # This is vendored, generated Postgres C++. It is known-good at C++17 and is not
 # ours to maintain, so silence its warnings and pin its standard rather than
-# letting the project-wide C++20 settings reach it. Upstream (bustub) called
-# disable_target_warnings() here, which is a bustub-root-defined function.
+# letting the project-wide C++20 settings reach it.
 set_target_properties(duckdb_pg_query PROPERTIES
         CXX_STANDARD 17
         CXX_STANDARD_REQUIRED ON

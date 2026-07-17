@@ -274,6 +274,190 @@ TEST(DataChunkTests, OrrifyWithSelectionInt32) {
   }
 }
 
+// ---------- Multi-type chunks ----------
+//
+// The INTEGER-only suite above cannot catch a per-type bug in the column movement — most of
+// all for a STRING column, whose values live in a shared heap rather than inline. These mirror
+// the movement ops over a mixed INTEGER + STRING + DOUBLE chunk. FillChunk casts its synthetic
+// numeric value into each column's own type, so every column carries type-correct data.
+// (DECIMAL / LIST are omitted here because Value::CastAs does not target them; the LIST column
+// path is covered by list_vector_test's DataChunkAppendWithAListColumn.)
+
+static auto MixedTypes() -> std::vector<LogicalType> {
+  return {LogicalType(LogicalTypeId::INTEGER), LogicalType(LogicalTypeId::STRING), LogicalType(LogicalTypeId::DOUBLE)};
+}
+
+TEST(DataChunkMixedTests, AppendMixedTypes) {
+  DataChunk chunk1;
+  chunk1.Initialize(MixedTypes());
+  FillChunk(chunk1, 10);
+
+  DataChunk chunk2;
+  chunk2.Initialize(MixedTypes());
+  FillChunk(chunk2, 10, 5000);
+
+  chunk1.Append(chunk2);
+  EXPECT_EQ(chunk1.GetSize(), 20);
+  for (idx_t i = 0; i < chunk2.ColumnCount(); i++) {
+    for (idx_t j = 0; j < chunk2.GetSize(); j++) {
+      EXPECT_EQ(chunk2.GetValue(i, j), chunk1.GetValue(i, j + 10)) << "col " << i << " row " << j;
+    }
+  }
+}
+
+TEST(DataChunkMixedTests, CopyMixedTypes) {
+  DataChunk src;
+  src.Initialize(MixedTypes());
+  FillChunk(src, 50);
+
+  DataChunk dst;
+  dst.Initialize(MixedTypes());
+  dst.SetCardinality(0);
+  src.Copy(dst);
+  EXPECT_EQ(dst.GetSize(), 50);
+  for (idx_t i = 0; i < src.ColumnCount(); i++) {
+    for (idx_t j = 0; j < src.GetSize(); j++) {
+      EXPECT_EQ(src.GetValue(i, j), dst.GetValue(i, j)) << "col " << i << " row " << j;
+    }
+  }
+}
+
+TEST(DataChunkMixedTests, SliceMixedTypes) {
+  DataChunk chunk;
+  chunk.Initialize(MixedTypes());
+  FillChunk(chunk, 20);
+
+  // Snapshot the last 10 rows before slicing, since Slice rewrites the chunk in place.
+  std::vector<std::vector<Value>> expected(chunk.ColumnCount());
+  for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+    for (idx_t j = 10; j < 20; j++) {
+      expected[i].push_back(chunk.GetValue(i, j));
+    }
+  }
+
+  SelectionVector sel(10);
+  for (idx_t i = 0; i < 10; i++) {
+    sel.SetIndex(i, i + 10);
+  }
+  chunk.Slice(sel, 10);
+  chunk.Normalify();
+  EXPECT_EQ(chunk.GetSize(), 10);
+  for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+    for (idx_t j = 0; j < 10; j++) {
+      EXPECT_EQ(chunk.GetValue(i, j), expected[i][j]) << "col " << i << " row " << j;
+    }
+  }
+}
+
+TEST(DataChunkMixedTests, SplitMixedTypes) {
+  DataChunk chunk;
+  chunk.Initialize(MixedTypes());
+  FillChunk(chunk, 30);
+
+  // Snapshot the DOUBLE column (index 2) before it moves out.
+  std::vector<Value> col2;
+  for (idx_t j = 0; j < 30; j++) {
+    col2.push_back(chunk.GetValue(2, j));
+  }
+
+  DataChunk tail;
+  chunk.Split(tail, 2);  // columns 0,1 stay; column 2 (DOUBLE) moves to tail
+  EXPECT_EQ(chunk.ColumnCount(), 2);
+  EXPECT_EQ(tail.ColumnCount(), 1);
+  EXPECT_EQ(tail.data_[0].GetLogicalTypeId(), LogicalTypeId::DOUBLE);
+  for (idx_t j = 0; j < 30; j++) {
+    EXPECT_EQ(tail.GetValue(0, j), col2[j]) << "row " << j;
+  }
+}
+
+// ---------- Reference / Clone / InitAndReference / cols_map slice ----------
+
+TEST(DataChunkReferenceTests, CloneSharesData) {
+  DataChunk chunk;
+  chunk.Initialize(MixedTypes());
+  FillChunk(chunk, 10);
+
+  auto clone = chunk.Clone();
+  EXPECT_EQ(clone->ColumnCount(), 3);
+  EXPECT_EQ(clone->GetSize(), 10);
+  // Clone references the source, so a source write shows through.
+  chunk.SetValue(0, 0, Value(999));
+  EXPECT_EQ(clone->GetValue(0, 0), chunk.GetValue(0, 0));
+}
+
+TEST(DataChunkReferenceTests, InitAndReferenceAllColumns) {
+  DataChunk chunk;
+  chunk.Initialize(MixedTypes());
+  FillChunk(chunk, 8);
+
+  DataChunk ref;
+  ref.InitAndReference(chunk);
+  EXPECT_EQ(ref.ColumnCount(), 3);
+  for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
+    for (idx_t j = 0; j < 8; j++) {
+      EXPECT_EQ(ref.GetValue(i, j), chunk.GetValue(i, j)) << "col " << i << " row " << j;
+    }
+  }
+}
+
+TEST(DataChunkReferenceTests, InitAndReferenceSubsetColumns) {
+  DataChunk chunk;
+  chunk.Initialize(MixedTypes());
+  FillChunk(chunk, 8);
+
+  DataChunk ref;
+  ref.InitAndReference(chunk, std::vector<idx_t>{0, 1});  // drop the DECIMAL column
+  EXPECT_EQ(ref.ColumnCount(), 2);
+  for (idx_t j = 0; j < 8; j++) {
+    EXPECT_EQ(ref.GetValue(0, j), chunk.GetValue(0, j));
+    EXPECT_EQ(ref.GetValue(1, j), chunk.GetValue(1, j));
+  }
+}
+
+TEST(DataChunkReferenceTests, SliceWithColsMapRemapsColumns) {
+  DataChunk other;
+  other.Initialize(MixedTypes());
+  FillChunk(other, 20);
+
+  // Target with three columns; the map routes other's column c into target column {2,1,0}.
+  DataChunk target;
+  target.Initialize(std::vector<PhysicalType>{PhysicalType::INTEGER, PhysicalType::INTEGER, PhysicalType::INTEGER});
+
+  SelectionVector sel(10);
+  for (idx_t i = 0; i < 10; i++) {
+    sel.SetIndex(i, i + 10);
+  }
+  target.Slice(other, sel, 10, std::vector<idx_t>{2, 1, 0});
+  EXPECT_EQ(target.GetSize(), 10);
+  // other col 0 (INTEGER) landed in target col 2.
+  for (idx_t j = 0; j < 10; j++) {
+    EXPECT_EQ(target.GetValue(2, j), other.GetValue(0, j + 10)) << "row " << j;
+    EXPECT_EQ(target.GetValue(0, j), other.GetValue(2, j + 10)) << "row " << j;  // DOUBLE -> col 0
+  }
+}
+
+TEST(DataChunkReferenceTests, PartialResetPreservesColumnCount) {
+  DataChunk chunk;
+  chunk.Initialize(MixedTypes());
+  FillChunk(chunk, 100);
+
+  // Partial reset re-initializes ONLY the named columns with backing storage; the others are
+  // left with null data (the chunk is meant to reference them), so only 0 and 2 are writable.
+  chunk.Reset(std::vector<idx_t>{0, 2});
+  EXPECT_EQ(chunk.GetSize(), 0);
+  EXPECT_EQ(chunk.ColumnCount(), 3);
+
+  chunk.SetCardinality(5);
+  for (idx_t j = 0; j < 5; j++) {
+    chunk.SetValue(0, j, Value(static_cast<int32_t>(j)));
+    chunk.SetValue(2, j, Value(static_cast<double>(j) * 1.5));
+  }
+  for (idx_t j = 0; j < 5; j++) {
+    EXPECT_EQ(chunk.GetValue(0, j), Value(static_cast<int32_t>(j)));
+    EXPECT_EQ(chunk.GetValue(2, j), Value(static_cast<double>(j) * 1.5));
+  }
+}
+
 // ---------- NULL propagation across DataChunk movement ----------
 
 TEST(DataChunkNullTests, AppendCarriesNull) {

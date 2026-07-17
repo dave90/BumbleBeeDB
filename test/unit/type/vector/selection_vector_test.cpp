@@ -115,4 +115,47 @@ TEST(SelectionVectorTest, OperatorSquareBrackets) {
   EXPECT_EQ(sv.GetIndex(1), 200);
 }
 
+// Slicing a slice must COMPOSE the two selections, not nest them: the second selection
+// indexes into the first's logical rows. This is the invariant the vectorized engine relies
+// on when it slices an already-sliced column.
+TEST(SelectionVectorTest, SliceComposesTwoLevels) {
+  SelectionVector base(6);
+  for (idx_t i = 0; i < 6; ++i) {
+    base.SetIndex(i, i * 10);  // {0, 10, 20, 30, 40, 50}
+  }
+
+  SelectionVector sel1(4);
+  sel1.SetIndex(0, 5);
+  sel1.SetIndex(1, 2);
+  sel1.SetIndex(2, 4);
+  sel1.SetIndex(3, 1);
+  SelectionVector level1(base.Slice(sel1, 4));  // {50, 20, 40, 10}
+
+  SelectionVector sel2(2);
+  sel2.SetIndex(0, 2);
+  sel2.SetIndex(1, 0);
+  SelectionVector level2(level1.Slice(sel2, 2));  // {40, 50}
+
+  EXPECT_EQ(level2.GetIndex(0), 40);
+  EXPECT_EQ(level2.GetIndex(1), 50);
+  // The composed index equals base looked up through the full sel1 ∘ sel2 path.
+  EXPECT_EQ(level2.GetIndex(0), base.GetIndex(sel1.GetIndex(sel2.GetIndex(0))));
+  EXPECT_EQ(level2.GetIndex(1), base.GetIndex(sel1.GetIndex(sel2.GetIndex(1))));
+}
+
+// Initialize(count) on an existing selection replaces its buffer with a fresh one.
+TEST(SelectionVectorTest, InitializeReallocates) {
+  SelectionVector sv(3);
+  sv.SetIndex(0, 7);
+
+  sv.Initialize(static_cast<idx_t>(5));
+  ASSERT_NE(sv.GetData(), nullptr);
+  for (idx_t i = 0; i < 5; ++i) {
+    sv.SetIndex(i, i + 100);
+  }
+  for (idx_t i = 0; i < 5; ++i) {
+    EXPECT_EQ(sv.GetIndex(i), i + 100);
+  }
+}
+
 }  // namespace bumblebee

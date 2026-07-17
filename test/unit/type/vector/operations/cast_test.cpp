@@ -244,4 +244,106 @@ TEST_F(VectorOperationsCastTest, TryCastDecimalIntoDecimal2) {
   }
 }
 
+// A failed conversion under Cast() (the non-Try form) must turn the row into a genuine NULL —
+// not the NullValue<T>() sentinel, which surfaces as a plausible 0 / INT_MIN and corrupts the
+// read. The successful rows are unaffected.
+TEST_F(VectorOperationsCastTest, CastOverflowRowBecomesNull) {
+  std::vector<uint64_t> data = {1, 65536, 7};  // 65536 does not fit a USMALLINT
+  Vector input = GenerateVector(PhysicalType::UBIGINT, data);
+  Vector result(PhysicalType::USMALLINT, data.size());
+
+  VectorOperations::Cast(input, result, data.size());
+
+  EXPECT_FALSE(result.GetValue(0).IsNull());
+  EXPECT_EQ(result.GetValue(0).GetAs<uint16_t>(), 1);
+  EXPECT_TRUE(result.GetValue(1).IsNull()) << "the overflowing row must be NULL, not a sentinel value";
+  EXPECT_FALSE(result.GetValue(2).IsNull());
+  EXPECT_EQ(result.GetValue(2).GetAs<uint16_t>(), 7);
+}
+
+// A string that does not parse becomes NULL, and the parseable rows around it survive.
+TEST_F(VectorOperationsCastTest, CastUnparseableStringBecomesNull) {
+  std::vector<std::string> data = {"42", "12a3", "7"};
+  Vector input = GenerateVector(PhysicalType::STRING, data);
+  Vector result(PhysicalType::INTEGER, data.size());
+
+  VectorOperations::Cast(input, result, data.size());
+
+  EXPECT_EQ(result.GetValue(0).GetAs<int32_t>(), 42);
+  EXPECT_TRUE(result.GetValue(1).IsNull()) << "the unparseable row must be NULL, not INT_MIN";
+  EXPECT_EQ(result.GetValue(2).GetAs<int32_t>(), 7);
+}
+
+// A CONSTANT input that overflows must collapse to a single NULL, exercising the constant
+// path of the failure handling.
+TEST_F(VectorOperationsCastTest, CastConstantOverflowBecomesNull) {
+  Vector input(Value(static_cast<int32_t>(70000)));  // does not fit a USMALLINT
+  Vector result(PhysicalType::USMALLINT, 4);
+
+  VectorOperations::Cast(input, result, 4);
+  for (idx_t i = 0; i < 4; i++) {
+    EXPECT_TRUE(result.GetValue(i).IsNull()) << "row " << i;
+  }
+}
+
+// A CONSTANT input that fits casts to a CONSTANT result — the encoding must survive the cast.
+TEST_F(VectorOperationsCastTest, CastConstantInput) {
+  Vector input(Value(static_cast<int32_t>(300)));
+  Vector result(PhysicalType::BIGINT, 4);
+
+  VectorOperations::Cast(input, result, 4);
+  EXPECT_EQ(result.GetVectorType(), VectorType::CONSTANT_VECTOR);
+  EXPECT_EQ(result.GetValue(0).GetAs<int64_t>(), 300);
+}
+
+// A DICTIONARY input is orrified inside the cast; the values must come out in selection order.
+TEST_F(VectorOperationsCastTest, CastDictionaryInput) {
+  Vector base(PhysicalType::INTEGER, 6);
+  for (idx_t i = 0; i < 6; i++) {
+    base.SetValue(i, Value(static_cast<int32_t>((i + 1) * 10)));
+  }
+  SelectionVector sel(3);
+  sel.SetIndex(0, 5);  // 60
+  sel.SetIndex(1, 1);  // 20
+  sel.SetIndex(2, 3);  // 40
+  Vector dict(base, sel, 3);
+
+  Vector result(PhysicalType::BIGINT, 3);
+  VectorOperations::Cast(dict, result, 3);
+  EXPECT_EQ(result.GetValue(0).GetAs<int64_t>(), 60);
+  EXPECT_EQ(result.GetValue(1).GetAs<int64_t>(), 20);
+  EXPECT_EQ(result.GetValue(2).GetAs<int64_t>(), 40);
+}
+
+// A NULL source row stays NULL through a cast (the source validity is propagated), and a
+// failing cast does not report a spurious error for the skipped NULL row.
+TEST_F(VectorOperationsCastTest, CastPreservesSourceNull) {
+  Vector input(PhysicalType::INTEGER, 3);
+  input.SetValue(0, Value(5));
+  input.SetValue(1, Value::Null(PhysicalType::INTEGER));
+  input.SetValue(2, Value(9));
+  Vector result(PhysicalType::BIGINT, 3);
+
+  VectorOperations::Cast(input, result, 3);
+  EXPECT_EQ(result.GetValue(0).GetAs<int64_t>(), 5);
+  EXPECT_TRUE(result.GetValue(1).IsNull());
+  EXPECT_EQ(result.GetValue(2).GetAs<int64_t>(), 9);
+}
+
+// TryCast reports failure but still converts the rows that do fit, NULLing only the bad one.
+TEST_F(VectorOperationsCastTest, TryCastReportsFailureButConvertsGoodRows) {
+  std::vector<uint64_t> data = {1, 2, 70000, 3};
+  Vector input = GenerateVector(PhysicalType::UBIGINT, data);
+  Vector result(PhysicalType::USMALLINT, data.size());
+  auto error = std::make_unique<std::string>();
+
+  bool ok = VectorOperations::TryCast(input, result, data.size(), error.get());
+  EXPECT_FALSE(ok);
+  EXPECT_FALSE(error->empty());
+  EXPECT_EQ(result.GetValue(0).GetAs<uint16_t>(), 1);
+  EXPECT_EQ(result.GetValue(1).GetAs<uint16_t>(), 2);
+  EXPECT_TRUE(result.GetValue(2).IsNull());
+  EXPECT_EQ(result.GetValue(3).GetAs<uint16_t>(), 3);
+}
+
 }  // namespace bumblebee

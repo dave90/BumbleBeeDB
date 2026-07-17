@@ -154,4 +154,10 @@ class NotImplementedException : public Exception {
       : Exception(ExceptionType::NOT_IMPLEMENTED, message) {}
 };
 
+/** @brief Thrown when a query fails at execution time (storage I/O, buffer exhaustion, ...). */
+class ExecutionException : public Exception {
+ public:
+  explicit ExecutionException(const std::string &message) : Exception(ExceptionType::EXECUTION, message) {}
+};
+
 }  // namespace bumblebee

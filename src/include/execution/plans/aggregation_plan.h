@@ -66,10 +66,6 @@ namespace bumblebee {
  *
  * The output schema is the group-by columns followed by the aggregate columns.
  *
- * Note what is deliberately absent: bustub keeps `AggregateKey` / `AggregateValue`
- * structs next to this plan node, but those describe an executor's hash table, not
- * the plan. BumbleBee's engine will use its own PRLHashTable, so they have no place
- * here.
  */
 class AggregationPlanNode : public AbstractPlanNode {
  public:

@@ -32,7 +32,16 @@
 
 namespace bumblebee {
 
-BumbleBeeInstance::BumbleBeeInstance() : catalog_(std::make_unique<Catalog>()) {}
+BumbleBeeInstance::BumbleBeeInstance() : owned_catalog_(std::make_unique<Catalog>()) {
+  catalog_ = owned_catalog_.get();
+}
+
+BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames)
+    : db_(std::make_unique<Database>(db_file, num_frames)) {
+  // The catalog lives inside the Database (which owns the disk, buffer pool and transaction manager);
+  // ~Database (via the db_ member) flushes and persists it on shutdown.
+  catalog_ = &db_->GetCatalog();
+}
 
 BumbleBeeInstance::~BumbleBeeInstance() = default;
 

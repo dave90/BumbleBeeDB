@@ -130,6 +130,80 @@ TEST(VectorOperationsHashConstantTest, CombineHashFlattensAConstantAccumulator) 
   }
 }
 
+// STRING columns route through a distinct kernel from the fixed-width types; hash them and
+// check each row against the scalar string hash.
+TEST(VectorOperationsHashStringTest, HashStringVector) {
+  const idx_t count = 4;
+  Vector v(LogicalType(LogicalTypeId::STRING), count);
+  v.SetValue(0, Value(std::string("")));
+  v.SetValue(1, Value(std::string("bee")));
+  v.SetValue(2, Value(std::string("a much longer string that will not fit inline")));
+  v.SetValue(3, Value(std::string("bumble")));
+
+  Vector hashes(LogicalTypeId::HASH, count);
+  VectorOperations::Hash(v, hashes, count);
+
+  auto *hd = FlatVector::GetData<hash_t>(hashes);
+  auto *sd = FlatVector::GetData<string_t>(v);
+  for (idx_t i = 0; i < count; i++) {
+    EXPECT_EQ(hd[i], bumblebee::Hash<string_t>(sd[i])) << "row " << i;
+  }
+}
+
+// A DICTIONARY-encoded input is orrified inside the kernel; its hashes must equal the hashes
+// of the same logical values laid out flat — otherwise a dictionary probe would miss.
+TEST(VectorOperationsHashDictionaryTest, HashDictionaryInputAgreesWithFlat) {
+  Vector base(PhysicalType::INTEGER, 6);
+  for (idx_t i = 0; i < 6; i++) {
+    base.SetValue(i, Value(static_cast<int32_t>(i) * 10));
+  }
+  SelectionVector sel(3);
+  sel.SetIndex(0, 5);  // 50
+  sel.SetIndex(1, 1);  // 10
+  sel.SetIndex(2, 3);  // 30
+  Vector dict(base, sel, 3);
+
+  Vector dict_hashes(LogicalTypeId::HASH, 3);
+  VectorOperations::Hash(dict, dict_hashes, 3);
+  auto *dh = FlatVector::GetData<hash_t>(dict_hashes);
+
+  EXPECT_EQ(dh[0], bumblebee::Hash<int32_t>(50));
+  EXPECT_EQ(dh[1], bumblebee::Hash<int32_t>(10));
+  EXPECT_EQ(dh[2], bumblebee::Hash<int32_t>(30));
+}
+
+// The rsel overload of CombineHash folds only the selected rows, writing the result at each
+// row's OWN index — the untouched rows must keep their prior accumulated hash.
+TEST_F(VectorOperationsHashTest, CombineHashWithSelection) {
+  Vector extra(PhysicalType::INTEGER, TEST_COUNT);
+  auto *extra_data = FlatVector::GetData<int32_t>(extra);
+  for (idx_t i = 0; i < TEST_COUNT; ++i) {
+    extra_data[i] = static_cast<int32_t>(i) + 100;
+  }
+
+  VectorOperations::Hash(*input_, *hashes_, TEST_COUNT);
+  auto *hash_data = FlatVector::GetData<hash_t>(*hashes_);
+  std::vector<hash_t> before(TEST_COUNT);
+  for (idx_t i = 0; i < TEST_COUNT; ++i) {
+    before[i] = hash_data[i];
+  }
+
+  // Fold only rows 3 and 1.
+  SelectionVector sel(2);
+  sel.SetIndex(0, 3);
+  sel.SetIndex(1, 1);
+  VectorOperations::CombineHash(*hashes_, extra, sel, 2);
+
+  for (idx_t i = 0; i < TEST_COUNT; ++i) {
+    if (i == 3 || i == 1) {
+      auto expected = (before[i] * UINT64_C(0xbf58476d1ce4e5b9)) ^ bumblebee::Hash<int32_t>(extra_data[i]);
+      EXPECT_EQ(hash_data[i], expected) << "selected row " << i;
+    } else {
+      EXPECT_EQ(hash_data[i], before[i]) << "untouched row " << i;
+    }
+  }
+}
+
 // The same numeric value must hash the same whatever integer type it is stored in —
 // otherwise a join between an INTEGER and a BIGINT key column would never match.
 TEST(VectorOperationsHashConstantTest, HashNumericDifferentType) {

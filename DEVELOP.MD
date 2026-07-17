@@ -2,17 +2,17 @@
 
 ## Naming
 
-| Entity | Case | Example |
-|---|---|---|
-| Class | `CamelCase` | `BufferPoolManager` |
-| Struct | `CamelCase` | `FrameHeader` |
-| Enum | `CamelCase` | `AccessType` |
-| Union | `CamelCase` | `ValueUnion` |
+| Entity | Case | Example                    |
+|---|---|----------------------------|
+| Class | `CamelCase` | `BufferPoolManager`        |
+| Struct | `CamelCase` | `FrameHeader`              |
+| Enum | `CamelCase` | `AccessType`               |
+| Union | `CamelCase` | `ValueUnion`               |
 | Function / method | `CamelCase` | `GetData()`, `FetchPage()` |
-| Namespace | `lower_case` | `bustub` |
-| Variable | `lower_case` | `frame_id` |
-| Member variable | `lower_case` with trailing `_` | `frame_id_`, `data_` |
-| Global constant | `UPPER_CASE` | `BUSTUB_PAGE_SIZE` |
+| Namespace | `lower_case` | `bumblebee`                |
+| Variable | `lower_case` | `frame_id`                 |
+| Member variable | `lower_case` with trailing `_` | `frame_id_`, `data_`       |
+| Global constant | `UPPER_CASE` | `PAGE_SIZE`         |
 
 ## Includes
 

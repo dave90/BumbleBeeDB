@@ -55,7 +55,7 @@ state object. This much BumbleBee got right and we keep it.
 enum class SourceResultType : uint8_t { HAVE_MORE_OUTPUT, FINISHED };
 enum class OperatorResultType : uint8_t { NEED_MORE_INPUT, HAVE_MORE_OUTPUT, FINISHED };
 enum class SinkResultType : uint8_t { NEED_MORE_INPUT, FINISHED };
-enum class SinkFinalizeType : uint8_t { READY, NO_OUTPUT_YET };
+enum class SinkFinalizeType : uint8_t { READY, NO_OUTPUT_POSSIBLE };
 
 class PhysicalOperator {
  public:
@@ -115,9 +115,29 @@ a source and `HAVE_MORE_OUTPUT` is meaningless for a sink, yet both are represen
 makes the illegal states unrepresentable and lets the push loop switch on each without a comment
 explaining which `FINISHED` this is.
 
-**`Finalize` returns `SinkFinalizeType`, not `void`. [D-2]** An empty build side on an inner join returns
-`NO_OUTPUT_YET`, and the executor prunes the entire probe subtree instead of running it to produce zero
-rows. §5.4 covers the deadlock this must avoid.
+**`Finalize` returns `SinkFinalizeType`, not `void`. [D-2] — and this is an *optimization*, not a
+requirement.** It is worth being precise about what it is for, because it is easy to over-sell (an
+earlier draft of this document did).
+
+The **scheduler does not need it.** `dependencies_remaining_` already answers the only question the
+scheduler asks — *when* may the next pipeline start — and it would answer it just as well if `Finalize`
+returned `void`. The verdict answers a different question, which nothing else asks: *is it worth starting
+the next pipeline at all?*
+
+The one operator that ever returns anything but `READY` is an **inner** `PhysicalHashJoin` whose build
+side came up empty. It then knows something no one could know at plan time: no probe row can ever match,
+so the probe pipeline is about to scan (say) a billion rows of `b` to produce nothing.
+`NO_OUTPUT_POSSIBLE` says *"I am empty, and nothing downstream of me can ever produce a row — skip the
+work."* It is permanent and final; there is no "come back later" state. (`READY` is therefore not really a
+value, it is the absence of news: "nothing special to report, proceed as normal.")
+
+Delete the enum entirely and **the engine is still correct** — it just scans all of `b`, probes an empty
+table, matches nothing, and returns the same answer more slowly. So this is droppable from v1: the
+mechanism is one flag on `Pipeline` and one branch in `FetchFromSource` (§5.4), and it can be added later
+with no scheduler changes. The only part worth keeping from day one is the *return type* in the signature,
+since widening a signature later ripples through every operator, whereas a `void` → enum change does not.
+
+§5.4 has the mechanism, and the correctness trap inside it.
 
 **`Finalize` takes `(stage, task_idx, task_count)` from day one. [D-7]** Today every caller passes
 `(0, 0, 1)` and the last task runs it inline. But the signature and the two counters on `Pipeline` are
@@ -150,7 +170,8 @@ class Pipeline {
   std::atomic<idx_t> tasks_remaining_;
   std::atomic<idx_t> finalize_tasks_remaining_;       // §5.6 seam, armed to 1 today
   std::atomic<idx_t> finalize_stage_;
-  std::atomic<bool> dead_;                            // pruned by an upstream NO_OUTPUT_YET
+  std::atomic<bool> dead_;                            // upstream said NO_OUTPUT_POSSIBLE: run with an
+                                                      //   empty source. NOT "do not run" — see §5.4
   std::atomic<bool> stop_;                            // LIMIT satisfied: all tasks bail
 };
 ```
@@ -497,42 +518,83 @@ loses whole partitions. **No ABA:** the counter only decreases within one arming
 after its tasks are enqueued, and is only re-armed by `Pipeline::Reset()` — which runs on the client
 thread with zero tasks in flight (the recursive-CTE seam).
 
-### 5.4 Dependency release, and the `NO_OUTPUT_YET` deadlock
+### 5.4 Dependency release, and what `NO_OUTPUT_POSSIBLE` must *not* do
 
 ```cpp
-void Executor::ReleaseDependents(Pipeline &p, bool dead) {
+void Executor::ReleaseDependents(Pipeline &p, bool no_output_possible) {
   std::vector<TaskRef> ready;
   for (auto *dep : p.dependents_) {
-    if (dead) { dep->dead_.store(true, std::memory_order_relaxed); }
+    if (no_output_possible) { dep->dead_.store(true, std::memory_order_relaxed); }
     // Exactly one thread gets 1 back, even if two dependencies finalize concurrently.
     // No lock, no double-schedule, no visited-set for the diamond case.
     if (dep->dependencies_remaining_.fetch_sub(1, std::memory_order_acq_rel) != 1) { continue; }
-    if (dep->dead_.load(std::memory_order_relaxed)) {
-      pipelines_completed_.fetch_add(1, std::memory_order_acq_rel);
-      ReleaseDependents(*dep, /*dead=*/true);        // cascade the kill
-    } else {
-      CreateTasks(*dep, ready);
-    }
+    CreateTasks(*dep, ready);        // ALWAYS schedule. dead_ only suppresses the SOURCE — see below.
   }
   scheduler_.EnqueueAll(std::move(ready));           // one lock, one notify_all
 }
 ```
 
-The `dead_` store may be `relaxed` *here and only here*, because the `fetch_sub` immediately following is
-`acq_rel` on the same atomic that the last decrementer acquires — so both interleavings agree.
+…and the entire effect of `dead_` is one branch at the top of the push loop:
 
-**The deadlock this avoids:** if `Finalize` returns `NO_OUTPUT_YET` (empty build side of an inner join)
-and we simply *don't schedule* the dependents, then `pipelines_completed_` never reaches `pipeline_count_`
-and the client waits forever. `NO_OUTPUT_YET` must **kill the dependent subtree** — mark it
-completed-without-running, and cascade.
+```cpp
+auto PipelineExecutor::FetchFromSource(DataChunk &result) -> SourceResultType {
+  if (pipeline_.dead_.load(std::memory_order_relaxed)) {
+    return SourceResultType::FINISHED;   // the source is never opened. THIS is the whole optimization.
+  }
+  return pipeline_.source_->GetData(context_, result, *pipeline_.source_gstate_, *local_source_state_);
+}
+```
+
+A dead pipeline is scheduled with **one** task, that task's source yields nothing, and everything else
+happens exactly as normal: `Combine` runs, the last (only) task runs `Finalize`, the dependents are
+released. The `dead_` store may be `relaxed` *here and only here*, because the `fetch_sub` immediately
+following is `acq_rel` on the same atomic the last decrementer acquires — so both interleavings agree.
+
+**The trap: `dead_` must suppress the *source*, not the *pipeline*.** The tempting reading of
+`NO_OUTPUT_POSSIBLE` is "skip the dependent pipelines entirely, mark them complete without running, and
+cascade the kill downstream". That is **wrong**, and it produces wrong answers, not merely slow ones:
+
+```sql
+SELECT COUNT(*) FROM a JOIN b ON a.k = b.k;   -- a is EMPTY
+```
+
+```
+P0:  Scan(a) ─────────────────────────▶ HashJoin (build)       deps: —
+P1:  Scan(b) ─▶ [HashJoin (probe)] ───▶ UngroupedAggregate     deps: P0
+P2:  UngroupedAggregate ──────────────▶ ResultCollector        deps: P1
+```
+
+The correct answer is **one row containing `0`**. Under "cascade the kill", P1 *and* P2 are marked dead
+and never run — so the aggregate's `Combine` and `Finalize` never happen, it never emits its zero-input
+row, and the query returns an **empty result set**. Under "suppress the source": P1 runs with one task,
+`b` is **never scanned** (the optimization is fully preserved — that was the billion rows we wanted to
+skip), the aggregate combines a zero-input state, finalizes to `0`, and returns **`READY`** — because an
+ungrouped aggregate always has output, even on empty input. So the deadness **stops there**, P2 runs
+normally, and the client gets its `0`.
+
+That is the general rule: **deadness travels one hop, and every sink re-judges it from its own
+`Finalize`.** An aggregate above an empty join resurrects the query (`READY`); a *hash-join build* fed by
+a dead pipeline finds its own table empty and returns `NO_OUTPUT_POSSIBLE` again, so the signal keeps
+climbing, correctly; a `ResultCollector` fed by a dead pipeline yields an empty result, which for
+`SELECT * FROM a JOIN b` is exactly right.
+
+Note this is the *same* argument as the `std::max<idx_t>(1, ...)` rule in §6 — a zero-row source still
+gets one task precisely so `Combine` → `Finalize` runs and `COUNT(*)` on an empty table returns `0`. An
+empty **source** and a dead **dependency** are the same situation and must get the same rule.
+
+**And the deadlock disappears with the cascade.** The reason an earlier draft needed a kill-cascade *plus*
+a rule that dead pipelines still increment `pipelines_completed_` was that a never-scheduled pipeline
+never increments anything, so the client waits forever. Here **every pipeline runs**, so every pipeline
+increments the counter on its own. No cascade, no completed-without-running bookkeeping, no hang.
 
 ### 5.5 Completion, exceptions, cancellation
 
 **Rule R1:** *a task that will cause more tasks to be enqueued must enqueue them — and so increment
 `active_tasks_` — strictly before decrementing its own.* That is why step (A) precedes step (B) in
 `PipelineTask::Execute`. Reverse them and `active_tasks_` transiently hits zero between pipelines, the
-client thread wakes, and the query returns after one pipeline. With R1 plus the kill-cascade,
-`active_tasks_ == 0` is *equivalent to* "the query is genuinely over, one way or the other":
+client thread wakes, and the query returns after one pipeline. Because **every** pipeline runs — a dead
+one included, it just has an empty source (§5.4) — and every task therefore reaches step (B), R1 alone
+makes `active_tasks_ == 0` *equivalent to* "the query is genuinely over, one way or the other":
 
 ```cpp
 void Executor::TaskFinished() {
@@ -686,7 +748,7 @@ so it is the last task, so `Finalize` runs — which is exactly what `SELECT COU
 
 | sink | local state (per task, **lock-free**) | `Combine` | `Finalize` |
 |---|---|---|---|
-| `PhysicalHashJoin` (build) | thread-local `JoinPRLHashTable` | radix-partition the local table; merge partition *p* under `partition_mutex_[p]` | build the pointer directory. Empty build + INNER ⇒ `NO_OUTPUT_YET` ⇒ the probe subtree is pruned |
+| `PhysicalHashJoin` (build) | thread-local `JoinPRLHashTable` | radix-partition the local table; merge partition *p* under `partition_mutex_[p]` | build the pointer directory. Empty build + INNER ⇒ `NO_OUTPUT_POSSIBLE` ⇒ the probe pipeline runs with an empty source, so `b` is never scanned (§5.4) |
 | `PhysicalNestedLoopJoin` (build) | thread-local `ChunkCollection` | **move** the chunks into the global collection under one mutex | — |
 | `PhysicalHashAggregate` | thread-local `AggregatePRLHashTable` | `PartitionedAggHT::combineLocalHt()` — radix-partition on the high hash bits, merge bucket *p* under `partitionsMutex_[p]` | aggregate each partition. **First user of the §5.6 seam** |
 | `PhysicalUngroupedAggregate` | one partial state per aggregate | fold partials under one mutex (N locks *per query*) | — |
@@ -844,12 +906,134 @@ exists with no class behind it).
 
 ---
 
+## 11. Making it debuggable: printing the physical plan and the pipelines
+
+This is not a nicety — it is the difference between a tractable engine and an untractable one. Two of the
+three trees in this design are **invisible at runtime**, and both fail *silently*:
+
+- A **lowering** bug (wrong build side, aggregate not partitioned, a scan lowered to the wrong source)
+  produces a physical tree nobody ever looks at.
+- A **pipeline-construction** bug is worse. If `BuildPipelines` attaches an operator to the wrong pipeline,
+  or forgets a dependency edge, the symptom is a *wrong answer* or a *hang* — a probe pipeline that ran
+  before its hash table was built reads an empty table and silently returns zero rows. There is no crash
+  and no assertion to catch it. **You cannot debug that without seeing the DAG.**
+
+So both get printed, and both reuse machinery that already exists.
+
+### The physical plan → `EXPLAIN`
+
+`ExplainOptions` in `src/include/binder/statement/explain_statement.h` is already a bitmask
+(`BINDER=1, PLANNER=2, OPTIMIZER=4, SCHEMA=8`). Add two values:
+
+```cpp
+enum ExplainOptions : uint8_t {
+  INVALID = 0, BINDER = 1, PLANNER = 2, OPTIMIZER = 4, SCHEMA = 8,
+  /** Print the physical operator tree (post-lowering). */
+  PHYSICAL = 16,
+  /** Print the pipeline DAG (post-BuildPipelines). */
+  PIPELINES = 32,
+};
+```
+
+and two option keywords in `Binder::BindExplain` (`src/binder/bind_select.cpp:800`), alongside the
+existing `p` / `b` / `o` / `s`:
+
+```cpp
+if (strcmp(temp->defname, "physical")  == 0 || strcmp(temp->defname, "x") == 0) { opts |= PHYSICAL;  }
+if (strcmp(temp->defname, "pipelines") == 0 || strcmp(temp->defname, "l") == 0) { opts |= PIPELINES; }
+```
+
+`PhysicalOperator` gets the **same `ToString` shape the plan tree already uses** — `AbstractPlanNode`
+has a public `ToString(bool with_schema)` plus a protected `PlanNodeToString()` that each node overrides,
+and `ChildrenToString(indent)` to recurse. Mirror it exactly (`ToString` / `ParamsToString` /
+`ChildrenToString`), so the two trees print in the same idiom and the `fmt::formatter` specializations at
+the bottom of `abstract_plan.h` can be copied across. `HandleExplainStatement`
+(`src/bumblebee_instance.cpp:91`) grows one more `if` block, exactly like the four already there.
+
+```
+> EXPLAIN (o, x) SELECT a.x, SUM(b.y) FROM a JOIN b ON a.k=b.k WHERE a.x>5 GROUP BY a.x ORDER BY 2 DESC LIMIT 10;
+
+=== OPTIMIZER ===
+TopN { n=10, order_by=[#0.1 desc] }
+  Agg { group_by=[#0.0], aggregates=[sum(#0.3)] }
+    HashJoin { left_key=[#0.1], right_key=[#1.0], type=Inner }
+      SeqScan { table=a, filter=(#0.1 > 5) }
+      SeqScan { table=b }
+
+=== PHYSICAL ===
+ResultCollector
+  TopN { n=10, order_by=[#0.1 desc], sink+source }
+    HashAggregate { group_by=[#0.0], aggregates=[sum(#0.3)], partitions=64, sink+source }
+      HashJoin { keys=[#0.1 = #1.0], type=Inner, build=child[0], sink+operator }
+        TableScan { table=a, storage=row, filter=(#0.1 > 5), cols=[k,x] }      <-- row pages
+        ParquetScan { file=b.parquet, cols=[k,y], row_groups=12 }              <-- columnar
+```
+
+Two things that view alone would have caught: **which** scan each table lowered to (row pages vs Parquet —
+invisible in the logical plan, which holds only a `table_oid_t`), and **which side builds** after a
+cardinality-driven swap.
+
+### The pipeline DAG → `\pipelines`
+
+The shell already dispatches backslash meta-commands (`src/main/main.cpp:67`), so:
+
+```
+\pipelines <sql>
+```
+
+is a thin alias that rewrites to `EXPLAIN (pipelines) <sql>` and prints only that block. That gives the
+distinct command without a second statement type, a second parse path, or any new binder work — the
+pipeline dump *needs* the query bound, planned, optimized and lowered anyway, which is precisely what the
+`EXPLAIN` path already does. It stops short of `Executor::ExecuteQuery`, so nothing runs.
+
+`Pipeline::ToString()` prints one pipeline; `Executor::PipelinesToString()` prints them in dependency
+order with their edges:
+
+```
+> \pipelines SELECT a.x, SUM(b.y) FROM a JOIN b ON a.k=b.k WHERE a.x>5 GROUP BY a.x ORDER BY 2 DESC LIMIT 10;
+
+=== PIPELINES ===
+P0  deps: —          max_threads: 8
+      source    TableScan(a) [filter #0.1 > 5]
+      sink      HashJoin(build)
+
+P1  deps: [P0]       max_threads: 12
+      source    ParquetScan(b)
+      operator  HashJoin(probe)
+      sink      HashAggregate
+
+P2  deps: [P1]       max_threads: 64
+      source    HashAggregate
+      sink      TopN
+
+P3  deps: [P2]       max_threads: 1     (TopN is order-preserving)
+      source    TopN
+      sink      ResultCollector
+```
+
+Everything a pipeline bug shows up in is on that page: the **dependency edges** (a missing one is a race,
+an extra one is a lost parallelism), which operators are **streaming** vs which are **sinks** (an operator
+that should be streaming appearing as a sink is a spurious materialization), and **`max_threads`** per
+pipeline — where an unexpected `1` immediately tells you which `ParallelSink()` / `ParallelOperator()` /
+`IsOrderPreserving()` hint collapsed your parallelism, which is otherwise a pure-mystery performance bug.
+
+### Later: `EXPLAIN ANALYZE`
+
+The same tree, annotated with what actually happened. The data is already being collected — `Executor`
+owns one `ThreadContext` per task, each carrying a per-operator profiler, and merges them after the query
+(§8). So `EXPLAIN ANALYZE` is a *formatting* job on top of the `PHYSICAL` printer: rows in / rows out /
+wall time per operator, plus per-pipeline task counts and morsel counts, which is how you find skew (one
+task doing 90% of the morsels). Not v1, but the plumbing exists from day one and should not be
+retrofitted.
+
+---
+
 ## Every deliberate divergence from BumbleBee
 
 | # | BumbleBee | BumbleBeeDB | why |
 |---|---|---|---|
 | D-1 | one `AtomResultType` | four result enums | `FINISHED` has three distinct meanings and three distinct propagation rules |
-| D-2 | `void finalize()` | `SinkFinalizeType Finalize()` | an empty build prunes the whole probe subtree |
+| D-2 | `void finalize()` | `SinkFinalizeType Finalize()` | an empty inner-join build lets the probe pipeline skip its scan entirely. **An optimization, not a requirement** — the scheduler does not need it, and v1 may ship without it (§1, §5.4) |
 | D-3 | global state, `combine`, `finalize` **only** for source and sink | **every** operator, in every role | removes the need to lift a build into its own rule with a `NopeOutput` sink — **kills fatal flaw #1 at the root** |
 | D-4 | global state lives on `PhysicalRule` | lives on the `Executor`, in flat vectors indexed by a dense `PhysicalOperator::id_` — not a hash map, and not a `mutable` member on the operator as DuckDB does | one operator, two pipelines, **one** shared sink state — structurally, because it is one slot. And the physical plan stays immutable, so it can be re-executed |
 | D-5 | priority buckets, hard barriers, a coordinator polling a 100 ms semaphore and rescanning the bucket | counter DAG; the last task finalizes **inline** and enqueues its own dependents; the client thread is a worker | zero coordination round-trips, no idle thread |

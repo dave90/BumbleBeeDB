@@ -62,12 +62,16 @@ struct HandleVectorCastError {
 template <class OP>
 struct VectorTryCastOperator {
   template <class INPUT_TYPE, class RESULT_TYPE>
-  static auto Operation(INPUT_TYPE &input, void *dataptr) -> RESULT_TYPE {
+  static auto Operation(INPUT_TYPE input, idx_t idx, void *dataptr) -> RESULT_TYPE {
     RESULT_TYPE output;
+    auto *data = reinterpret_cast<VectorTryCastData *>(dataptr);
     if (OP::template Operation<INPUT_TYPE, RESULT_TYPE>(input, output)) {
       return output;
     }
-    auto *data = reinterpret_cast<VectorTryCastData *>(dataptr);
+    // A failed conversion is a NULL, not a silently-wrong value. Clear the row's validity so
+    // the result reads as NULL rather than as NullValue<RESULT_TYPE>() — a sentinel that
+    // otherwise surfaces as a legitimate-looking 0 / INT_MIN and corrupts downstream reads.
+    data->result_.SetInvalid(idx);
     return HandleVectorCastError::Operation<RESULT_TYPE>("error during conversion!", data->error_message_,
                                                          data->all_converted_);
   }
@@ -138,7 +142,8 @@ struct DecimalToFloatCastOp {
 template <class SRC, class DST, class OP>
 auto VectorCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   VectorTryCastData input(result, error_message);
-  UnaryExecution::GenericExecute<SRC, DST, VectorTryCastOperator<OP>>(source, result, count, &input);
+  // The index-aware variant so a per-row failure can mark that row NULL in the result.
+  UnaryExecution::GenericExecuteWithIndex<SRC, DST, VectorTryCastOperator<OP>>(source, result, count, &input);
   return input.all_converted_;
 }
 

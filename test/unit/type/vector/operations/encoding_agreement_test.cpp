@@ -280,6 +280,39 @@ class EncodingAgreementTest : public ::testing::Test {
       }
     }
   }
+
+  using UnaryArithFn = void (*)(Vector &, Vector &, idx_t);
+
+  /** @brief Run a unary kernel over every encoding of `a`; the values AND nulls must match. */
+  void CheckUnaryArithOverAllData(const char *op_name, UnaryArithFn fn) {
+    for (const auto &[name_a, col_a] : AllColumns()) {
+      SCOPED_TRACE(std::string(op_name) + ": " + name_a);
+      owned_.clear();
+
+      Vector base_result(PhysicalType::INTEGER, N);
+      fn(*Make("FLAT", col_a), base_result, N);
+      std::vector<std::optional<int32_t>> baseline(N);
+      for (idx_t i = 0; i < N; i++) {
+        baseline[i] = base_result.RowIsValid(i) ? std::optional<int32_t>(base_result.GetValue(i).GetAs<int32_t>())
+                                                : std::nullopt;
+      }
+
+      for (const auto &na : EncodingNames(col_a)) {
+        Vector *va = Make(na, col_a);
+        Vector result(PhysicalType::INTEGER, N);
+        fn(*va, result, N);
+        for (idx_t i = 0; i < N; i++) {
+          bool valid = result.RowIsValid(i);
+          EXPECT_EQ(valid, baseline[i].has_value())
+              << op_name << "(" << na << ") row " << i << ": nullness disagrees with FLAT";
+          if (valid && baseline[i].has_value()) {
+            EXPECT_EQ(result.GetValue(i).GetAs<int32_t>(), *baseline[i])
+                << op_name << "(" << na << ") row " << i << ": value disagrees with FLAT";
+          }
+        }
+      }
+    }
+  }
 };
 
 TEST_F(EncodingAgreementTest, EqualsAgreesAcrossEncodings) {
@@ -306,6 +339,27 @@ TEST_F(EncodingAgreementTest, NotDistinctFromAgreesAcrossEncodings) {
   });
 }
 
+TEST_F(EncodingAgreementTest, LessThanEqualsAgreesAcrossEncodings) {
+  CheckComparisonOverAllData("LessThanEquals", [](Vector &l, Vector &r, const SelectionVector *s, idx_t c,
+                                                  SelectionVector *t) {
+    return VectorOperations::LessThanEquals(l, r, s, c, t);
+  });
+}
+
+TEST_F(EncodingAgreementTest, GreaterThanEqualsAgreesAcrossEncodings) {
+  CheckComparisonOverAllData("GreaterThanEquals", [](Vector &l, Vector &r, const SelectionVector *s, idx_t c,
+                                                     SelectionVector *t) {
+    return VectorOperations::GreaterThanEquals(l, r, s, c, t);
+  });
+}
+
+TEST_F(EncodingAgreementTest, NotEqualsAgreesAcrossEncodings) {
+  CheckComparisonOverAllData("NotEquals", [](Vector &l, Vector &r, const SelectionVector *s, idx_t c,
+                                             SelectionVector *t) {
+    return VectorOperations::NotEquals(l, r, s, c, t);
+  });
+}
+
 TEST_F(EncodingAgreementTest, SumAgreesAcrossEncodings) {
   CheckArithOverAllData(
       "Sum", [](Vector &l, Vector &r, Vector &res, idx_t c) { VectorOperations::Sum(l, r, res, c); });
@@ -314,6 +368,28 @@ TEST_F(EncodingAgreementTest, SumAgreesAcrossEncodings) {
 TEST_F(EncodingAgreementTest, DifferenceAgreesAcrossEncodings) {
   CheckArithOverAllData("Difference",
                         [](Vector &l, Vector &r, Vector &res, idx_t c) { VectorOperations::Difference(l, r, res, c); });
+}
+
+TEST_F(EncodingAgreementTest, DotAgreesAcrossEncodings) {
+  CheckArithOverAllData(
+      "Dot", [](Vector &l, Vector &r, Vector &res, idx_t c) { VectorOperations::Dot(l, r, res, c); });
+}
+
+// The datasets hold no zero, so Division / Modulo never hit the divide-by-zero guard here —
+// this pins that the plain quotient / remainder is identical whatever the operands' encoding.
+TEST_F(EncodingAgreementTest, DivisionAgreesAcrossEncodings) {
+  CheckArithOverAllData("Division",
+                        [](Vector &l, Vector &r, Vector &res, idx_t c) { VectorOperations::Division(l, r, res, c); });
+}
+
+TEST_F(EncodingAgreementTest, ModuloAgreesAcrossEncodings) {
+  CheckArithOverAllData(
+      "Modulo", [](Vector &l, Vector &r, Vector &res, idx_t c) { VectorOperations::Modulo(l, r, res, c); });
+}
+
+TEST_F(EncodingAgreementTest, NegateAgreesAcrossEncodings) {
+  CheckUnaryArithOverAllData("Negate",
+                             [](Vector &in, Vector &res, idx_t c) { VectorOperations::Negate(in, res, c); });
 }
 
 // The NULL-aware comparators are the ones DISTINCT / GROUP BY / dedup rely on, and they are

@@ -12,12 +12,14 @@
 
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "database.h"
 
 namespace bumblebee {
 
@@ -121,10 +123,25 @@ class StringVectorWriter : public ResultWriter {
  * execution engine yet, so a query is answered by printing the plan it would have
  * run; `CREATE TABLE` is the one statement that has a real effect, registering a
  * schema in the catalog.
+ *
+ * Two backing modes: the default is a purely in-memory catalog (no disk, no
+ * persistence — used by the tests). The file constructor owns a durable `Database`
+ * (disk + buffer pool + persistent catalog + transaction manager), so a table
+ * created in one session is recovered on the next. Until the execution engine
+ * exists, only `CREATE TABLE` produces durable state; DML still just prints a plan.
  */
 class BumbleBeeInstance {
  public:
+  /** @brief An in-memory instance: no buffer pool, no disk, no persistence. */
   BumbleBeeInstance();
+
+  /**
+   * @brief A durable instance backed by `db_file`: owns a `Database` and takes its catalog from there.
+   * @param db_file    The database file to open (created if absent).
+   * @param num_frames Buffer-pool size in frames (defaults to the standard pool size).
+   */
+  explicit BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames = BUFFER_POOL_SIZE);
+
   ~BumbleBeeInstance();
 
   /**
@@ -139,8 +156,11 @@ class BumbleBeeInstance {
   /** @brief Register a few tables so a fresh shell has something to query. */
   void GenerateMockTable();
 
-  /** The catalog. */
-  std::unique_ptr<Catalog> catalog_;
+  /** @return The owning Database in durable mode, or nullptr for an in-memory instance. */
+  auto GetDatabase() -> Database * { return db_.get(); }
+
+  /** The catalog (non-owning): the in-memory one, or the durable Database's. */
+  Catalog *catalog_;
 
  private:
   void HandleCreateStatement(const CreateStatement &stmt, ResultWriter &writer);
@@ -148,6 +168,11 @@ class BumbleBeeInstance {
   void CmdDisplayTables(ResultWriter &writer);
   void CmdDisplayHelp(ResultWriter &writer);
   void WriteOneCell(const std::string &cell, ResultWriter &writer);
+
+  /** Durable backing (disk + BPM + catalog + txn manager); null for an in-memory instance. */
+  std::unique_ptr<Database> db_;
+  /** In-memory catalog; owns the catalog only when `db_` is null. */
+  std::unique_ptr<Catalog> owned_catalog_;
 };
 
 }  // namespace bumblebee

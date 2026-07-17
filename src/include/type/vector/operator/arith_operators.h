@@ -14,6 +14,7 @@
 
 #include <cmath>
 
+#include "common/limits.h"
 #include "type/bumble_string.h"
 
 namespace bumblebee {
@@ -76,6 +77,40 @@ struct And {
     return left & right;
   }
 };
+
+//===--------------------------------------------------------------------===//
+// Integer divide-by-zero guards
+//
+// `left / right` and `left % right` are undefined behavior — a SIGFPE trap on x86 — when
+// the integer divisor is zero. The floating-point paths are fine (they yield inf / NaN),
+// and the DECIMAL kernels in vector_arith.cpp already saturate a zero divisor to the type
+// maximum. These specializations bring the plain integer types in line with that DECIMAL
+// policy: a zero divisor saturates to the type maximum rather than trapping.
+//
+// NOTE: the signed INT_MIN / -1 overflow is a separate edge that also traps; it is not
+// guarded here, only the reported divide-by-zero.
+//===--------------------------------------------------------------------===//
+
+#define BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(TYPE)                        \
+  template <>                                                          \
+  inline auto Division::Operation(TYPE left, TYPE right) -> TYPE {     \
+    return right == 0 ? NumericLimits<TYPE>::Maximum() : left / right; \
+  }                                                                    \
+  template <>                                                          \
+  inline auto Modulo::Operation(TYPE left, TYPE right) -> TYPE {       \
+    return right == 0 ? NumericLimits<TYPE>::Maximum() : left % right; \
+  }
+
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(int8_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(int16_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(int32_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(int64_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(uint8_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(uint16_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(uint32_t)
+BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD(uint64_t)
+
+#undef BUMBLEBEE_DEFINE_INT_DIVMOD_GUARD
 
 //===--------------------------------------------------------------------===//
 // Float and double modulo

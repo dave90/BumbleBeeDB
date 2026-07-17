@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -40,8 +41,26 @@ auto main(int argc, char **argv) -> int {
   // test blows up but is just noise here: the shell reports the error itself.
   bumblebee::global_disable_exception_print.store(true);
 
-  auto instance = std::make_unique<bumblebee::BumbleBeeInstance>();
-  instance->GenerateMockTable();
+  // By default the shell is durable, backed by `bb.db` — the catalog (and, once the execution engine
+  // lands, the rows) survives across runs. `--db <path>` overrides the file; `--memory` (or `-m`) runs
+  // a purely in-memory instance that persists nothing.
+  std::filesystem::path db_path = "bb.db";
+  bool in_memory = false;
+  for (int i = 1; i < argc; i++) {
+    if (std::strcmp(argv[i], "--memory") == 0 || std::strcmp(argv[i], "-m") == 0) {
+      in_memory = true;
+    } else if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
+      db_path = argv[++i];
+    }
+  }
+
+  auto instance = in_memory ? std::make_unique<bumblebee::BumbleBeeInstance>()
+                            : std::make_unique<bumblebee::BumbleBeeInstance>(db_path);
+  // Seed the demo tables only when the catalog is empty — always for an in-memory instance, and for a
+  // brand-new file so reopening an existing database does not fail on a duplicate CREATE.
+  if (instance->catalog_->GetTableNames().empty()) {
+    instance->GenerateMockTable();
+  }
 
   // `-c "<sql>"` runs one statement and exits, which makes the shell scriptable.
   for (int i = 1; i < argc; i++) {
@@ -50,7 +69,8 @@ auto main(int argc, char **argv) -> int {
     }
   }
 
-  std::cout << "BumbleBeeDB — type \\help for help, Ctrl-D to exit." << std::endl;
+  std::cout << "BumbleBeeDB (" << (in_memory ? "in-memory" : db_path.string())
+            << ") — type \\help for help, Ctrl-D to exit." << std::endl;
 
   std::string query;
   while (true) {
