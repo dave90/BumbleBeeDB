@@ -1,0 +1,100 @@
+# ORDER BY ... LIMIT exercises the Top-N operator.
+
+statement ok
+CREATE TABLE t(name VARCHAR(8), score INT);
+
+statement ok
+INSERT INTO t VALUES ('a', 30), ('b', 10), ('c', 40), ('d', 20), ('e', 50);
+
+# VARCHAR values render quoted in result output.
+query
+SELECT name, score FROM t ORDER BY score DESC LIMIT 3;
+----
+'e' 50
+'c' 40
+'a' 30
+
+query
+SELECT score FROM t ORDER BY score LIMIT 2;
+----
+10
+20
+
+# LIMIT larger than the table returns everything, sorted.
+query
+SELECT score FROM t ORDER BY score LIMIT 100;
+----
+10
+20
+30
+40
+50
+
+# LIMIT 0 keeps nothing.
+query
+SELECT score FROM t ORDER BY score LIMIT 0;
+----
+
+# A later batch that is entirely worse than the kept rows must not change the result
+# (the integer prefilter prunes it wholesale).
+statement ok
+INSERT INTO t VALUES ('f', 60), ('g', 70), ('h', 80), ('i', 90);
+
+query
+SELECT score FROM t ORDER BY score LIMIT 2;
+----
+10
+20
+
+# ... and a batch with a new best row must displace the old one.
+statement ok
+INSERT INTO t VALUES ('j', 5);
+
+query
+SELECT name, score FROM t ORDER BY score LIMIT 2;
+----
+'j' 5
+'b' 10
+
+# String sort keys (no prefilter) with a tie: both 'b' rows outrank 'c'.
+statement ok
+CREATE TABLE s(v VARCHAR(8), k INT);
+
+statement ok
+INSERT INTO s VALUES ('c', 1), ('b', 2), ('a', 3), ('b', 4);
+
+query rowsort
+SELECT v FROM s ORDER BY v LIMIT 3;
+----
+'a'
+'b'
+'b'
+
+# Multiple sort keys with mixed directions under a LIMIT.
+query
+SELECT v, k FROM s ORDER BY v ASC, k DESC LIMIT 3;
+----
+'a' 3
+'b' 4
+'b' 2
+
+# NULLs under a LIMIT: ASC puts NULLs last (cut off), DESC puts them first (kept).
+statement ok
+CREATE TABLE n(a INT);
+
+statement ok
+INSERT INTO n VALUES (2), (NULL), (1), (3), (NULL);
+
+query
+SELECT a FROM n ORDER BY a LIMIT 3;
+----
+1
+2
+3
+
+query
+SELECT a FROM n ORDER BY a DESC LIMIT 3;
+----
+NULL
+NULL
+3

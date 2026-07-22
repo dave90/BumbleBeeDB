@@ -1,0 +1,32 @@
+# NULL semantics in aggregates: COUNT(*) counts rows, COUNT(col) skips NULLs, and SUM/MIN/MAX
+# ignore NULL inputs. An all-NULL column aggregates to NULL (except COUNT, which is 0).
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL);
+
+# COUNT(*) = every row; COUNT(a) = non-null a's; COUNT(b) skips the two NULLs.
+query
+SELECT COUNT(*), COUNT(a), COUNT(b) FROM t;
+----
+4 4 2
+
+# SUM/MIN/MAX ignore the NULL rows of b.
+query
+SELECT SUM(b), MIN(b), MAX(b) FROM t;
+----
+40 10 30
+
+statement ok
+CREATE TABLE allnull(x INT, y INT);
+
+statement ok
+INSERT INTO allnull VALUES (1, NULL), (2, NULL);
+
+# COUNT(*) still counts rows; COUNT/SUM/MIN/MAX over the all-NULL column collapse to 0 / NULL.
+query
+SELECT COUNT(*), COUNT(y), SUM(y), MIN(y), MAX(y) FROM allnull;
+----
+2 0 NULL NULL NULL

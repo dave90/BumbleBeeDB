@@ -1,0 +1,33 @@
+# A derived table (subquery in the FROM clause) with a required alias.
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40);
+
+query rowsort
+SELECT x.a FROM (SELECT a, b FROM t WHERE b >= 20) AS x;
+----
+2
+3
+4
+
+# Aggregate over a derived table.
+query
+SELECT COUNT(*), SUM(b) FROM (SELECT a, b FROM t WHERE a <= 2) AS x;
+----
+2 30
+
+# Join against a derived table.
+statement ok
+CREATE TABLE u(a INT, uv INT);
+
+statement ok
+INSERT INTO u VALUES (2,222),(3,333);
+
+query rowsort
+SELECT x.a, u.uv FROM (SELECT a FROM t WHERE b >= 20) AS x JOIN u ON x.a = u.a;
+----
+2 222
+3 333

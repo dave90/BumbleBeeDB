@@ -567,6 +567,42 @@ auto BPLUSTREE_TYPE::GetRootPageId() -> page_id_t {
   return header_rguard.template As<BPlusTreeHeaderPage>()->root_page_id_;
 }
 
+INDEX_TEMPLATE_ARGUMENTS
+void BPLUSTREE_TYPE::FreeSubtree(page_id_t page_id) {
+  // Collect this node's child ids while briefly holding it, then drop the guard before freeing —
+  // DeletePage refuses a pinned page, so a page can only be deleted once no guard references it.
+  std::vector<page_id_t> children;
+  {
+    ReadPageGuard guard = bpm_->ReadPage(page_id);
+    const auto *node = guard.template As<BPlusTreePage>();
+    if (!node->IsLeafPage()) {
+      const auto *internal = guard.template As<InternalPage>();
+      // An internal page holds GetSize() child pointers at ValueAt(0 .. GetSize()-1).
+      children.reserve(internal->GetSize());
+      for (int i = 0; i < internal->GetSize(); i++) {
+        children.push_back(internal->ValueAt(i));
+      }
+    }
+  }
+  for (page_id_t child : children) {
+    FreeSubtree(child);
+  }
+  bpm_->DeletePage(page_id);
+}
+
+INDEX_TEMPLATE_ARGUMENTS
+void BPLUSTREE_TYPE::FreeAllPages() {
+  page_id_t root_page_id;
+  {
+    ReadPageGuard header = bpm_->ReadPage(header_page_id_);
+    root_page_id = header.template As<BPlusTreeHeaderPage>()->root_page_id_;
+  }
+  if (root_page_id != INVALID_PAGE_ID) {
+    FreeSubtree(root_page_id);
+  }
+  bpm_->DeletePage(header_page_id_);
+}
+
 template class BPlusTree<GenericKey<4>, RID, GenericComparator<4>>;
 template class BPlusTree<GenericKey<8>, RID, GenericComparator<8>>;
 template class BPlusTree<GenericKey<16>, RID, GenericComparator<16>>;

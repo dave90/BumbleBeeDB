@@ -24,11 +24,13 @@
 #include "catalog/schema.h"
 #include "common/exception.h"
 #include "execution/expressions/abstract_expression.h"
+#include "execution/expressions/cast_expression.h"
 #include "execution/expressions/column_value_expression.h"
 #include "execution/plans/abstract_plan.h"
 #include "execution/plans/delete_plan.h"
 #include "execution/plans/filter_plan.h"
 #include "execution/plans/insert_plan.h"
+#include "execution/plans/projection_plan.h"
 #include "execution/plans/update_plan.h"
 #include "planner/planner.h"
 
@@ -42,18 +44,78 @@ auto MakeDmlResultSchema(const char *column_name) -> SchemaRef {
       std::vector{Column{column_name, LogicalType(LogicalTypeId::INTEGER)}});
 }
 
+/** @return Whether `t` is a number BumbleBee will implicitly widen between (integers, float, decimal). */
+auto IsNumericType(const LogicalType &t) -> bool {
+  switch (t.GetTypeId()) {
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER:
+    case LogicalTypeId::UBIGINT:
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+    case LogicalTypeId::DECIMAL:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * @brief Whether a value of type `from` may be stored into a column of type `to`.
+ *
+ * Allowed: the same type, or a lossless numeric widening (INT -> BIGINT, INT -> DOUBLE, ...). Narrowing
+ * and cross-family assignments need an explicit CAST and are rejected. `CommonType(from, to) == to` means
+ * `to` is the wider supertype.
+ */
+auto CanAssign(const LogicalType &from, const LogicalType &to) -> bool {
+  return from == to || (IsNumericType(from) && IsNumericType(to) && LogicalType::CommonType(from, to) == to);
+}
+
 }  // namespace
 
 auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRef {
   auto select = PlanSelect(*statement.select_);
 
-  // The rows being inserted must line up with the table, column for column.
+  // The rows being inserted must line up with the table, column for column — except the auto-generated
+  // `_id` primary key (column 0), which the INSERT executor fills, so the VALUES supply the rest.
   const auto &table_columns = statement.table_->schema_.GetColumns();
   const auto &child_columns = select->OutputSchema().GetColumns();
-  if (!std::equal(table_columns.cbegin(), table_columns.cend(), child_columns.cbegin(), child_columns.cend(),
-                  [](auto &&col1, auto &&col2) { return col1.GetType() == col2.GetType(); })) {
+  const bool auto_id = !table_columns.empty() && table_columns.front().GetName() == AUTO_ID_COLUMN;
+  const size_t offset = auto_id ? 1 : 0;
+
+  if (child_columns.size() != table_columns.size() - offset) {
     throw PlannerException(
         fmt::format("the values do not match the schema of table {}", statement.table_->table_));
+  }
+
+  // Each supplied column must match its target column's type or widen losslessly to it. Where a widening
+  // is needed (e.g. an INT literal into a BIGINT column), project the value through a CastExpression so
+  // the row reaches the heap at the column's physical width; matching columns pass through untouched.
+  std::vector<AbstractExpressionRef> proj_exprs;
+  proj_exprs.reserve(child_columns.size());
+  bool needs_cast = false;
+  for (size_t c = 0; c < child_columns.size(); c++) {
+    const auto &from = child_columns[c].GetType();
+    const auto &to = table_columns[c + offset].GetType();
+    if (!CanAssign(from, to)) {
+      throw PlannerException(
+          fmt::format("the values do not match the schema of table {}", statement.table_->table_));
+    }
+    AbstractExpressionRef col =
+        std::make_shared<ColumnValueExpression>(0, static_cast<uint32_t>(c), child_columns[c]);
+    if (from != to) {
+      col = std::make_shared<CastExpression>(std::move(col), to);
+      needs_cast = true;
+    }
+    proj_exprs.push_back(std::move(col));
+  }
+  if (needs_cast) {
+    auto proj_schema = std::make_shared<Schema>(ProjectionPlanNode::InferProjectionSchema(proj_exprs));
+    select = std::make_shared<ProjectionPlanNode>(std::move(proj_schema), std::move(proj_exprs), std::move(select));
   }
 
   return std::make_shared<InsertPlanNode>(MakeDmlResultSchema("__bumblebee_internal.insert_rows"),
@@ -95,6 +157,24 @@ auto Planner::PlanUpdate(const UpdateStatement &statement) -> AbstractPlanNodeRe
       target_exprs[idx] =
           std::make_shared<ColumnValueExpression>(0, idx, filter->output_schema_->GetColumn(idx));
     }
+  }
+
+  // A SET value may be produced at a narrower type than its column (e.g. `SET big = 1`, an INT into a
+  // BIGINT). Widen it through a CastExpression so the replacement row is written at the column's width;
+  // the unchanged columns already reference their old value at the column type, so they never need one.
+  for (size_t idx = 0; idx < target_exprs.size(); idx++) {
+    // Copy into values: GetReturnType() returns a Column by value, so a reference into its .GetType()
+    // would dangle.
+    const LogicalType to = filter->output_schema_->GetColumn(idx).GetType();
+    const LogicalType from = target_exprs[idx]->GetReturnType().GetType();
+    if (from == to) {
+      continue;
+    }
+    if (!CanAssign(from, to)) {
+      throw PlannerException(fmt::format("cannot assign a {} value to column '{}' of type {}", from.ToString(),
+                                         filter->output_schema_->GetColumn(idx).GetName(), to.ToString()));
+    }
+    target_exprs[idx] = std::make_shared<CastExpression>(std::move(target_exprs[idx]), to);
   }
 
   return std::make_shared<UpdatePlanNode>(MakeDmlResultSchema("__bumblebee_internal.update_rows"),

@@ -32,6 +32,12 @@ enum ExplainOptions : uint8_t {
   OPTIMIZER = 4,
   /** Print the output schema. */
   SCHEMA = 8,
+  /** Print the physical operator tree (post-lowering). */
+  PHYSICAL = 16,
+  /** Print the pipeline DAG (post-BuildPipelines). */
+  PIPELINES = 32,
+  /** Run the query and annotate the physical tree with per-operator profiling. */
+  ANALYZE = 64,
 };
 
 /**

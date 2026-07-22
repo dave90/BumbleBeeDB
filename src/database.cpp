@@ -47,6 +47,9 @@ Database::Database(const std::filesystem::path &db_file, size_t num_frames) : nu
   // The transaction manager is per-database and resolves oids through this catalog. Its default 2-hour
   // timeout is enforced whenever GarbageCollection() is driven.
   txn_manager_ = std::make_unique<TransactionManager>(catalog_.get());
+  // Restore the commit-ts high-water mark so readers see rows committed in earlier sessions. Without
+  // this, the counter restarts at 0 and every persisted row (ts >= 1) is invisible to a fresh snapshot.
+  txn_manager_->SetLastCommitTs(recovered_commit_ts_);
 }
 
 Database::~Database() { Close(); }
@@ -131,6 +134,7 @@ void Database::LoadCatalog(ByteReader &r) {
   }
   auto next_table_oid = r.GetU32();
   auto next_index_oid = r.GetU32();
+  recovered_commit_ts_ = r.GetI64();  // commit-ts high-water mark (v2), applied to the txn manager in the ctor
 
   // Rebuild the buffer pool seeded with the persisted allocator state, then the catalog over it.
   bpm_ = std::make_unique<BufferPoolManager>(num_frames_, dm_.get(), next_page_id);
@@ -145,7 +149,16 @@ void Database::LoadCatalog(ByteReader &r) {
     auto first_page_id = r.GetI32();
     auto last_page_id = r.GetI32();
     auto format = static_cast<StorageFormat>(r.GetU8());
-    catalog_->LoadTable(oid, name, schema, first_page_id, last_page_id, format);
+    // v3: primary-key column indices, the auto-_id flag, and the _id auto-increment high-water mark.
+    auto pk_count = r.GetU32();
+    std::vector<uint32_t> pk_attrs;
+    pk_attrs.reserve(pk_count);
+    for (uint32_t k = 0; k < pk_count; k++) {
+      pk_attrs.push_back(r.GetU32());
+    }
+    auto auto_id = r.GetU8() != 0;
+    auto next_id = r.GetI64();
+    catalog_->LoadTable(oid, name, schema, first_page_id, last_page_id, format, pk_attrs, auto_id, next_id);
   }
 
   auto index_count = r.GetU32();
@@ -200,6 +213,9 @@ void Database::SerializeCatalog(ByteWriter &w) {
   }
   w.PutU32(catalog_->GetNextTableOid());
   w.PutU32(catalog_->GetNextIndexOid());
+  // Persist the commit-ts high-water mark so a reopened database keeps handing out timestamps above every
+  // row already on disk; restored via TransactionManager::SetLastCommitTs on reopen.
+  w.PutI64(txn_manager_ != nullptr ? txn_manager_->GetLastCommitTs() : 0);
 
   auto tables = catalog_->GetTables();
   w.PutU32(static_cast<uint32_t>(tables.size()));
@@ -213,6 +229,13 @@ void Database::SerializeCatalog(ByteWriter &w) {
     w.PutI32(heap->GetFirstPageId());
     w.PutI32(heap->GetLastPageId());
     w.PutU8(static_cast<uint8_t>(t->storage_->GetFormat()));
+    // v3: primary-key column indices, the auto-_id flag, and the _id auto-increment high-water mark.
+    w.PutU32(static_cast<uint32_t>(t->pk_attrs_.size()));
+    for (auto a : t->pk_attrs_) {
+      w.PutU32(a);
+    }
+    w.PutU8(t->auto_id_ ? 1 : 0);
+    w.PutI64(t->next_id_.load());
   }
 
   auto indexes = catalog_->GetIndexes();

@@ -1,0 +1,35 @@
+# Negative coverage: clause / statement features that are NOT supported today.
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+
+# OFFSET — bound but not planned (even OFFSET 0 fails).
+statement error
+SELECT a FROM t ORDER BY a LIMIT 1 OFFSET 1;
+
+# LIMIT must be an integer literal, not an expression.
+statement error
+SELECT a FROM t LIMIT 1 + 1;
+
+# ORDER BY a column that is not in the SELECT list.
+statement error
+SELECT a FROM t ORDER BY b;
+
+# ORDER BY a select-list alias (the alias is not visible to ORDER BY).
+statement error
+SELECT a AS x FROM t ORDER BY x;
+
+# INSERT must supply all columns implicitly — an explicit column list is rejected.
+statement error
+INSERT INTO t (a, b) VALUES (4, 40);
+
+# Set operations are not supported.
+statement error
+SELECT a FROM t UNION SELECT b FROM t;
+
+# Scalar / IN subqueries in an expression are not supported.
+statement error
+SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t);

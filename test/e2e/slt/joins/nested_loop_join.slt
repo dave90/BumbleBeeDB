@@ -1,0 +1,20 @@
+# A non-equi join condition forces the nested-loop join (no hash key available).
+
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1,10),(2,20),(3,30);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (2,200),(3,300);
+
+query rowsort
+SELECT l.k, r.k FROM l JOIN r ON l.k < r.k;
+----
+1 2
+1 3
+2 3

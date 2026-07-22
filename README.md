@@ -100,3 +100,34 @@ TSan build:
 ```bash
 ./build-tsan/unit_tests --gtest_filter='*Concurrent*:*Mvcc*'
 ```
+
+### End-to-end SQL tests (`.slt`)
+
+`test/e2e/` holds a pytest harness that runs sqllogictest-style `.slt` files (SQL
+scripts with expected output) against the `BumbleBee` shell — one pytest test per
+file, grouped by feature (`aggregates/`, `joins/`, `dml/`, …). Each file runs
+against a fresh in-memory instance, so tests start from an empty catalog.
+
+```bash
+# Build the shell, then run the whole corpus (defaults to build/BumbleBee).
+cmake --build build --target BumbleBee
+python -m pytest test/e2e -v
+
+# One category or one file.
+python -m pytest test/e2e -v -k joins
+python -m pytest test/e2e/slt/joins/inner_join.slt -v
+```
+
+To exercise the vectorized engine's multi-chunk paths without thousands of rows,
+build a **small-vector** variant (a lowered `STANDARD_VECTOR_SIZE`, which is a
+compile-time constant) and point the harness at it:
+
+```bash
+cmake -S . -B build-smallvec -DCMAKE_BUILD_TYPE=Release -DBBDB_VECTOR_SIZE=4
+cmake --build build-smallvec --target BumbleBee
+BBDB_SLT_BIN=build-smallvec/BumbleBee BBDB_SLT_SMALL_VECTOR=1 python -m pytest test/e2e -v
+```
+
+Per-file `# config:` directives lower runtime knobs (morsel size, memory budget,
+threads) so a handful of rows can cover the same code paths. See
+[`test/e2e/README.md`](test/e2e/README.md) for the `.slt` format and directives.

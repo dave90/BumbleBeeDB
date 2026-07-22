@@ -173,6 +173,9 @@ void TransactionManager::Abort(Transaction *txn) {
   // Roll each write-set tuple back to its committed pre-image / tombstone fresh inserts. Snapshot the
   // write set under the txn latch first, so this is safe even when the caller is the GC reaper on a
   // different thread than the one that populated it.
+  // The index is a stable key -> RID directory that DML never deletes from (bustub-style): whether a key
+  // is live is read from the tuple's MVCC version, which the heap rollback above already restored. So an
+  // aborted insert's fresh tuple is tombstoned and a revived slot returns to deleted — no index undo.
   for (const auto &[oid, rids] : txn->SnapshotWriteSets()) {
     auto *heap = GetTableHeap(catalog_, oid);
     if (heap == nullptr) {

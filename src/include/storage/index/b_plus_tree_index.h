@@ -52,6 +52,8 @@ class BPlusTreeIndex : public Index {
   auto GetHeaderPageId() const -> page_id_t override { return tree_->GetHeaderPageId(); }
   auto GetKeySize() const -> size_t override { return KeySize; }
 
+  void FreeAllPages() override { tree_->FreeAllPages(); }
+
   void InsertEntry(const_data_ptr_t key, uint32_t key_len, RID rid) override {
     KeyType index_key;
     index_key.SetFromKey(key, key_len);

@@ -16,6 +16,11 @@
 
 #include "storage/buffer/arc_replacer.h"
 
+#include <atomic>
+#include <mutex>  // NOLINT
+#include <set>
+
+#include "concurrency_test_util.h"
 #include "gtest/gtest.h"
 
 namespace bumblebee {
@@ -372,5 +377,72 @@ TEST(ArcReplacerTest, RemoveBehaviorTest) {
 }
 
 // Feel free to write more tests!
+
+// Concurrent inserts then a concurrent drain: N threads each RecordAccess + SetEvictable on their own
+// disjoint frames (the shared ARC lists/maps are mutated in parallel under the replacer latch), then N
+// threads race to Evict() the pool dry. Every frame must be evicted exactly once — no lost or
+// double-evicted victim, and no torn state (TSan-clean).
+TEST(ArcReplacerTest, ConcurrentInsertThenDrainEvicts) {
+  const int threads = 8;
+  const int per_thread = 64;
+  const int total = threads * per_thread;
+  ArcReplacer replacer(total);
+
+  // Phase 1 — parallel population over disjoint frame ids.
+  LaunchParallelTest(threads, [&](uint64_t tid) {
+    for (int i = 0; i < per_thread; i++) {
+      auto f = static_cast<frame_id_t>(tid * per_thread + i);
+      replacer.RecordAccess(f, f + 1);  // page id kept distinct from frame id
+      replacer.SetEvictable(f, true);
+    }
+  });
+  ASSERT_EQ(replacer.Size(), static_cast<size_t>(total));
+
+  // Phase 2 — parallel drain: each thread evicts until the replacer is empty.
+  std::atomic<int> evicted{0};
+  std::mutex victims_latch;
+  std::set<frame_id_t> victims;
+  LaunchParallelTest(threads, [&](uint64_t /*tid*/) {
+    while (true) {
+      auto v = replacer.Evict();
+      if (!v.has_value()) {
+        break;
+      }
+      evicted.fetch_add(1, std::memory_order_relaxed);
+      std::lock_guard lk(victims_latch);
+      victims.insert(*v);
+    }
+  });
+
+  EXPECT_EQ(evicted.load(), total);
+  EXPECT_EQ(victims.size(), static_cast<size_t>(total));  // each frame evicted exactly once
+  EXPECT_EQ(replacer.Size(), 0U);
+  EXPECT_FALSE(replacer.Evict().has_value());
+}
+
+// Steady-state churn: each thread repeatedly RecordAccess/SetEvictable/Evict/Remove on its OWN frame,
+// mirroring how the buffer pool cycles a frame through the replacer. This races many threads through
+// every mutating entry point at once; it must not crash or deadlock, and afterwards the replacer must
+// still be internally consistent (Size reflects whatever is left, and drains cleanly).
+TEST(ArcReplacerTest, ConcurrentChurnStaysConsistent) {
+  const int threads = 8;
+  const int rounds = 200;
+  ArcReplacer replacer(threads);
+
+  LaunchParallelTest(threads, [&](uint64_t tid) {
+    auto f = static_cast<frame_id_t>(tid);
+    for (int r = 0; r < rounds; r++) {
+      replacer.RecordAccess(f, static_cast<page_id_t>(tid * rounds + r));
+      // Re-access to promote into the MFU list, then make it evictable and relinquish the frame.
+      replacer.RecordAccess(f, static_cast<page_id_t>(tid * rounds + r));
+      replacer.SetEvictable(f, true);
+      replacer.Remove(f);
+    }
+  });
+
+  // Every thread Removed its frame last, so nothing evictable remains.
+  EXPECT_EQ(replacer.Size(), 0U);
+  EXPECT_FALSE(replacer.Evict().has_value());
+}
 
 }  // namespace bumblebee

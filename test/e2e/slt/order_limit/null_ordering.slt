@@ -1,0 +1,43 @@
+# Where NULLs sort. Default convention: ASC puts NULLs LAST, DESC puts NULLs FIRST.
+
+statement ok
+CREATE TABLE t(a INT);
+
+statement ok
+INSERT INTO t VALUES (2),(3),(1);
+
+statement ok
+INSERT INTO t VALUES (NULL);
+
+statement ok
+INSERT INTO t VALUES (NULL);
+
+query
+SELECT a FROM t ORDER BY a;
+----
+1
+2
+3
+NULL
+NULL
+
+query
+SELECT a FROM t ORDER BY a DESC;
+----
+NULL
+NULL
+3
+2
+1
+
+# KNOWN LIMITATION: an explicit NULLS FIRST / NULLS LAST is parsed but IGNORED by execution — the
+# sort still uses the default (ASC = NULLs last). If NULLS FIRST is ever honored, update this expected
+# block (the first two rows would become NULL). See physical_sort.h / physical_top_n.h.
+query
+SELECT a FROM t ORDER BY a ASC NULLS FIRST;
+----
+1
+2
+3
+NULL
+NULL

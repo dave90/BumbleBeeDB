@@ -1,0 +1,24 @@
+# Sequential scan with WHERE filters, including a filter that selects nothing.
+
+statement ok
+CREATE TABLE t(id INT, v INT);
+
+statement ok
+INSERT INTO t VALUES (1,100),(2,200),(3,300),(4,400);
+
+query rowsort
+SELECT id, v FROM t WHERE v >= 200;
+----
+2 200
+3 300
+4 400
+
+query
+SELECT id FROM t WHERE v = 250;
+----
+
+query rowsort
+SELECT id FROM t WHERE v > 100 AND v < 400;
+----
+2
+3

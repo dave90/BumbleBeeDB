@@ -76,6 +76,14 @@ class Index {
   /** @return The byte width of this index's key slot (the concrete `KeySize`), for persistence. */
   virtual auto GetKeySize() const -> size_t { return 0; }
 
+  /**
+   * @brief Return every page this index owns to the buffer pool's free list (DROP TABLE / DROP INDEX).
+   *
+   * After this call the index must not be used again. The default is a no-op for index kinds that own
+   * no pages of their own.
+   */
+  virtual void FreeAllPages() {}
+
  protected:
   std::unique_ptr<IndexMetadata> metadata_;
 };

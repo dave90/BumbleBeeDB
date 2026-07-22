@@ -54,6 +54,8 @@ class BoundExpressionListRef;
 class BoundOrderBy;
 class BoundSubqueryRef;
 class CreateStatement;
+class DropStatement;
+class TransactionStatement;
 class ExplainStatement;
 class DeleteStatement;
 class UpdateStatement;
@@ -115,6 +117,10 @@ class Binder {
   auto BindExplain(duckdb_libpgquery::PGExplainStmt *stmt) -> std::unique_ptr<ExplainStatement>;
 
   auto BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique_ptr<CreateStatement>;
+
+  auto BindDrop(duckdb_libpgquery::PGDropStmt *stmt) -> std::unique_ptr<DropStatement>;
+
+  auto BindTransaction(duckdb_libpgquery::PGTransactionStmt *stmt) -> std::unique_ptr<TransactionStatement>;
 
   auto BindColumnDefinition(duckdb_libpgquery::PGColumnDef *cdef) -> Column;
 

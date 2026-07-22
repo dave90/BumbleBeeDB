@@ -1,0 +1,24 @@
+# Aggregates over a table with no rows: an ungrouped aggregate returns a single row
+# (COUNT = 0, SUM/MIN/MAX = NULL), while a GROUP BY over no rows returns no rows at all.
+
+statement ok
+CREATE TABLE e(a INT);
+
+query
+SELECT COUNT(*), SUM(a), MIN(a), MAX(a) FROM e;
+----
+0 NULL NULL NULL
+
+# GROUP BY over an empty table yields zero groups.
+query
+SELECT a, COUNT(*) FROM e GROUP BY a;
+----
+
+# A filter that selects nothing behaves the same as an empty table for the ungrouped aggregate.
+statement ok
+INSERT INTO e VALUES (1), (2), (3);
+
+query
+SELECT COUNT(*), SUM(a) FROM e WHERE a > 100;
+----
+0 NULL

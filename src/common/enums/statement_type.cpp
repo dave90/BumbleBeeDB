@@ -28,8 +28,12 @@ auto StatementTypeToString(StatementType type) -> std::string {
       return "Delete";
     case StatementType::CREATE_STATEMENT:
       return "Create";
+    case StatementType::DROP_STATEMENT:
+      return "Drop";
     case StatementType::EXPLAIN_STATEMENT:
       return "Explain";
+    case StatementType::TRANSACTION_STATEMENT:
+      return "Transaction";
   }
   return "Unknown";
 }

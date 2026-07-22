@@ -1,0 +1,79 @@
+# The auto-generated `_id` primary key. A table declared without a PRIMARY KEY gets a hidden-but-visible
+# BIGINT `_id` column prepended at position 0, made the primary key and backed by an auto index. `_id` is
+# filled from a per-table monotonic counter that is NEVER rewound (deleted ids are not reused).
+
+statement ok
+CREATE TABLE t(v INT);
+
+statement ok
+INSERT INTO t VALUES (10), (20), (30);
+
+# `_id` is visible: SELECT * returns it as column 0, and the user column shifts right.
+query
+SELECT * FROM t;
+----
+0 10
+1 20
+2 30
+
+# `_id` can be named explicitly, filtered on, and projected.
+query
+SELECT v FROM t WHERE _id = 1;
+----
+20
+
+query rowsort
+SELECT _id FROM t WHERE v > 15;
+----
+1
+2
+
+# The counter is monotonic across deletes: deleting _id=1 and inserting again hands out _id=3, not 1.
+statement ok
+DELETE FROM t WHERE v = 20;
+
+statement ok
+INSERT INTO t VALUES (40);
+
+query rowsort
+SELECT _id, v FROM t;
+----
+0 10
+2 30
+3 40
+
+# VALUES supply only the user columns — `_id` is auto-filled, never provided.
+statement error
+INSERT INTO t VALUES (99, 100);
+
+# A user column literally named `_id` is reserved and rejected at CREATE time.
+statement error
+CREATE TABLE bad(_id INT, v INT);
+
+# Each table has its OWN independent counter, both starting at 0.
+statement ok
+CREATE TABLE u(name VARCHAR);
+
+statement ok
+INSERT INTO u VALUES ('a'), ('b'), ('c');
+
+query
+SELECT _id, name FROM u;
+----
+0 'a'
+1 'b'
+2 'c'
+
+# A self-join on `_id` matches each row to itself (a point where the primary key equals itself).
+query rowsort
+SELECT x.name, y.name FROM u x JOIN u y ON x._id = y._id;
+----
+'a' 'a'
+'b' 'b'
+'c' 'c'
+
+# COUNT(*) over the whole table.
+query
+SELECT COUNT(*) FROM u;
+----
+3

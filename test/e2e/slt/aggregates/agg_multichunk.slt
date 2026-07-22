@@ -1,0 +1,22 @@
+# Aggregation whose input spans multiple vector chunks / scan morsels.
+# The lowered morsel size forces the parallel scan to hand out several morsels for a small
+# table (meaningful once --morsel-pages is wired in Phase 1); under the small-vector build the
+# 10 rows also cross chunk boundaries. The result must be identical regardless of chunking.
+# config: morsel_pages=1 threads=1
+
+statement ok
+CREATE TABLE t(a INT, g INT);
+
+statement ok
+INSERT INTO t VALUES (1,0),(2,0),(3,1),(4,1),(5,0),(6,1),(7,0),(8,1),(9,0),(10,1);
+
+query
+SELECT COUNT(*), SUM(a), MIN(a), MAX(a) FROM t;
+----
+10 55 1 10
+
+query rowsort
+SELECT g, COUNT(*), SUM(a) FROM t GROUP BY g;
+----
+0 5 24
+1 5 31

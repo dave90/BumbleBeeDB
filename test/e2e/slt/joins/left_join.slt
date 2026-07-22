@@ -1,0 +1,20 @@
+# LEFT OUTER join: unmatched left rows keep NULLs for the right columns.
+
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1,10),(2,20),(3,30);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (2,200),(3,300);
+
+query rowsort
+SELECT l.k, l.lv, r.rv FROM l LEFT JOIN r ON l.k = r.k;
+----
+1 10 NULL
+2 20 200
+3 30 300

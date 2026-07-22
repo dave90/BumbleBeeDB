@@ -1,0 +1,19 @@
+# Inner equi-join (hash join).
+
+statement ok
+CREATE TABLE a(k INT, av INT);
+
+statement ok
+INSERT INTO a VALUES (1,10),(2,20),(3,30);
+
+statement ok
+CREATE TABLE b(k INT, bv INT);
+
+statement ok
+INSERT INTO b VALUES (2,200),(3,300),(4,400);
+
+query rowsort
+SELECT a.k, a.av, b.bv FROM a JOIN b ON a.k = b.k;
+----
+2 20 200
+3 30 300

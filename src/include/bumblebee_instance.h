@@ -19,12 +19,19 @@
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "concurrency/transaction_manager.h"
 #include "database.h"
+#include "storage/buffer/buffer_pool_manager.h"
+#include "storage/disk/memory_disk_manager.h"
 
 namespace bumblebee {
 
 class CreateStatement;
+class DropStatement;
+class TransactionStatement;
 class ExplainStatement;
+class BoundStatement;
+class ClientContext;
 
 /**
  * Where a statement's results are written. The instance drives this interface; the
@@ -53,6 +60,18 @@ class ResultWriter {
     EndTable();
   }
 
+  /**
+   * @brief The most result rows this writer wants emitted; 0 means unlimited.
+   *
+   * `WriteResultTable` stops after this many rows and then calls `WriteTruncationNotice`. The default
+   * is unlimited so machine consumers (the tests' `StringVectorWriter`, the e2e protocol) see every row;
+   * only the interactive shell's writer caps output.
+   */
+  virtual auto MaxDisplayRows() const -> idx_t { return 0; }
+
+  /** @brief Called once when output was capped: `shown` of `total` rows were emitted. Default no-op. */
+  virtual void WriteTruncationNotice(idx_t shown, idx_t total) {}
+
   bool simplified_output_{false};
 };
 
@@ -72,8 +91,12 @@ class NoopWriter : public ResultWriter {
 /** @brief Writes separator-delimited plain text to a stream. Used by the shell. */
 class SimpleStreamWriter : public ResultWriter {
  public:
-  explicit SimpleStreamWriter(std::ostream &stream, bool disable_header = false, std::string separator = "\t")
-      : disable_header_(disable_header), stream_(stream), separator_(std::move(separator)) {}
+  explicit SimpleStreamWriter(std::ostream &stream, bool disable_header = false, std::string separator = "\t",
+                              idx_t max_display_rows = 0)
+      : disable_header_(disable_header),
+        stream_(stream),
+        separator_(std::move(separator)),
+        max_display_rows_(max_display_rows) {}
 
   void WriteCell(const std::string &cell) override { stream_ << cell << separator_; }
 
@@ -96,9 +119,18 @@ class SimpleStreamWriter : public ResultWriter {
   void BeginTable(bool simplified_output) override {}
   void EndTable() override {}
 
+  auto MaxDisplayRows() const -> idx_t override { return max_display_rows_; }
+
+  void WriteTruncationNotice(idx_t shown, idx_t total) override {
+    stream_ << "-- showing first " << shown << " of " << total << " rows (--max-rows 0 to show all) --"
+            << std::endl;
+  }
+
   bool disable_header_;
   std::ostream &stream_;
   std::string separator_;
+  /** Cap on rows emitted (0 = unlimited); the interactive shell sets this so a huge SELECT is truncated. */
+  idx_t max_display_rows_;
 };
 
 /** @brief Collects the cells into a vector of rows. Used by the tests. */
@@ -161,18 +193,51 @@ class BumbleBeeInstance {
 
   /** The catalog (non-owning): the in-memory one, or the durable Database's. */
   Catalog *catalog_;
+  /** The transaction manager (non-owning): the in-memory one, or the durable Database's. */
+  TransactionManager *txn_mgr_;
+  /** The buffer pool (non-owning): the in-memory one, or the durable Database's. */
+  BufferPoolManager *bpm_;
+
+  /** Force lowering to the out-of-core join/sort variants (tests toggle this to exercise the spill path). */
+  bool prefer_external_{false};
+  /** The per-query memory budget passed to each statement's ClientContext. */
+  idx_t max_memory_{MAX_MEMORY};
+  /** Worker-thread cap per statement; 0 leaves the ClientContext's hardware-detected default in place. */
+  idx_t max_threads_{0};
+  /** Heap pages per parallel-scan morsel passed to each statement's ClientContext. */
+  idx_t morsel_pages_{MORSEL_PAGES};
+  /** Target rows per columnar morsel passed to each statement's ClientContext (reserved). */
+  idx_t morsel_size_{MORSEL_SIZE};
 
  private:
   void HandleCreateStatement(const CreateStatement &stmt, ResultWriter &writer);
+  void HandleDropStatement(const DropStatement &stmt, ResultWriter &writer);
+  void HandleTransactionStatement(const TransactionStatement &stmt, ResultWriter &writer);
   void HandleExplainStatement(const ExplainStatement &stmt, ResultWriter &writer);
+  /** @brief Bind → plan → optimize → lower → execute one non-DDL statement, streaming rows to `writer`. */
+  void ExecuteStatement(const BoundStatement &statement, ResultWriter &writer);
+  /** @brief Copy this instance's tunables (memory, threads, morsel, spill) onto a statement's ClientContext. */
+  void ApplyConfig(ClientContext &client) const;
   void CmdDisplayTables(ResultWriter &writer);
+  void CmdDescribeTable(const std::string &table_name, ResultWriter &writer);
   void CmdDisplayHelp(ResultWriter &writer);
+  void CmdClear(ResultWriter &writer);
   void WriteOneCell(const std::string &cell, ResultWriter &writer);
+
+  /**
+   * The explicit transaction opened by BEGIN, or null when statements autocommit. While set, every DML /
+   * SELECT statement runs inside it (seeing its own uncommitted writes) until COMMIT or ROLLBACK; a
+   * statement that errors aborts and clears it. Non-owning — the transaction manager owns the object.
+   */
+  Transaction *active_txn_{nullptr};
 
   /** Durable backing (disk + BPM + catalog + txn manager); null for an in-memory instance. */
   std::unique_ptr<Database> db_;
-  /** In-memory catalog; owns the catalog only when `db_` is null. */
+  /** In-memory backing (used only when `db_` is null): a memory disk + buffer pool + catalog + txn mgr. */
+  std::unique_ptr<MemoryDiskManager> mem_disk_;
+  std::unique_ptr<BufferPoolManager> owned_bpm_;
   std::unique_ptr<Catalog> owned_catalog_;
+  std::unique_ptr<TransactionManager> owned_txn_mgr_;
 };
 
 }  // namespace bumblebee

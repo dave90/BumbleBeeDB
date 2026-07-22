@@ -1,0 +1,36 @@
+# Scan / filter / aggregate whose input crosses vector-chunk boundaries with only a handful of rows.
+# Requires the small-vector build (STANDARD_VECTOR_SIZE lowered, e.g. to 4): 10 rows then span
+# several chunks, so a broken chunk boundary (dropped or duplicated rows) changes the result.
+# require: small_vector
+# config: morsel_pages=1 threads=1
+
+statement ok
+CREATE TABLE t(a INT, g INT);
+
+statement ok
+INSERT INTO t VALUES (1,0),(2,1),(3,0),(4,1),(5,0),(6,1),(7,0),(8,1),(9,0),(10,1);
+
+# Every row must survive the multi-chunk scan + filter.
+query rowsort
+SELECT a FROM t WHERE g = 0;
+----
+1
+3
+5
+7
+9
+
+# Aggregate over a chunk-spanning input.
+query
+SELECT COUNT(*), SUM(a) FROM t;
+----
+10 55
+
+# Order across chunk boundaries.
+query
+SELECT a FROM t ORDER BY a DESC LIMIT 4;
+----
+10
+9
+8
+7

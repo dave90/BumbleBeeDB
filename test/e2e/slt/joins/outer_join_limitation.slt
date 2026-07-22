@@ -1,0 +1,35 @@
+# KNOWN LIMITATION: RIGHT JOIN and FULL OUTER JOIN are accepted by the binder/planner but no operator
+# implements them — they silently execute as INNER joins (matches only, no NULL-padded rows). LEFT JOIN
+# is implemented correctly. This file pins the current (incorrect) RIGHT/FULL behavior so a future fix
+# is caught: when RIGHT/FULL are honored, the unmatched rows below appear and these blocks change.
+
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1,10),(2,20);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (2,200),(3,300);
+
+# LEFT JOIN is correct: the unmatched left row (k=1) is kept with a NULL right column.
+query rowsort
+SELECT l.lv, r.rv FROM l LEFT JOIN r ON l.k = r.k;
+----
+10 NULL
+20 200
+
+# RIGHT JOIN currently behaves as INNER — the unmatched right row (k=3) is dropped instead of kept.
+query rowsort
+SELECT l.lv, r.rv FROM l RIGHT JOIN r ON l.k = r.k;
+----
+20 200
+
+# FULL OUTER JOIN currently behaves as INNER — both unmatched rows (k=1, k=3) are dropped.
+query rowsort
+SELECT l.lv, r.rv FROM l FULL JOIN r ON l.k = r.k;
+----
+20 200

@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -205,6 +206,35 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
 
   if (columns.empty()) {
     throw BinderException("should have at least 1 column");
+  }
+
+  // The `_id` name is reserved for the auto-generated primary key; a user may not declare it (compared
+  // case-insensitively, since an unquoted `_ID` folds to `_id`).
+  for (const auto &col : columns) {
+    if (StringUtil::Lower(col.GetName()) == AUTO_ID_COLUMN) {
+      throw BinderException(fmt::format("column name '{}' is reserved for the auto-generated primary key",
+                                        AUTO_ID_COLUMN));
+    }
+  }
+
+  // No PRIMARY KEY declared: prepend an auto-increment `_id` BIGINT column and make it the primary key.
+  if (pk.empty()) {
+    std::vector<Column> with_id;
+    with_id.reserve(columns.size() + 1);
+    with_id.push_back(Column::Make(AUTO_ID_COLUMN, LogicalType(LogicalTypeId::BIGINT)));
+    for (auto &c : columns)  with_id.push_back(std::move(c));
+
+    columns = std::move(with_id);
+    pk = {AUTO_ID_COLUMN};
+  } else {
+    // A declared PRIMARY KEY must name real columns.
+    for (const auto &key_col : pk) {
+      const bool found = std::any_of(columns.begin(), columns.end(),
+                                     [&](const Column &c) { return c.GetName() == key_col; });
+      if (!found) {
+        throw BinderException(fmt::format("primary key column '{}' does not exist", key_col));
+      }
+    }
   }
 
   return std::make_unique<CreateStatement>(std::move(table), std::move(columns), std::move(pk));

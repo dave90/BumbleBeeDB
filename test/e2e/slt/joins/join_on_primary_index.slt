@@ -1,0 +1,119 @@
+# Joins where the join key is a primary key — both the auto `_id` primary index and an explicit
+# PRIMARY KEY column — across two and three tables. (Point lookups still full-scan today, so these
+# exercise correctness of the join, not the index access path.)
+
+# --- Join a child table to a parent's auto `_id` primary key -----------------------------------------
+# `users` has no declared PK, so it gets `_id` 0,1,2. `orders.uid` is a BIGINT foreign key referencing
+# those ids (the FK column must be BIGINT to match `_id`'s type).
+
+statement ok
+CREATE TABLE users(name VARCHAR);
+
+statement ok
+INSERT INTO users VALUES ('alice'), ('bob'), ('carol');
+
+statement ok
+CREATE TABLE profile(bio VARCHAR);
+
+statement ok
+INSERT INTO profile VALUES ('x'), ('y'), ('z');
+
+# Two parent tables joined on their aligned `_id` primary keys (BIGINT = BIGINT).
+query rowsort
+SELECT users.name, profile.bio FROM users JOIN profile ON users._id = profile._id;
+----
+'alice' 'x'
+'bob' 'y'
+'carol' 'z'
+
+# Only the overlapping ids match: profile has an extra row (id 2 already matched; give users fewer).
+statement ok
+CREATE TABLE two(name VARCHAR);
+
+statement ok
+INSERT INTO two VALUES ('p'), ('q');
+
+query rowsort
+SELECT two.name, profile.bio FROM two JOIN profile ON two._id = profile._id;
+----
+'p' 'x'
+'q' 'y'
+
+# --- Join on an explicit INT PRIMARY KEY (parent) to an INT foreign key (child) ----------------------
+
+statement ok
+CREATE TABLE dept(id INT PRIMARY KEY, dname VARCHAR);
+
+statement ok
+INSERT INTO dept VALUES (1, 'Eng'), (2, 'Sales'), (3, 'HR');
+
+statement ok
+CREATE TABLE emp(deptid INT, ename VARCHAR);
+
+statement ok
+INSERT INTO emp VALUES (1, 'alice'), (1, 'bob'), (2, 'carol');
+
+# Inner join child -> parent PK: HR (id 3) has no employees and drops out.
+query rowsort
+SELECT emp.ename, dept.dname FROM emp JOIN dept ON emp.deptid = dept.id;
+----
+'alice' 'Eng'
+'bob' 'Eng'
+'carol' 'Sales'
+
+# LEFT join parent -> child keeps the unmatched parent PK (HR) with NULLs for the child columns.
+query rowsort
+SELECT dept.dname, emp.ename FROM dept LEFT JOIN emp ON emp.deptid = dept.id;
+----
+'Eng' 'alice'
+'Eng' 'bob'
+'HR' NULL
+'Sales' 'carol'
+
+# Aggregate over a PK join: group employees by their department name.
+query rowsort
+SELECT dept.dname, COUNT(*) FROM dept JOIN emp ON emp.deptid = dept.id GROUP BY dept.dname;
+----
+'Eng' 2
+'Sales' 1
+
+# Filter on the primary-key column combined with the join.
+query
+SELECT emp.ename FROM emp JOIN dept ON emp.deptid = dept.id WHERE dept.id = 2;
+----
+'carol'
+
+# --- Three-table chain, every join on a primary key --------------------------------------------------
+# a.id (PK) <- b.aid ; b.id (PK) <- c.bid
+
+statement ok
+CREATE TABLE a(id INT PRIMARY KEY, av INT);
+
+statement ok
+INSERT INTO a VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE TABLE b(id INT PRIMARY KEY, aid INT, bv INT);
+
+statement ok
+INSERT INTO b VALUES (1, 1, 11), (2, 2, 22), (3, 1, 33);
+
+statement ok
+CREATE TABLE c(id INT PRIMARY KEY, bid INT);
+
+statement ok
+INSERT INTO c VALUES (1, 1), (2, 3);
+
+query rowsort
+SELECT a.av, b.bv, c.id FROM a JOIN b ON b.aid = a.id JOIN c ON c.bid = b.id;
+----
+100 11 1
+100 33 2
+
+# Self-join on an explicit primary key: pair each row with itself.
+query rowsort
+SELECT x.dname, y.dname FROM dept x JOIN dept y ON x.id = y.id;
+----
+'Eng' 'Eng'
+'HR' 'HR'
+'Sales' 'Sales'

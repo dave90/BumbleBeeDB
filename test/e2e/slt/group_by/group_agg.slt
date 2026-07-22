@@ -1,0 +1,22 @@
+# GROUP BY with per-group aggregates. Hash aggregation does not guarantee output order, so the
+# result is compared order-insensitively with `rowsort`.
+
+statement ok
+CREATE TABLE sales(region INT, amt INT);
+
+statement ok
+INSERT INTO sales VALUES (1,100),(1,200),(2,50),(2,50),(3,10);
+
+query rowsort
+SELECT region, COUNT(*), SUM(amt) FROM sales GROUP BY region;
+----
+1 2 300
+2 2 100
+3 1 10
+
+# Group with a filter applied before aggregation.
+query rowsort
+SELECT region, MAX(amt) FROM sales WHERE amt > 40 GROUP BY region;
+----
+1 200
+2 50

@@ -84,11 +84,22 @@ class BPlusTree {
   auto GetRootPageId() -> page_id_t;
   auto GetHeaderPageId() const -> page_id_t { return header_page_id_; }
 
+  /**
+   * @brief Free every page of the tree — header, root and all descendants — to the free list.
+   *
+   * A post-order walk from the root deletes each subtree's children before the node itself, then the
+   * header page last. The tree must not be used afterwards (DROP TABLE / DROP INDEX).
+   */
+  void FreeAllPages();
+
   auto Begin() -> IndexIteratorType;
   auto Begin(const KeyType &key) -> IndexIteratorType;
   auto End() -> IndexIteratorType;
 
  private:
+  /** @brief Post-order delete the subtree rooted at `page_id`, freeing every page in it. */
+  void FreeSubtree(page_id_t page_id);
+
   auto RecursiveInsert(Context &ctx, const KeyType &key, const ValueType &value) -> InsertInternalResult;
   auto InitBPlusTree(const KeyType &key, const ValueType &value) -> page_id_t;
   auto RecursiveInsertLeaf(Context &ctx, const KeyType &key, const ValueType &value) -> InsertInternalResult;

@@ -1,0 +1,96 @@
+# Implicit numeric widening on write: a value produced at a narrower type is cast up to its target
+# column's type for INSERT and UPDATE (e.g. an INT literal into a BIGINT column). Narrowing and
+# cross-family assignments are still rejected.
+
+# --- INSERT: INT literal into a BIGINT column -----------------------------------------------------
+
+statement ok
+CREATE TABLE o(uid BIGINT, amt INT);
+
+statement ok
+INSERT INTO o VALUES (5, 100), (7, 200);
+
+query rowsort
+SELECT uid, amt FROM o;
+----
+5 100
+7 200
+
+# --- UPDATE: INT literal into a BIGINT column -----------------------------------------------------
+
+statement ok
+UPDATE o SET uid = 42 WHERE amt = 100;
+
+query rowsort
+SELECT uid, amt FROM o;
+----
+42 100
+7 200
+
+# --- INSERT: INT into a DOUBLE column -------------------------------------------------------------
+
+statement ok
+CREATE TABLE d(x DOUBLE, y INT);
+
+statement ok
+INSERT INTO d VALUES (3, 1);
+
+query
+SELECT x, y FROM d;
+----
+3 1
+
+# --- A BIGINT foreign key can now be populated and joined against the auto `_id` -------------------
+# `users` gets a hidden BIGINT `_id` (0,1,2). `ord.uid` is a BIGINT FK; small INT literals widen into it,
+# so the join on `_id = uid` (both BIGINT) matches.
+
+statement ok
+CREATE TABLE users(name VARCHAR);
+
+statement ok
+INSERT INTO users VALUES ('a'), ('b'), ('c');
+
+statement ok
+CREATE TABLE ord(uid BIGINT, amt INT);
+
+statement ok
+INSERT INTO ord VALUES (0, 100), (0, 200), (2, 300);
+
+query rowsort
+SELECT users.name, ord.amt FROM users JOIN ord ON users._id = ord.uid;
+----
+'a' 100
+'a' 200
+'c' 300
+
+# --- UPDATE the auto `_id` (BIGINT) with an INT literal, uniqueness enforced -----------------------
+
+statement ok
+CREATE TABLE t(v INT);
+
+statement ok
+INSERT INTO t VALUES (100), (200), (300);
+
+# _id 0 -> 99 (a real value now, not garbage).
+statement ok
+UPDATE t SET _id = 99 WHERE _id = 0;
+
+query rowsort
+SELECT _id, v FROM t;
+----
+1 200
+2 300
+99 100
+
+# Moving _id onto an occupied value is rejected (the key bytes are now correct, so uniqueness works).
+statement error
+UPDATE t SET _id = 1 WHERE _id = 2;
+
+# --- Narrowing is still rejected ------------------------------------------------------------------
+# 9999999999 does not fit INT (it is a wider numeric literal), so storing it into an INT column fails.
+
+statement ok
+CREATE TABLE n(a INT);
+
+statement error
+INSERT INTO n VALUES (9999999999);

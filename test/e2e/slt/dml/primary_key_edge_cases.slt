@@ -1,0 +1,118 @@
+# Exhaustive edge cases for the PRIMARY KEY / primary-index feature: composite keys, enforcement
+# corners, DDL validation, and the current known limitations (documented here as regression anchors,
+# not endorsements — see the notes on each).
+
+# --- Composite primary key ---------------------------------------------------------------------------
+# PRIMARY KEY(a, b): the pair must be unique; either column may repeat alone.
+
+statement ok
+CREATE TABLE ck(a INT, b INT, v INT, PRIMARY KEY(a, b));
+
+statement ok
+INSERT INTO ck VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30);
+
+# (1,1) already exists -> duplicate composite key is rejected.
+statement error
+INSERT INTO ck VALUES (1, 1, 99);
+
+# a=1 and b=1 each repeat across DIFFERENT rows, which is fine — only the PAIR is unique.
+query rowsort
+SELECT a, b, v FROM ck;
+----
+1 1 10
+1 2 20
+2 1 30
+
+# --- Enforcement corners -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE pk(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO pk VALUES (1, 10);
+
+# A duplicate within a SINGLE multi-row INSERT is caught and the statement fails.
+statement error
+INSERT INTO pk VALUES (2, 20), (2, 21);
+
+# The HEAP rolls back cleanly: no rows from the failed batch survive — the table still has only (1,10).
+query rowsort
+SELECT id, v FROM pk;
+----
+1 10
+
+# Index maintenance is transactional: the first batch row's key (2) was inserted into the index before
+# the duplicate was hit, but the abort replays the inverse and removes it. So key 2 is NOT leaked and can
+# be inserted cleanly afterwards.
+statement ok
+INSERT INTO pk VALUES (2, 20);
+
+statement ok
+INSERT INTO pk VALUES (3, 30);
+
+query rowsort
+SELECT id, v FROM pk;
+----
+1 10
+2 20
+3 30
+
+# UPDATE / DELETE that match zero rows succeed and report 0 affected.
+query
+UPDATE pk SET v = 99 WHERE id = 404;
+----
+0
+
+query
+DELETE FROM pk WHERE id = 404;
+----
+0
+
+# --- DDL validation ----------------------------------------------------------------------------------
+
+# Two PRIMARY KEY declarations are rejected.
+statement error
+CREATE TABLE two_pk(a INT PRIMARY KEY, b INT PRIMARY KEY);
+
+# A table-level PRIMARY KEY must name real columns.
+statement error
+CREATE TABLE bad_pk(a INT, PRIMARY KEY(nope));
+
+# --- Current limitations (documented behavior; may change if the engine grows) -----------------------
+
+# A VARCHAR primary key is not supported: the fixed-width index cannot scatter variable-length keys.
+statement ok
+CREATE TABLE vpk(code VARCHAR PRIMARY KEY, v INT);
+
+statement error
+INSERT INTO vpk VALUES ('AA', 1);
+
+# A NULL in a primary-key column is currently ACCEPTED (no NOT-NULL enforcement on the PK yet).
+statement ok
+CREATE TABLE npk(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO npk VALUES (NULL, 1);
+
+query
+SELECT id, v FROM npk;
+----
+NULL 1
+
+# UPDATE maintains the primary-key index: updating a key to a value that already exists is rejected
+# (uniqueness enforced), the same as INSERT.
+statement ok
+CREATE TABLE upk(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO upk VALUES (1, 10), (2, 20);
+
+statement error
+UPDATE upk SET id = 2 WHERE id = 1;
+
+# The rejected UPDATE changed nothing (the transaction rolled back).
+query rowsort
+SELECT id, v FROM upk;
+----
+1 10
+2 20

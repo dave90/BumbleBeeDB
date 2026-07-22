@@ -1,0 +1,23 @@
+# INSERT reports the number of rows inserted (asserted via a `query` record).
+
+statement ok
+CREATE TABLE t(v INT);
+
+query
+INSERT INTO t VALUES (1),(2),(3);
+----
+3
+
+query
+INSERT INTO t VALUES (4);
+----
+1
+
+query
+SELECT COUNT(*), SUM(v) FROM t;
+----
+4 10
+
+# A row whose values do not match the table schema must fail.
+statement error
+INSERT INTO t VALUES (1, 2);

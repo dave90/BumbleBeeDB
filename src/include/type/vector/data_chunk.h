@@ -159,6 +159,13 @@ class DataChunk {
   /** @return The type of every column. */
   auto GetTypes() const -> std::vector<LogicalType>;
 
+  /**
+   * @return An estimate of the bytes these rows occupy once materialized: the inline
+   *         stride of every column plus the out-of-line payloads (string bytes, list and
+   *         array elements) the inline stride only points at.
+   */
+  auto EstimatedBytes() -> idx_t;
+
   /** @return A printable rendering of the chunk. */
   auto ToString() const -> std::string;
 

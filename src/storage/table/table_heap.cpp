@@ -45,89 +45,102 @@ auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UB
 }  // namespace
 
 /**
- * @brief A sequential scan over a `TableHeap`, one page (one chunk) at a time.
+ * @brief A scan over one `[begin, end)` page-index morsel of a `ParallelScanState`, a page per chunk.
  *
- * The current page's guard is held across the `Next` return so gathered strings can reference the
- * pinned frame zero-copy; it is dropped when the next page is pulled or the scan is destroyed.
+ * The scan addresses pages through the state's snapshotted page directory rather than by following the
+ * on-disk chain, so many `HeapScan`s over disjoint morsels of the same snapshot run concurrently. The
+ * current page's guard is held across the `Next` return so gathered strings can reference the pinned
+ * frame zero-copy; it is dropped when the next page is pulled or the scan is destroyed.
  */
 class HeapScan : public TableScan {
  public:
-  HeapScan(TableHeap *heap, std::vector<idx_t> projection, TransactionManager *txn_mgr = nullptr,
-           Transaction *txn = nullptr, ScanPredicate predicate = {})
-      : heap_(heap),
-        projection_(std::move(projection)),
-        current_page_(heap->first_page_id_),
-        txn_mgr_(txn_mgr),
-        txn_(txn),
-        predicate_(std::move(predicate)) {
+  HeapScan(std::shared_ptr<ParallelScanState> state, idx_t begin, idx_t end)
+      : state_(std::move(state)), page_idx_(begin), page_end_(std::min<idx_t>(end, state_ ? state_->pages_.size() : 0)) {
+    projection_ = state_->projection_;
     if (projection_.empty()) {
-      for (idx_t i = 0; i < heap_->layout_.GetColumnCount(); i++) {
+      for (idx_t i = 0; i < state_->heap_->layout_.GetColumnCount(); i++) {
         projection_.push_back(i);
       }
     }
-    // Snapshot the end of the heap at scan-open time: the last page and its live slot count. Rows
-    // appended after this point are not visited (the Halloween problem) — inserts only ever extend
-    // the tail page, so earlier pages are frozen and only the stop page can grow past the bound.
-    std::lock_guard lock(heap_->latch_);
-    stop_page_id_ = heap_->last_page_id_;
-    auto guard = heap_->bpm_->ReadPage(stop_page_id_);
-    stop_slot_ = guard.As<TablePage>()->GetNumTuples();
   }
 
   auto Next(DataChunk &out, Vector *row_ids) -> bool override {
-    const bool mvcc = txn_ != nullptr;
-    while (current_page_ != INVALID_PAGE_ID) {
-      auto guard = heap_->bpm_->ReadPage(current_page_);
-      const auto *page = guard.As<TablePage>();
-      bool at_stop_page = current_page_ == stop_page_id_;
-      // On the stop page, only the rows that existed when the scan opened; elsewhere, all rows.
-      auto num_slots = at_stop_page ? stop_slot_ : page->GetNumTuples();
+    auto &heap = *state_->heap_;
+    auto *txn_mgr = state_->txn_mgr_;
+    auto *txn = state_->txn_;
+    const bool mvcc = txn != nullptr;
+    const auto &predicate = state_->predicate_;
+    const idx_t last_page_idx = state_->pages_.empty() ? 0 : state_->pages_.size() - 1;
 
+    while (true) {
+      // Retire a fully-drained page. The guard was held across the previous return so that page's
+      // zero-copy strings stayed valid until the consumer processed the chunk; it is safe to drop now.
+      if (guard_.has_value() && slot_cursor_ >= cur_num_slots_) {
+        guard_.reset();
+        page_idx_++;
+      }
+      // Pin the next page. A page holds many rows — potentially more than STANDARD_VECTOR_SIZE — so a
+      // single page is drained across several `Next` calls, a vector's worth of rows at a time.
+      if (!guard_.has_value()) {
+        if (page_idx_ >= page_end_) {
+          return false;
+        }
+        guard_ = heap.bpm_->ReadPage(state_->pages_[page_idx_]);
+        slot_cursor_ = 0;
+        // Only the last page of the snapshot carries the Halloween slot cap; earlier pages are frozen
+        // (a page stops growing the moment a fresh page is linked after it), so all their slots count.
+        cur_num_slots_ = page_idx_ == last_page_idx ? state_->stop_slot_ : guard_->As<TablePage>()->GetNumTuples();
+      }
+
+      const page_id_t current_page = state_->pages_[page_idx_];
+      const auto *page = guard_->As<TablePage>();
       auto ptrs = FlatVector::GetData<data_ptr_t>(row_ptrs_);
       recon_buffers_.clear();
-      recon_buffers_.reserve(num_slots);
+      recon_buffers_.reserve(std::min<idx_t>(STANDARD_VECTOR_SIZE, cur_num_slots_));
       idx_t count = 0;
       int64_t rids[STANDARD_VECTOR_SIZE];
-      for (uint16_t slot = 0; slot < num_slots; slot++) {
+      // Gather up to a full vector of visible rows, resuming where the previous chunk left off.
+      for (; slot_cursor_ < cur_num_slots_ && count < STANDARD_VECTOR_SIZE; slot_cursor_++) {
+        const uint16_t slot = slot_cursor_;
         auto [meta, row_ptr, size] = page->GetRow(slot);
         if (mvcc) {
           // Reconstruct the version visible to the snapshot from the base tuple we hold latched.
           // Not-visible rows (deleted-in-snapshot, created-after, or a still-uncommitted other txn)
           // are dropped. We must NOT re-latch this page, so reconstruct in place from the base.
-          auto head_link = txn_mgr_->GetUndoLink(RID(current_page_, slot));
-          auto visible = ReconstructVisible(txn_mgr_, txn_, meta, row_ptr, size, head_link);
+          auto head_link = txn_mgr->GetUndoLink(RID(current_page, slot));
+          auto visible = ReconstructVisible(txn_mgr, txn, meta, row_ptr, size, head_link);
           if (!visible.has_value()) {
             continue;
           }
           recon_buffers_.push_back(std::move(*visible));
-          if (predicate_ && !predicate_(heap_->layout_, reinterpret_cast<const_data_ptr_t>(recon_buffers_.back().data()))) {
+          if (predicate && !predicate(heap.layout_, reinterpret_cast<const_data_ptr_t>(recon_buffers_.back().data()))) {
             recon_buffers_.pop_back();  // filtered out — reclaim the buffer we just staged
             continue;
           }
           ptrs[count] = reinterpret_cast<data_ptr_t>(recon_buffers_.back().data());
         } else {
           if (meta.is_deleted_) {
-            continue;  // bug #8: scans skip logically deleted rows
+            continue;  // scans skip logically deleted rows
           }
-          if (predicate_ && !predicate_(heap_->layout_, row_ptr)) {
+          if (predicate && !predicate(heap.layout_, row_ptr)) {
             continue;  // filtered out by the scan predicate
           }
           ptrs[count] = const_cast<data_ptr_t>(reinterpret_cast<const_data_ptr_t>(row_ptr));
         }
-        rids[count] = RID(current_page_, slot).Get();
+        rids[count] = RID(current_page, slot).Get();
         count++;
       }
 
-      // Never follow past the stop page (pages linked after the scan opened are not part of it).
-      auto next = at_stop_page ? INVALID_PAGE_ID : page->GetNextPageId();
       if (count == 0) {
-        current_page_ = next;
-        continue;  // empty (or all-not-visible) page
+        // Every remaining slot on this page was filtered / not visible; move to the next page.
+        guard_.reset();
+        page_idx_++;
+        continue;
       }
 
       // MVCC rows live in `recon_buffers_` (freed next call), so copy their strings into `out`.
       for (idx_t k = 0; k < projection_.size(); k++) {
-        RowOperations::FullScanColumn(heap_->layout_, row_ptrs_, out.data_[k], count, projection_[k],
+        RowOperations::FullScanColumn(heap.layout_, row_ptrs_, out.data_[k], count, projection_[k],
                                       /*copy_strings=*/mvcc);
       }
       out.SetCardinality(count);
@@ -138,29 +151,36 @@ class HeapScan : public TableScan {
         }
       }
 
-      guard_ = std::move(guard);  // keep pinned so a non-MVCC chunk's zero-copy strings stay valid
-      current_page_ = next;
+      // Keep `guard_` pinned across the return so a non-MVCC chunk's zero-copy strings stay valid; the
+      // page is retired at the top of the next call once `slot_cursor_` has reached `cur_num_slots_`.
       return true;
     }
-    guard_.reset();
-    return false;
   }
 
  private:
-  TableHeap *heap_;
+  std::shared_ptr<ParallelScanState> state_;
+  idx_t page_idx_;
+  idx_t page_end_;
   std::vector<idx_t> projection_;
-  page_id_t current_page_;
-  page_id_t stop_page_id_{INVALID_PAGE_ID};
-  uint32_t stop_slot_{0};
   std::optional<ReadPageGuard> guard_;
+  /** The next slot to read on the currently pinned page — a page is drained a vector at a time. */
+  uint16_t slot_cursor_{0};
+  /** The live-slot count of the currently pinned page (cached so the page is not re-read to retire it). */
+  idx_t cur_num_slots_{0};
   Vector row_ptrs_{MakePointerVector()};
-  TransactionManager *txn_mgr_{nullptr};
-  Transaction *txn_{nullptr};
-  // Filters rows to those it matches; empty ⇒ match every row (unfiltered scan).
-  ScanPredicate predicate_;
   // Owns reconstructed older-version bytes for the current chunk (MVCC scans only).
   std::vector<std::vector<char>> recon_buffers_;
 };
+
+auto ParallelScanState::NextMorsel(idx_t &begin, idx_t &end) -> bool {
+  const idx_t start = next_page_idx_.fetch_add(morsel_pages_, std::memory_order_relaxed);
+  if (start >= pages_.size()) {
+    return false;
+  }
+  begin = start;
+  end = std::min<idx_t>(start + morsel_pages_, pages_.size());
+  return true;
+}
 
 TableHeap::TableHeap(BufferPoolManager *bpm, SchemaRef schema)
     : bpm_(bpm), schema_(std::move(schema)), layout_(LayoutFromSchema(*schema_)) {
@@ -168,6 +188,7 @@ TableHeap::TableHeap(BufferPoolManager *bpm, SchemaRef schema)
   last_page_id_ = first_page_id_;
   auto guard = bpm_->WritePage(first_page_id_);
   guard.AsMut<TablePage>()->Init();
+  page_directory_.push_back(first_page_id_);
 }
 
 TableHeap::TableHeap(BufferPoolManager *bpm, SchemaRef schema, page_id_t first_page_id, page_id_t last_page_id)
@@ -177,27 +198,60 @@ TableHeap::TableHeap(BufferPoolManager *bpm, SchemaRef schema, page_id_t first_p
       first_page_id_(first_page_id),
       last_page_id_(last_page_id) {
   // Recovery path: the pages already exist on disk with their contents and next-page chain intact —
-  // do NOT NewPage()/Init(), which would allocate a fresh page and wipe the table.
+  // do NOT NewPage()/Init(), which would allocate a fresh page and wipe the table. Rebuild the page
+  // directory by walking the on-disk chain once (the chain is the source of truth on open).
+  for (page_id_t pid = first_page_id_; pid != INVALID_PAGE_ID;) {
+    page_directory_.push_back(pid);
+    auto guard = bpm_->ReadPage(pid);
+    pid = guard.As<TablePage>()->GetNextPageId();
+  }
+}
+
+auto TableHeap::BeginParallelScan(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid,
+                                  ScanPredicate predicate, const std::vector<idx_t> &projection)
+    -> std::shared_ptr<ParallelScanState> {
+  // Under MVCC an empty predicate means "match every row" — normalize it to an explicit always-true so
+  // the read set recorded below is the honest whole-table predicate and the scan filter matches it.
+  if (txn != nullptr && !predicate) {
+    predicate = [](const RowLayout & /*layout*/, const_data_ptr_t /*row*/) { return true; };
+  }
+  auto state = std::make_shared<ParallelScanState>();
+  state->heap_ = this;
+  state->txn_mgr_ = txn_mgr;
+  state->txn_ = txn;
+  state->projection_ = projection;
+  state->predicate_ = predicate;
+  {
+    // Snapshot the page directory + the tail page's live-slot count atomically: rows appended after
+    // this point (the Halloween problem) are not part of the scan. Same lock order as AppendRowBytes
+    // (latch_ then a page guard), so the two never deadlock.
+    std::lock_guard lock(latch_);
+    state->pages_ = page_directory_;
+    auto guard = bpm_->ReadPage(last_page_id_);
+    state->stop_slot_ = guard.As<TablePage>()->GetNumTuples();
+  }
+  if (txn != nullptr && txn->GetIsolationLevel() == IsolationLevel::SERIALIZABLE) {
+    // The scan returns exactly the rows matching `predicate`, so that predicate *is* the read set:
+    // record it once for commit-time phantom validation (once per scan, not once per morsel).
+    txn->AppendScanPredicate(oid, predicate);
+  }
+  return state;
+}
+
+auto TableHeap::MakeMorselScan(const std::shared_ptr<ParallelScanState> &state, idx_t begin, idx_t end)
+    -> std::unique_ptr<TableScan> {
+  return std::make_unique<HeapScan>(state, begin, end);
 }
 
 auto TableHeap::MakeScan(const std::vector<idx_t> &projection) -> std::unique_ptr<TableScan> {
-  return std::make_unique<HeapScan>(this, projection);
+  auto state = BeginParallelScan(nullptr, nullptr, 0, {}, projection);
+  return MakeMorselScan(state, 0, state->NumPages());
 }
 
 auto TableHeap::MakeMvccScan(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, ScanPredicate predicate,
                              const std::vector<idx_t> &projection) -> std::unique_ptr<TableScan> {
-  // An empty predicate means "match every row" — normalize it to an explicit always-true so the read
-  // set recorded below is the honest whole-table predicate and the scan filter matches it exactly.
-  if (!predicate) {
-    predicate = [](const RowLayout & /*layout*/, const_data_ptr_t /*row*/) { return true; };
-  }
-  if (txn != nullptr && txn->GetIsolationLevel() == IsolationLevel::SERIALIZABLE) {
-    // The scan returns exactly the rows matching `predicate`, so that predicate *is* the read set:
-    // record it for commit-time phantom validation. A whole-table default records the conservative
-    // "true" predicate, flagging any concurrent write to this table as a conflict.
-    txn->AppendScanPredicate(oid, predicate);
-  }
-  return std::make_unique<HeapScan>(this, projection, txn_mgr, txn, std::move(predicate));
+  auto state = BeginParallelScan(txn_mgr, txn, oid, std::move(predicate), projection);
+  return MakeMorselScan(state, 0, state->NumPages());
 }
 
 auto TableHeap::ComputeRowSizes(DataChunk &chunk) const -> std::vector<uint32_t> {
@@ -242,6 +296,7 @@ auto TableHeap::AppendRowBytes(const TupleMeta &meta, const_data_ptr_t row_data,
     auto new_guard = bpm_->WritePage(new_page_id);
     new_guard.AsMut<TablePage>()->Init();
     last_page_id_ = new_page_id;
+    page_directory_.push_back(new_page_id);  // extend the parallel-scan substrate under latch_
   }
 }
 
@@ -338,6 +393,18 @@ void TableHeap::Fetch(Vector &row_ids, idx_t count, DataChunk &out) {
     RowOperations::FullScanColumn(layout_, rows, out.data_[col_no], count, col_no, /*copy_strings=*/true);
   }
   out.SetCardinality(count);
+}
+
+void TableHeap::FreeAllPages() {
+  std::lock_guard lk(latch_);
+  // `page_directory_` is the complete list of pages this heap ever linked, so it is enough to walk it
+  // rather than re-traverse the on-disk chain. DeletePage returns each id to the persistent free list.
+  for (page_id_t pid : page_directory_) {
+    bpm_->DeletePage(pid);
+  }
+  page_directory_.clear();
+  first_page_id_ = INVALID_PAGE_ID;
+  last_page_id_ = INVALID_PAGE_ID;
 }
 
 }  // namespace bumblebee

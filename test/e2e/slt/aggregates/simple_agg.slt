@@ -1,0 +1,27 @@
+# Whole-table aggregates (COUNT / SUM / MIN / MAX) with and without a filter.
+
+statement ok
+CREATE TABLE nums(v INT);
+
+statement ok
+INSERT INTO nums VALUES (5), (10), (15), (20);
+
+query
+SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM nums;
+----
+4 50 5 20
+
+query
+SELECT COUNT(*) FROM nums WHERE v > 10;
+----
+2
+
+# Aggregate over an empty selection.
+query
+SELECT COUNT(*), SUM(v) FROM nums WHERE v > 100;
+----
+0 NULL
+
+# Referencing a column that does not exist must fail.
+statement error
+SELECT SUM(missing) FROM nums;

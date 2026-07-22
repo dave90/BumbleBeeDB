@@ -98,13 +98,81 @@ static constexpr frame_id_t INVALID_FRAME_ID = -1;
 /** The default length of a VARCHAR column when the DDL does not specify one. */
 static constexpr uint32_t VARCHAR_DEFAULT_LENGTH = 128;
 
+/**
+ * The name of the auto-generated primary-key column added to a table created without an explicit PRIMARY
+ * KEY. It is a reserved name (CREATE TABLE rejects a user column of this name), but a valid SQL identifier,
+ * so it is usable unquoted in queries: `SELECT _id`, `WHERE _id = 5`, `ORDER BY _id`. It is a BIGINT
+ * filled with a per-table auto-increment counter. Kept lowercase so it round-trips the binder's
+ * case-folding of unquoted identifiers.
+ */
+static constexpr const char *AUTO_ID_COLUMN = "_id";
+
+// ---------------------------------------------------------------------------------------------------
+// Build-time overridable tunables.
+//
+// Each of the following is seeded from a `BUMBLEBEE_*` macro that defaults to the production value but
+// can be overridden with a compiler `-D` (wired through the `BBDB_VECTOR_SIZE` CMake cache option for the
+// vector size). This lets a *test* build lower a size so a handful of rows exercise the same multi-chunk /
+// multi-partition code paths a production run only hits at scale — without turning these into runtime
+// state (STANDARD_VECTOR_SIZE in particular sizes fixed-extent arrays and cannot be a runtime value).
+// ---------------------------------------------------------------------------------------------------
+
 /** The number of rows a Vector holds, i.e. the unit of work of the vectorized engine. */
-static constexpr idx_t STANDARD_VECTOR_SIZE = 1024;
+#ifndef BUMBLEBEE_STANDARD_VECTOR_SIZE
+#define BUMBLEBEE_STANDARD_VECTOR_SIZE 1024
+#endif
+static constexpr idx_t STANDARD_VECTOR_SIZE = BUMBLEBEE_STANDARD_VECTOR_SIZE;
 
 /**
  * The size of one StringHeap chunk. It is also the largest string the heap can store,
  * since a string is never split across chunks.
  */
 static constexpr idx_t MINIMUM_HEAP_SIZE = 4096 * 2;
+
+// ---------------------------------------------------------------------------------------------------
+// Execution-engine tunables (the morsel-driven push runtime — see plan_executor.md).
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * The number of heap pages handed out per morsel by a parallel table scan. A morsel is the unit of
+ * work one task pulls at a time; sizing it so a morsel is ≈100k rows amortizes the atomic hand-out.
+ */
+static constexpr idx_t MORSEL_PAGES = 64;
+
+/** The target number of rows per columnar (row-group) morsel. */
+static constexpr idx_t MORSEL_SIZE = 100000;
+
+/** The number of radix partitions a thread-local hash table / aggregate splits into at Combine. */
+#ifndef BUMBLEBEE_RADIX_PARTITIONS
+#define BUMBLEBEE_RADIX_PARTITIONS 64
+#endif
+static constexpr idx_t RADIX_PARTITIONS = BUMBLEBEE_RADIX_PARTITIONS;
+
+/** The default worker-thread count when the platform reports none. */
+static constexpr idx_t DEFAULT_THREAD_COUNT = 16;
+
+/** The hard upper bound on worker threads a single query may use. */
+static constexpr idx_t MAX_THREADS = 128;
+
+/** The per-query memory budget (bytes) before an in-memory breaker must spill */
+static constexpr idx_t MAX_MEMORY = 256UL * 1024 * 1024;
+
+/** The number of partitions a grace hash join splits each side into */
+#ifndef BUMBLEBEE_GH_PARTITION_COUNT
+#define BUMBLEBEE_GH_PARTITION_COUNT 64
+#endif
+static constexpr idx_t GH_PARTITION_COUNT = BUMBLEBEE_GH_PARTITION_COUNT;
+
+/** The maximum re-partition recursion depth of a grace hash join before the NLJ fallback */
+#ifndef BUMBLEBEE_GH_MAX_RECURSION
+#define BUMBLEBEE_GH_MAX_RECURSION 10
+#endif
+static constexpr idx_t GH_MAX_RECURSION = BUMBLEBEE_GH_MAX_RECURSION;
+
+/** The k-way fan-out of the external merge sort's merge phase */
+#ifndef BUMBLEBEE_MERGE_FANOUT
+#define BUMBLEBEE_MERGE_FANOUT 8
+#endif
+static constexpr idx_t MERGE_FANOUT = BUMBLEBEE_MERGE_FANOUT;
 
 }  // namespace bumblebee

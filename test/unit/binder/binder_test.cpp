@@ -307,14 +307,18 @@ TEST(BinderTest, BindCreateTable) {
 
   const auto &create = dynamic_cast<const CreateStatement &>(*statements[0]);
   EXPECT_EQ(create.table_, "t");
-  ASSERT_EQ(create.columns_.size(), 4U);
-  EXPECT_EQ(create.columns_[0].GetName(), "v1");
-  EXPECT_EQ(create.columns_[0].GetType().ToString(), "INTEGER");
-  EXPECT_EQ(create.columns_[1].GetType().ToString(), "VARCHAR");
-  EXPECT_EQ(create.columns_[1].GetStorageSize(), 100U);
-  EXPECT_EQ(create.columns_[2].GetType().ToString(), "BOOLEAN");
-  EXPECT_EQ(create.columns_[3].GetType().ToString(), "DOUBLE");
-  EXPECT_TRUE(create.primary_key_.empty());
+  // No PRIMARY KEY declared -> an auto BIGINT "_id" is prepended as column 0 and made the primary key.
+  ASSERT_EQ(create.columns_.size(), 5U);
+  EXPECT_EQ(create.columns_[0].GetName(), "_id");
+  EXPECT_EQ(create.columns_[0].GetType().ToString(), "BIGINT");
+  EXPECT_EQ(create.columns_[1].GetName(), "v1");
+  EXPECT_EQ(create.columns_[1].GetType().ToString(), "INTEGER");
+  EXPECT_EQ(create.columns_[2].GetType().ToString(), "VARCHAR");
+  EXPECT_EQ(create.columns_[2].GetStorageSize(), 100U);
+  EXPECT_EQ(create.columns_[3].GetType().ToString(), "BOOLEAN");
+  EXPECT_EQ(create.columns_[4].GetType().ToString(), "DOUBLE");
+  ASSERT_EQ(create.primary_key_.size(), 1U);
+  EXPECT_EQ(create.primary_key_[0], "_id");
 }
 
 TEST(BinderTest, BindCreateTablePrimaryKey) {
@@ -330,30 +334,32 @@ TEST(BinderTest, BindCreateTableArrayColumns) {
   ASSERT_EQ(statements[0]->type_, StatementType::CREATE_STATEMENT);
 
   const auto &create = dynamic_cast<const CreateStatement &>(*statements[0]);
-  ASSERT_EQ(create.columns_.size(), 3U);
+  ASSERT_EQ(create.columns_.size(), 4U);  // _id + the three declared columns
 
-  EXPECT_EQ(create.columns_[0].GetName(), "v");
-  EXPECT_EQ(create.columns_[0].GetType().ToString(), "INTEGER");
+  EXPECT_EQ(create.columns_[0].GetName(), "_id");  // auto primary key
+  EXPECT_EQ(create.columns_[1].GetName(), "v");
+  EXPECT_EQ(create.columns_[1].GetType().ToString(), "INTEGER");
 
   // `int[]` is a variable-length LIST.
-  EXPECT_EQ(create.columns_[1].GetName(), "tags");
-  EXPECT_EQ(create.columns_[1].GetType().ToString(), "INTEGER[]");
-  EXPECT_EQ(create.columns_[1].GetType().GetTypeId(), LogicalTypeId::LIST);
-  EXPECT_FALSE(create.columns_[1].IsInlined());
+  EXPECT_EQ(create.columns_[2].GetName(), "tags");
+  EXPECT_EQ(create.columns_[2].GetType().ToString(), "INTEGER[]");
+  EXPECT_EQ(create.columns_[2].GetType().GetTypeId(), LogicalTypeId::LIST);
+  EXPECT_FALSE(create.columns_[2].IsInlined());
 
   // `int[3]` is a fixed-length ARRAY.
-  EXPECT_EQ(create.columns_[2].GetName(), "fixed");
-  EXPECT_EQ(create.columns_[2].GetType().ToString(), "INTEGER[3]");
-  EXPECT_EQ(create.columns_[2].GetType().GetTypeId(), LogicalTypeId::ARRAY);
-  EXPECT_EQ(create.columns_[2].GetType().GetListData().size_, 3U);
-  EXPECT_FALSE(create.columns_[2].IsInlined());
+  EXPECT_EQ(create.columns_[3].GetName(), "fixed");
+  EXPECT_EQ(create.columns_[3].GetType().ToString(), "INTEGER[3]");
+  EXPECT_EQ(create.columns_[3].GetType().GetTypeId(), LogicalTypeId::ARRAY);
+  EXPECT_EQ(create.columns_[3].GetType().GetListData().size_, 3U);
+  EXPECT_FALSE(create.columns_[3].IsInlined());
 }
 
 TEST(BinderTest, BindCreateTableArrayOfVarchar) {
   auto statements = Bind("create table t(names varchar[])");
   const auto &create = dynamic_cast<const CreateStatement &>(*statements[0]);
-  ASSERT_EQ(create.columns_.size(), 1U);
-  EXPECT_EQ(create.columns_[0].GetType().ToString(), "VARCHAR[]");
+  ASSERT_EQ(create.columns_.size(), 2U);  // _id + names
+  EXPECT_EQ(create.columns_[0].GetName(), "_id");
+  EXPECT_EQ(create.columns_[1].GetType().ToString(), "VARCHAR[]");
 }
 
 TEST(BinderTest, SelectFromTableWithArrayColumns) {

@@ -12,47 +12,125 @@
 
 #include "bumblebee_instance.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "binder/binder.h"
 #include "binder/bound_statement.h"
 #include "binder/statement/create_statement.h"
+#include "binder/statement/drop_statement.h"
 #include "binder/statement/explain_statement.h"
+#include "binder/statement/transaction_statement.h"
 #include "catalog/column.h"
 #include "catalog/schema.h"
 #include "common/enums/statement_type.h"
 #include "common/exception.h"
 #include "common/util/string_util.h"
+#include "execution/operator/helper/physical_result_collector.h"
+#include "execution/physical_plan_generator.h"
+#include "execution/plans/abstract_plan.h"
 #include "fmt/format.h"
+#include "main/client_context.h"
 #include "optimizer/optimizer.h"
+#include "parallel/executor.h"
 #include "planner/planner.h"
 #include "type/logical_type.h"
 
 namespace bumblebee {
 
-BumbleBeeInstance::BumbleBeeInstance() : owned_catalog_(std::make_unique<Catalog>()) {
+namespace {
+
+/** Backing store size for an in-memory instance: 4096 pages (32 MiB) is plenty for the test suites. */
+constexpr size_t kInMemoryDiskPages = 4096;
+constexpr size_t kInMemoryFrames = 1024;
+
+/** @brief Stream a result collector's gathered chunks to `writer` as a table. */
+void WriteResultTable(const PhysicalOperator &root, GlobalSinkState *sink_state, ResultWriter &writer) {
+  auto *gs = dynamic_cast<ResultCollectorGlobalState *>(sink_state);
+  writer.BeginTable(true);
+  writer.BeginHeader();
+  for (const auto &col : root.output_schema_->GetColumns()) {
+    writer.WriteHeaderCell(col.GetName());
+  }
+  writer.EndHeader();
+  if (gs != nullptr) {
+    // A writer may cap how many rows it wants (the interactive shell does, to avoid flooding the
+    // terminal on a huge SELECT); 0 means unlimited. We emit up to the cap, then report the total.
+    const idx_t limit = writer.MaxDisplayRows();
+    idx_t total = 0;
+    for (const auto &chunk : gs->chunks_) {
+      total += chunk->GetSize();
+    }
+    idx_t shown = 0;
+    for (const auto &chunk : gs->chunks_) {
+      if (limit != 0 && shown >= limit) {
+        break;
+      }
+      for (idx_t r = 0; r < chunk->GetSize(); r++) {
+        if (limit != 0 && shown >= limit) {
+          break;
+        }
+        writer.BeginRow();
+        for (idx_t c = 0; c < chunk->ColumnCount(); c++) {
+          writer.WriteCell(chunk->GetValue(c, r).ToString());
+        }
+        writer.EndRow();
+        shown++;
+      }
+    }
+    writer.EndTable();
+    if (limit != 0 && total > limit) {
+      writer.WriteTruncationNotice(shown, total);
+    }
+    return;
+  }
+  writer.EndTable();
+}
+
+}  // namespace
+
+BumbleBeeInstance::BumbleBeeInstance()
+    : mem_disk_(std::make_unique<MemoryDiskManager>(kInMemoryDiskPages)),
+      owned_bpm_(std::make_unique<BufferPoolManager>(kInMemoryFrames, mem_disk_.get())),
+      owned_catalog_(std::make_unique<Catalog>(owned_bpm_.get())),
+      owned_txn_mgr_(std::make_unique<TransactionManager>(owned_catalog_.get())) {
   catalog_ = owned_catalog_.get();
+  bpm_ = owned_bpm_.get();
+  txn_mgr_ = owned_txn_mgr_.get();
 }
 
 BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames)
     : db_(std::make_unique<Database>(db_file, num_frames)) {
-  // The catalog lives inside the Database (which owns the disk, buffer pool and transaction manager);
-  // ~Database (via the db_ member) flushes and persists it on shutdown.
+  // The catalog, buffer pool and transaction manager all live inside the Database (which owns the disk);
+  // ~Database (via the db_ member) flushes and persists on shutdown.
   catalog_ = &db_->GetCatalog();
+  bpm_ = &db_->GetBufferPool();
+  txn_mgr_ = &db_->GetTransactionManager();
 }
 
-BumbleBeeInstance::~BumbleBeeInstance() = default;
+BumbleBeeInstance::~BumbleBeeInstance() {
+  // Roll back an explicit transaction left open at shutdown so its uncommitted writes never persist.
+  if (active_txn_ != nullptr) {
+    txn_mgr_->Abort(active_txn_);
+    active_txn_ = nullptr;
+  }
+}
 
 void BumbleBeeInstance::WriteOneCell(const std::string &cell, ResultWriter &writer) { writer.OneCell(cell); }
 
 void BumbleBeeInstance::GenerateMockTable() {
-  const auto int_type = LogicalType(LogicalTypeId::INTEGER);
-  catalog_->CreateTable("__mock_table_1",
-                        Schema(std::vector{Column{"colA", int_type}, Column{"colB", int_type}}));
-  catalog_->CreateTable("__mock_table_2",
-                        Schema(std::vector{Column{"colC", int_type}, Column{"colD", int_type}}));
+  // Seed a few demo tables *with rows* (via the real SQL path) so a fresh shell has data to query out of
+  // the box — two integer tables that join on their first column, plus one with a string column.
+  NoopWriter noop;
+  ExecuteSql("CREATE TABLE mock_ints_1(colA INT, colB INT);", noop);
+  ExecuteSql("INSERT INTO mock_ints_1 VALUES (1, 100), (2, 200), (3, 300), (4, 400);", noop);
+  ExecuteSql("CREATE TABLE mock_ints_2(colC INT, colD INT);", noop);
+  ExecuteSql("INSERT INTO mock_ints_2 VALUES (1, 10), (2, 20), (3, 30);", noop);
+  ExecuteSql("CREATE TABLE mock_people(id INT, name VARCHAR(32), age INT);", noop);
+  ExecuteSql("INSERT INTO mock_people VALUES (1, 'alice', 30), (2, 'bob', 25), (3, 'carol', 41);", noop);
 }
 
 void BumbleBeeInstance::CmdDisplayTables(ResultWriter &writer) {
@@ -76,25 +154,156 @@ void BumbleBeeInstance::CmdDisplayTables(ResultWriter &writer) {
   writer.EndTable();
 }
 
+void BumbleBeeInstance::CmdDescribeTable(const std::string &table_name, ResultWriter &writer) {
+  const auto table_info = catalog_->GetTable(table_name);
+  if (table_info == NULL_TABLE_INFO) {
+    throw Exception(fmt::format("no such table: {}", table_name));
+  }
+  const auto &schema = table_info->schema_;
+
+  // One row per column: ordinal, name, type, and on-page storage width in bytes.
+  writer.BeginTable(false);
+  writer.BeginHeader();
+  writer.WriteHeaderCell("#");
+  writer.WriteHeaderCell("column");
+  writer.WriteHeaderCell("type");
+  writer.WriteHeaderCell("bytes");
+  writer.EndHeader();
+  for (uint32_t i = 0; i < schema.GetColumnCount(); i++) {
+    const auto &col = schema.GetColumn(i);
+    writer.BeginRow();
+    writer.WriteCell(fmt::format("{}", i));
+    writer.WriteCell(col.GetName());
+    writer.WriteCell(col.GetType().ToString());
+    writer.WriteCell(fmt::format("{}", col.GetStorageSize()));
+    writer.EndRow();
+  }
+  writer.EndTable();
+
+  // Any indexes on the table, listed after the columns (mirrors psql's `\d`).
+  std::vector<std::shared_ptr<IndexInfo>> table_indexes;
+  for (const auto &idx : catalog_->GetIndexes()) {
+    if (idx->table_name_ == table_name) {
+      table_indexes.push_back(idx);
+    }
+  }
+  if (!table_indexes.empty()) {
+    writer.BeginTable(false);
+    writer.BeginHeader();
+    writer.WriteHeaderCell("index");
+    writer.WriteHeaderCell("key columns");
+    writer.EndHeader();
+    for (const auto &idx : table_indexes) {
+      std::string key_cols;
+      for (const auto &col : idx->key_schema_.GetColumns()) {
+        if (!key_cols.empty()) {
+          key_cols += ", ";
+        }
+        key_cols += col.GetName();
+      }
+      writer.BeginRow();
+      writer.WriteCell(idx->name_);
+      writer.WriteCell(fmt::format("({})", key_cols));
+      writer.EndRow();
+    }
+    writer.EndTable();
+  }
+}
+
+void BumbleBeeInstance::CmdClear(ResultWriter &writer) {
+  const auto dropped = catalog_->DropAllTables();
+  WriteOneCell(fmt::format("Cleared the database: dropped {} table(s).", dropped), writer);
+}
+
 void BumbleBeeInstance::CmdDisplayHelp(ResultWriter &writer) {
   std::string help = R"(Welcome to the BumbleBeeDB shell!
 
-\dt: show all tables
-\help: show this message again
+Meta-commands:
+  \dt              show all tables
+  \d <table>       describe a table's columns and indexes
+  \clear           drop every table (wipe the database)
+  \pipelines <sql> show the pipeline plan for a query
+  \help            show this message again
 
-BumbleBeeDB has no execution engine yet. CREATE TABLE registers a schema in the
-catalog; every other statement prints the plan it would have run. Use EXPLAIN to
-see the binder and planner output alongside the optimized plan.
+BumbleBeeDB runs SQL end to end: CREATE TABLE / DROP TABLE / INSERT / SELECT
+(with joins, aggregation, ORDER BY, LIMIT), plus UPDATE and DELETE. Statements
+autocommit by default; wrap several in BEGIN ... COMMIT (or ROLLBACK to discard)
+to run them in one explicit transaction. Prefix any query with EXPLAIN (e.g.
+EXPLAIN (optimizer) SELECT ...) to see the binder, planner, optimized, and
+physical plans instead of running it.
 )";
   WriteOneCell(help, writer);
 }
 
 void BumbleBeeInstance::HandleCreateStatement(const CreateStatement &stmt, ResultWriter &writer) {
-  auto info = catalog_->CreateTable(stmt.table_, Schema(stmt.columns_));
+  Schema schema(stmt.columns_);
+
+  // Resolve primary-key column names (the binder guaranteed they exist) to their indices.
+  std::vector<uint32_t> pk_attrs;
+  pk_attrs.reserve(stmt.primary_key_.size());
+  for (const auto &pk_name : stmt.primary_key_) {
+    for (uint32_t i = 0; i < schema.GetColumnCount(); i++) {
+      if (schema.GetColumn(i).GetName() == pk_name) {
+        pk_attrs.push_back(i);
+        break;
+      }
+    }
+  }
+  // The primary key is auto-generated iff column 0 is the reserved `_id` (the binder prepends it).
+  const bool auto_id = schema.GetColumnCount() > 0 && schema.GetColumn(0).GetName() == AUTO_ID_COLUMN;
+
+  auto info = catalog_->CreateTable(stmt.table_, schema, StorageFormat::ROW, pk_attrs, auto_id);
   if (info == NULL_TABLE_INFO) {
     throw Exception(fmt::format("failed to create table {}: it already exists", stmt.table_));
   }
+  // Every table has a primary key, so build its B+tree index (needs a storage-backed catalog).
+  if (!pk_attrs.empty() && info->storage_ != nullptr) {
+    catalog_->CreateIndexForKey("_pk_" + stmt.table_, stmt.table_, pk_attrs);
+  }
   WriteOneCell(fmt::format("Table created with id = {}", info->oid_), writer);
+}
+
+void BumbleBeeInstance::HandleDropStatement(const DropStatement &stmt, ResultWriter &writer) {
+  size_t dropped = 0;
+  for (const auto &table : stmt.tables_) {
+    // DropTable removes the table and every index defined on it (including the auto primary-key index).
+    if (catalog_->DropTable(table)) {
+      dropped++;
+    } else if (!stmt.if_exists_) {
+      // Without IF EXISTS, a missing table is an error. Any tables named earlier in the same statement
+      // have already been dropped — DROP is not transactional here.
+      throw Exception(fmt::format("cannot drop table {}: it does not exist", table));
+    }
+  }
+  WriteOneCell(fmt::format("Dropped {} table(s)", dropped), writer);
+}
+
+void BumbleBeeInstance::HandleTransactionStatement(const TransactionStatement &stmt, ResultWriter &writer) {
+  switch (stmt.txn_type_) {
+    case TransactionType::BEGIN:
+      // Nested BEGIN is an error — there are no savepoints, so a second BEGIN would silently leak the
+      // first transaction.
+      if (active_txn_ != nullptr) {
+        throw Exception("cannot BEGIN: a transaction is already in progress");
+      }
+      active_txn_ = txn_mgr_->Begin();
+      break;
+    case TransactionType::COMMIT:
+      if (active_txn_ == nullptr) {
+        throw Exception("cannot COMMIT: no transaction is in progress");
+      }
+      txn_mgr_->Commit(active_txn_);
+      active_txn_ = nullptr;
+      break;
+    case TransactionType::ROLLBACK:
+      if (active_txn_ == nullptr) {
+        throw Exception("cannot ROLLBACK: no transaction is in progress");
+      }
+      txn_mgr_->Abort(active_txn_);
+      active_txn_ = nullptr;
+      break;
+  }
+  WriteOneCell(TransactionTypeToString(stmt.txn_type_), writer);
 }
 
 void BumbleBeeInstance::HandleExplainStatement(const ExplainStatement &stmt, ResultWriter &writer) {
@@ -126,7 +335,122 @@ void BumbleBeeInstance::HandleExplainStatement(const ExplainStatement &stmt, Res
     output += "\n";
   }
 
+  const bool want_physical = (stmt.options_ & ExplainOptions::PHYSICAL) != 0;
+  const bool want_pipelines = (stmt.options_ & ExplainOptions::PIPELINES) != 0;
+  const bool want_analyze = (stmt.options_ & ExplainOptions::ANALYZE) != 0;
+
+  if (want_physical || want_pipelines || want_analyze) {
+    ClientContext client(*catalog_, *txn_mgr_, bpm_);
+    ApplyConfig(client);
+    // Run inside the explicit transaction if one is open (so EXPLAIN ANALYZE sees its writes and does not
+    // commit it early); otherwise autocommit a fresh transaction for the analyze run.
+    const bool autocommit = active_txn_ == nullptr;
+    auto *txn = autocommit ? txn_mgr_->Begin() : active_txn_;
+    client.txn_ = txn;
+    try {
+      PhysicalPlanGenerator generator(client);
+      auto physical = generator.PlanRoot(optimized_plan);
+
+      if (want_physical) {
+        output += "=== PHYSICAL ===\n" + physical->ToString() + "\n";
+      }
+      if (want_pipelines || want_analyze) {
+        Executor executor(client);
+        executor.Initialize(*physical);
+        if (want_analyze) {
+          executor.ExecuteQuery();  // EXPLAIN ANALYZE actually runs the query
+          output += "=== ANALYZE ===\n" + executor.AnalyzeToString(*physical) + "\n";
+        }
+        if (want_pipelines) {
+          output += "=== PIPELINES ===\n" + executor.PipelinesToString() + "\n";
+        }
+      }
+      if (autocommit) {
+        txn_mgr_->Commit(txn);
+      }
+    } catch (...) {
+      txn_mgr_->Abort(txn);
+      if (!autocommit) {
+        active_txn_ = nullptr;  // a failed statement aborts the explicit transaction
+      }
+      throw;
+    }
+  }
+
   WriteOneCell(output, writer);
+}
+
+void BumbleBeeInstance::ApplyConfig(ClientContext &client) const {
+  client.config_.prefer_external_ = prefer_external_;
+  client.config_.max_memory_ = max_memory_;
+  client.config_.morsel_pages_ = std::max<idx_t>(1, morsel_pages_);
+  client.config_.morsel_size_ = morsel_size_;
+  // 0 means "leave the ClientContext's hardware-detected default"; otherwise clamp to the hard ceiling.
+  if (max_threads_ > 0) {
+    client.config_.max_threads_ = std::clamp<idx_t>(max_threads_, 1, MAX_THREADS);
+  }
+  client.mem_.SetBudget(max_memory_);
+}
+
+void BumbleBeeInstance::ExecuteStatement(const BoundStatement &statement, ResultWriter &writer) {
+  // Optimize ONCE; only lowering (below) decides in-memory vs external, so the logical tree is a stable
+  // set of nodes across retries and each node is identified by its pointer.
+  Planner planner(*catalog_);
+  planner.PlanQuery(statement);
+  Optimizer optimizer(*catalog_);
+  auto optimized_plan = optimizer.Optimize(planner.plan_);
+
+  // Autocommit: without an explicit BEGIN, each statement runs in its own transaction. Inside an
+  // explicit transaction (active_txn_ set) the statement joins it — it is neither committed here nor
+  // retried under a fresh transaction; a failure aborts the whole transaction instead.
+  const bool autocommit = active_txn_ == nullptr;
+
+  // Detect → re-plan → retry: an in-memory breaker that overflows the budget throws MemoryLimitException
+  // naming its logical node; in autocommit mode we abort, force just that node external, and re-run under
+  // a fresh transaction. That retry needs a clean rollback, which we cannot do for a single statement of
+  // an explicit transaction — so there we surface the overflow (and abort the transaction) instead.
+  std::unordered_set<const AbstractPlanNode *> force_external;
+  while (true) {
+    // A fresh ClientContext gives each attempt a fresh memory budget.
+    ClientContext client(*catalog_, *txn_mgr_, bpm_);
+    ApplyConfig(client);
+    auto *txn = autocommit ? txn_mgr_->Begin() : active_txn_;
+    client.txn_ = txn;
+    try {
+      PhysicalPlanGenerator generator(client);
+      generator.SetForceExternal(force_external);
+      auto physical = generator.PlanRoot(optimized_plan);
+
+      Executor executor(client);
+      executor.Initialize(*physical);
+      executor.ExecuteQuery();
+
+      WriteResultTable(*physical, executor.GetOrCreateSinkState(*physical), writer);
+      if (autocommit) {
+        txn_mgr_->Commit(txn);
+      }
+      return;
+    } catch (const MemoryLimitException &e) {
+      const auto *culprit = static_cast<const AbstractPlanNode *>(e.Culprit());
+      // Retry (fresh transaction, culprit forced external) only in autocommit mode, and only while we can
+      // still make progress — a null or already-forced culprit means give up.
+      if (autocommit && culprit != nullptr && force_external.insert(culprit).second) {
+        txn_mgr_->Abort(txn);  // fresh transaction on the next attempt
+        continue;
+      }
+      txn_mgr_->Abort(txn);
+      if (!autocommit) {
+        active_txn_ = nullptr;
+      }
+      throw;
+    } catch (...) {
+      txn_mgr_->Abort(txn);  // roll back partial writes (a conflict or other error) before surfacing
+      if (!autocommit) {
+        active_txn_ = nullptr;  // a failed statement aborts the explicit transaction
+      }
+      throw;
+    }
+  }
 }
 
 auto BumbleBeeInstance::ExecuteSql(const std::string &sql, ResultWriter &writer) -> bool {
@@ -138,6 +462,26 @@ auto BumbleBeeInstance::ExecuteSql(const std::string &sql, ResultWriter &writer)
     if (sql == "\\help") {
       CmdDisplayHelp(writer);
       return true;
+    }
+    if (sql == "\\clear") {
+      CmdClear(writer);
+      return true;
+    }
+    // `\d <table>` describes one table's schema. Checked after `\dt` (an exact match handled above), and
+    // the required space keeps the two from colliding.
+    static const std::string kDescribe = "\\d ";
+    if (sql.rfind(kDescribe, 0) == 0) {
+      auto table = sql.substr(kDescribe.size());
+      StringUtil::LTrim(&table);
+      StringUtil::RTrim(&table);
+      CmdDescribeTable(table, writer);
+      return true;
+    }
+    // `\pipelines <sql>` is a thin alias for EXPLAIN (pipelines) <sql> — it needs the query bound,
+    // planned, optimized and lowered, which the EXPLAIN path already does, and stops short of running.
+    static const std::string kPipelines = "\\pipelines ";
+    if (sql.rfind(kPipelines, 0) == 0) {
+      return ExecuteSql("EXPLAIN (pipelines) " + sql.substr(kPipelines.size()), writer);
     }
     throw Exception(fmt::format("unsupported meta-command: {}", sql));
   }
@@ -153,6 +497,14 @@ auto BumbleBeeInstance::ExecuteSql(const std::string &sql, ResultWriter &writer)
         HandleCreateStatement(dynamic_cast<const CreateStatement &>(*statement), writer);
         continue;
       }
+      case StatementType::DROP_STATEMENT: {
+        HandleDropStatement(dynamic_cast<const DropStatement &>(*statement), writer);
+        continue;
+      }
+      case StatementType::TRANSACTION_STATEMENT: {
+        HandleTransactionStatement(dynamic_cast<const TransactionStatement &>(*statement), writer);
+        continue;
+      }
       case StatementType::EXPLAIN_STATEMENT: {
         HandleExplainStatement(dynamic_cast<const ExplainStatement &>(*statement), writer);
         continue;
@@ -161,17 +513,7 @@ auto BumbleBeeInstance::ExecuteSql(const std::string &sql, ResultWriter &writer)
         break;
     }
 
-    Planner planner(*catalog_);
-    planner.PlanQuery(*statement);
-
-    Optimizer optimizer(*catalog_);
-    auto optimized_plan = optimizer.Optimize(planner.plan_);
-
-    // There is no execution engine yet, so the plan *is* the result. Once the
-    // engine lands this becomes an Execute() call and the rows go to the writer.
-    WriteOneCell(fmt::format("=== OPTIMIZED PLAN (no execution engine yet) ===\n{}",
-                             optimized_plan->ToString(true)),
-                 writer);
+    ExecuteStatement(*statement, writer);
   }
 
   return true;

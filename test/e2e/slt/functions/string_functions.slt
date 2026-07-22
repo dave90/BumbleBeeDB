@@ -1,0 +1,27 @@
+# The only supported scalar functions: upper() and lower(). VARCHAR values render quoted in output.
+
+statement ok
+CREATE TABLE t(s VARCHAR(8));
+
+statement ok
+INSERT INTO t VALUES ('Hello'),('World'),('MiXeD');
+
+query rowsort
+SELECT upper(s) FROM t;
+----
+'HELLO'
+'MIXED'
+'WORLD'
+
+query rowsort
+SELECT lower(s) FROM t;
+----
+'hello'
+'mixed'
+'world'
+
+# Functions compose with filters and ordering.
+query
+SELECT lower(s) FROM t WHERE s = 'World';
+----
+'world'

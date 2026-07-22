@@ -41,6 +41,14 @@ void MvccInsert(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, 
                 Vector &out_rids);
 
 /**
+ * @brief The shared write path for a same-RID update (`is_delete=false`) or delete (`is_delete=true`),
+ * running the 3-branch write-write conflict logic under one page write latch. Also used to *revive* a
+ * tombstoned slot in place (write a new, undeleted version over a deleted base).
+ */
+void ApplyMvccModify(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, TableHeap &heap, RID rid,
+                     bool is_delete, const_data_ptr_t new_row, uint16_t new_size);
+
+/**
  * @brief Update in place, same-RID, the `chunk.GetSize()` rows named by `rids` to `chunk`.
  *
  * Per row runs the 3-branch write-write conflict logic; a conflict taints `txn` and throws

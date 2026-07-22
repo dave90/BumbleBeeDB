@@ -1,0 +1,71 @@
+# The full set of supported filter predicates: the six comparison operators plus AND / OR.
+
+statement ok
+CREATE TABLE t(a INT);
+
+statement ok
+INSERT INTO t VALUES (1),(2),(3),(4),(5);
+
+query rowsort
+SELECT a FROM t WHERE a = 3;
+----
+3
+
+query rowsort
+SELECT a FROM t WHERE a <> 3;
+----
+1
+2
+4
+5
+
+query rowsort
+SELECT a FROM t WHERE a < 3;
+----
+1
+2
+
+query rowsort
+SELECT a FROM t WHERE a <= 3;
+----
+1
+2
+3
+
+query rowsort
+SELECT a FROM t WHERE a > 3;
+----
+4
+5
+
+query rowsort
+SELECT a FROM t WHERE a >= 3;
+----
+3
+4
+5
+
+query rowsort
+SELECT a FROM t WHERE a = 1 OR a = 5;
+----
+1
+5
+
+query rowsort
+SELECT a FROM t WHERE a > 1 AND a < 5;
+----
+2
+3
+4
+
+# A comparison against NULL is unknown, so the row is excluded (never matches, even with <>).
+statement ok
+INSERT INTO t VALUES (NULL);
+
+query rowsort
+SELECT a FROM t WHERE a <> 3;
+----
+1
+2
+4
+5

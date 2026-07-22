@@ -1,0 +1,30 @@
+# GROUP BY treats NULL keys as one group (IS NOT DISTINCT FROM), unlike the joins where NULL never
+# matches. Multi-key grouping keeps every distinct NULL/value combination apart.
+
+statement ok
+CREATE TABLE t(g INT, v INT);
+
+statement ok
+INSERT INTO t VALUES (1,10),(NULL,20),(1,30),(NULL,40),(2,50);
+
+query rowsort
+SELECT g, COUNT(*), SUM(v) FROM t GROUP BY g;
+----
+1 2 40
+2 1 50
+NULL 2 60
+
+statement ok
+CREATE TABLE m(a INT, b INT, v INT);
+
+statement ok
+INSERT INTO m VALUES (1,NULL,1),(1,NULL,2),(NULL,1,3),(NULL,NULL,4),(NULL,NULL,5),(1,1,6);
+
+# (1,NULL), (NULL,1), (NULL,NULL) and (1,1) are four different groups.
+query rowsort
+SELECT a, b, COUNT(*), SUM(v) FROM m GROUP BY a, b;
+----
+1 1 1 6
+1 NULL 2 3
+NULL 1 1 3
+NULL NULL 2 9

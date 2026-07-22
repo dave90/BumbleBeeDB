@@ -1,0 +1,37 @@
+# LEFT OUTER join through the out-of-core grace hash join: the preserved (left) side streams as the
+# probe, the right side is partitioned to disk. Unmatched and NULL-keyed left rows come out once,
+# NULL-padded; duplicate build keys fan out. prefer_external forces the grace variant.
+# config: prefer_external=true
+
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1,10),(2,20),(NULL,30),(3,40);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (1,100),(1,101),(NULL,200);
+
+query rowsort
+SELECT l.lv, r.rv FROM l LEFT JOIN r ON l.k = r.k;
+----
+10 100
+10 101
+20 NULL
+30 NULL
+40 NULL
+
+# LEFT against an empty right table preserves every left row.
+statement ok
+CREATE TABLE empty_r(k INT, rv INT);
+
+query rowsort
+SELECT l.lv, empty_r.rv FROM l LEFT JOIN empty_r ON l.k = empty_r.k;
+----
+10 NULL
+20 NULL
+30 NULL
+40 NULL

@@ -1,0 +1,98 @@
+# Index maintenance is transactional: on abort (a failed statement or an explicit ROLLBACK) the index is
+# restored to match the rolled-back heap. Every entry the transaction inserted is deleted again, and every
+# entry it deleted is re-inserted, so no key is leaked and none goes missing.
+
+statement ok
+CREATE TABLE p(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO p VALUES (1, 10);
+
+# --- A failed multi-row INSERT does not leak the first row's key --------------------------------------
+# (2,20) is inserted, then (2,21) trips the duplicate and aborts. The index entry for 2 is rolled back.
+
+statement error
+INSERT INTO p VALUES (2, 20), (2, 21);
+
+# Key 2 is free again — this INSERT succeeds (it would have wrongly failed if 2 had leaked).
+statement ok
+INSERT INTO p VALUES (2, 99);
+
+query rowsort
+SELECT id, v FROM p;
+----
+1 10
+2 99
+
+# --- ROLLBACK undoes an INSERT (keys freed) -----------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO p VALUES (3, 30), (4, 40);
+
+statement ok
+ROLLBACK;
+
+# The inserted rows are gone AND their keys are free, so they can be inserted again.
+statement ok
+INSERT INTO p VALUES (3, 300), (4, 400);
+
+query rowsort
+SELECT id, v FROM p;
+----
+1 10
+2 99
+3 300
+4 400
+
+# --- ROLLBACK undoes a DELETE (deleted key restored) --------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM p WHERE id = 1;
+
+statement ok
+ROLLBACK;
+
+# The row is back...
+query rowsort
+SELECT id, v FROM p;
+----
+1 10
+2 99
+3 300
+4 400
+
+# ...and its index entry is back too, so re-inserting key 1 is a duplicate (not a silent second copy).
+statement error
+INSERT INTO p VALUES (1, -1);
+
+# --- ROLLBACK undoes an UPDATE key move (old and new keys both restored) -------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE p SET id = 50 WHERE id = 2;
+
+statement ok
+ROLLBACK;
+
+query rowsort
+SELECT id, v FROM p;
+----
+1 10
+2 99
+3 300
+4 400
+
+# The new key (50) was never committed, so it is free; the old key (2) is still occupied.
+statement ok
+INSERT INTO p VALUES (50, 5);
+
+statement error
+INSERT INTO p VALUES (2, -2);

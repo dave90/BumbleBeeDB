@@ -160,4 +160,23 @@ class ExecutionException : public Exception {
   explicit ExecutionException(const std::string &message) : Exception(ExceptionType::EXECUTION, message) {}
 };
 
+/**
+ * @brief Thrown by an in-memory breaker when its input exceeds the query memory budget.
+ *
+ * It carries the **logical plan node** the operator was lowered from (opaque `const void *` here to keep
+ * this low-level header free of plan includes) so the driver can re-lower just that node to its external,
+ * memory-bounded variant and retry — the "detect → re-plan → retry" adaptivity.
+ */
+class MemoryLimitException : public Exception {
+ public:
+  explicit MemoryLimitException(const void *culprit)
+      : Exception(ExceptionType::OUT_OF_MEMORY, "operator exceeded the query memory budget"), culprit_(culprit) {}
+
+  /** @return The logical plan node (as an opaque pointer) that overflowed. */
+  auto Culprit() const -> const void * { return culprit_; }
+
+ private:
+  const void *culprit_;
+};
+
 }  // namespace bumblebee

@@ -32,8 +32,12 @@ enum class StatementType : uint8_t {
   DELETE_STATEMENT,
   /** CREATE TABLE. */
   CREATE_STATEMENT,
+  /** DROP TABLE. */
+  DROP_STATEMENT,
   /** EXPLAIN. */
   EXPLAIN_STATEMENT,
+  /** BEGIN / COMMIT / ROLLBACK. */
+  TRANSACTION_STATEMENT,
 };
 
 /**

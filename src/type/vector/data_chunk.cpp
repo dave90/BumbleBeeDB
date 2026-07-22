@@ -296,6 +296,48 @@ auto DataChunk::GetTypes() const -> std::vector<LogicalType> {
   return types;
 }
 
+namespace {
+
+/** The materialized bytes of `count` rows of `vec`: the inline stride plus the out-of-line payloads. */
+auto VectorEstimatedBytes(Vector &vec, idx_t count) -> idx_t {
+  const auto ptype = vec.GetType();
+  idx_t bytes = LogicalType::SizeOf(ptype) * count;
+  switch (ptype) {
+    case PhysicalType::STRING: {
+      // The stride holds the 24-byte handles; only the non-inlined payloads live elsewhere.
+      VectorData vd;
+      vec.Orrify(count, vd);
+      const auto *strings = reinterpret_cast<const string_t *>(vd.data_);
+      for (idx_t i = 0; i < count; i++) {
+        const idx_t idx = vd.sel_->GetIndex(i);
+        if (vd.validity_->RowIsValid(idx) && !strings[idx].IsInlined()) {
+          bytes += strings[idx].Size();
+        }
+      }
+      break;
+    }
+    case PhysicalType::LIST:
+      bytes += VectorEstimatedBytes(ListVector::GetChild(vec), ListVector::GetListSize(vec));
+      break;
+    case PhysicalType::ARRAY:
+      bytes += VectorEstimatedBytes(ArrayVector::GetChild(vec), count * ArrayVector::GetArraySize(vec));
+      break;
+    default:
+      break;
+  }
+  return bytes;
+}
+
+}  // namespace
+
+auto DataChunk::EstimatedBytes() -> idx_t {
+  idx_t bytes = 0;
+  for (auto &v : data_) {
+    bytes += VectorEstimatedBytes(v, count_);
+  }
+  return bytes;
+}
+
 auto DataChunk::ToString() const -> std::string {
   std::string result = "Chunk - [" + std::to_string(ColumnCount()) + " Columns]\n";
   for (idx_t i = 0; i < ColumnCount(); i++) {

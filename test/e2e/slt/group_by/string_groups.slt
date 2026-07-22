@@ -1,0 +1,27 @@
+# GROUP BY over strings: long keys sharing a 16-byte prefix stay distinct groups (full byte compare),
+# the empty string is a group of its own, and NULLs collapse into a single group.
+
+statement ok
+CREATE TABLE s(k VARCHAR, v INT);
+
+statement ok
+INSERT INTO s VALUES ('aaaaaaaaaaaaaaaa-first',1),('aaaaaaaaaaaaaaaa-first',2),('aaaaaaaaaaaaaaaa-second',4),(NULL,8),(NULL,16),('',32),('x',64);
+
+query rowsort
+SELECT k, COUNT(*), SUM(v) FROM s GROUP BY k;
+----
+'' 1 32
+'aaaaaaaaaaaaaaaa-first' 2 3
+'aaaaaaaaaaaaaaaa-second' 1 4
+'x' 1 64
+NULL 2 24
+
+# DISTINCT rides the same group table: same distinctions must hold.
+query rowsort
+SELECT DISTINCT k FROM s;
+----
+''
+'aaaaaaaaaaaaaaaa-first'
+'aaaaaaaaaaaaaaaa-second'
+'x'
+NULL

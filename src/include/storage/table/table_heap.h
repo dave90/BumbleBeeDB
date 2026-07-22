@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>  // NOLINT
 #include <optional>
@@ -29,8 +30,45 @@
 namespace bumblebee {
 
 class HeapScan;
+class TableHeap;
 class TransactionManager;
 class Transaction;
+
+/**
+ * @brief The shared, snapshotted state a parallel scan hands morsels out from.
+ *
+ * A `TableHeap` is a singly linked page chain, so page *k* is not addressable without walking from the
+ * head — two tasks cannot carve up the chain directly. `BeginParallelScan` fixes this by snapshotting
+ * the heap's page directory (a `vector<page_id_t>`) plus the tail page's live-slot count (the Halloween
+ * boundary) into this object. Workers then pull page-index morsels off `next_page_idx_` with a single
+ * `fetch_add` — no per-morsel lock (that is the divergence from BumbleBee).
+ *
+ * The scan configuration (txn, predicate, projection) lives here too, recorded once at scan open, so
+ * every morsel's `HeapScan` reconstructs the same visible version and the SERIALIZABLE read set is
+ * recorded exactly once rather than per morsel.
+ */
+struct ParallelScanState {
+  TableHeap *heap_{nullptr};
+  /** The page directory as it stood when the scan opened. Pages linked later are not part of the scan. */
+  std::vector<page_id_t> pages_;
+  /** The live-slot count of the last snapshotted page at open — the Halloween bound on the tail page. */
+  uint32_t stop_slot_{0};
+  /** Column indices to materialize; empty means every column. */
+  std::vector<idx_t> projection_;
+  TransactionManager *txn_mgr_{nullptr};
+  Transaction *txn_{nullptr};
+  /** Row filter; empty ⇒ match every row. Also the SERIALIZABLE read set (recorded once at open). */
+  ScanPredicate predicate_;
+  /** The monotonic morsel cursor — a `fetch_add` needs no mutex over a monotonic page-index range. */
+  std::atomic<idx_t> next_page_idx_{0};
+  /** Heap pages handed out per morsel (>= 1). Seeded from `ClientConfig::morsel_pages_` at scan open. */
+  idx_t morsel_pages_{MORSEL_PAGES};
+
+  /** @brief Claim the next `[begin, end)` page-index morsel. @return false when the cursor is exhausted. */
+  auto NextMorsel(idx_t &begin, idx_t &end) -> bool;
+
+  auto NumPages() const -> idx_t { return pages_.size(); }
+};
 
 /**
  * @brief A row-format table: a singly linked list of slotted pages in the buffer pool.
@@ -70,10 +108,31 @@ class TableHeap : public TableStorage {
   auto MakeMvccScan(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, ScanPredicate predicate = {},
                     const std::vector<idx_t> &projection = {}) -> std::unique_ptr<TableScan>;
 
+  /**
+   * @brief Open a parallel scan: snapshot the page directory + Halloween boundary + read set once.
+   *
+   * The returned state is shared by a `PhysicalTableScan`'s global source state; each task opens a
+   * per-morsel cursor via `MakeMorselScan`. `txn`/`predicate` may be null/empty for a plain scan.
+   */
+  auto BeginParallelScan(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, ScanPredicate predicate = {},
+                         const std::vector<idx_t> &projection = {}) -> std::shared_ptr<ParallelScanState>;
+
+  /** @brief Open a `TableScan` cursor over the `[begin, end)` page-index morsel of a parallel scan. */
+  auto MakeMorselScan(const std::shared_ptr<ParallelScanState> &state, idx_t begin, idx_t end)
+      -> std::unique_ptr<TableScan>;
+
   void Append(DataChunk &chunk, Vector &out_rids) override;
   void Update(Vector &row_ids, DataChunk &chunk) override;
   void Delete(Vector &row_ids, idx_t count) override;
   void Fetch(Vector &row_ids, idx_t count, DataChunk &out) override;
+
+  /**
+   * @brief Free every heap page (the whole linked page chain) back to the buffer pool's free list.
+   *
+   * Walks `page_directory_` — the complete list of pages this heap ever linked — deleting each. The
+   * heap is left empty (no pages, no first/last); callers must drop it right after (DROP TABLE).
+   */
+  void FreeAllPages() override;
 
   auto GetFirstPageId() const -> page_id_t { return first_page_id_; }
   auto GetLastPageId() const -> page_id_t { return last_page_id_; }
@@ -115,6 +174,11 @@ class TableHeap : public TableStorage {
   std::mutex latch_;
   page_id_t first_page_id_;
   page_id_t last_page_id_;
+  /**
+   * Every page of the heap, in link order, so a parallel scan can address page *k* directly (a linked
+   * list cannot). Appended under `latch_` whenever a new page is linked; the substrate for `ParallelScanState`.
+   */
+  std::vector<page_id_t> page_directory_;
 };
 
 }  // namespace bumblebee

@@ -1,0 +1,51 @@
+# A three-table join. Mixed equi + non-equi conditions across all three inputs.
+
+statement ok
+CREATE TABLE a(x INT);
+
+statement ok
+INSERT INTO a VALUES (1),(2);
+
+statement ok
+CREATE TABLE b(y INT);
+
+statement ok
+INSERT INTO b VALUES (10),(20);
+
+statement ok
+CREATE TABLE c(z INT);
+
+statement ok
+INSERT INTO c VALUES (100);
+
+query rowsort
+SELECT a.x, b.y, c.z FROM a JOIN b ON a.x < b.y JOIN c ON c.z > b.y;
+----
+1 10 100
+1 20 100
+2 10 100
+2 20 100
+
+# Three-way equi-join (hash joins).
+statement ok
+CREATE TABLE d(k INT, dv INT);
+
+statement ok
+INSERT INTO d VALUES (1,10),(2,20),(3,30);
+
+statement ok
+CREATE TABLE e(k INT, ev INT);
+
+statement ok
+INSERT INTO e VALUES (2,200),(3,300);
+
+statement ok
+CREATE TABLE f(k INT, fv INT);
+
+statement ok
+INSERT INTO f VALUES (3,3000);
+
+query rowsort
+SELECT d.dv, e.ev, f.fv FROM d JOIN e ON d.k = e.k JOIN f ON e.k = f.k;
+----
+30 300 3000

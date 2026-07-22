@@ -1,0 +1,121 @@
+# Explicit transaction control: BEGIN opens a transaction, COMMIT publishes its writes, ROLLBACK
+# discards them. Statements between BEGIN and COMMIT/ROLLBACK see the transaction's own uncommitted
+# writes. State persists across records within this file (one long-lived session).
+
+statement ok
+CREATE TABLE t(v INT);
+
+# BEGIN / COMMIT / ROLLBACK each echo their keyword.
+query
+BEGIN;
+----
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1), (2);
+
+# Inside the transaction, the statement sees its own uncommitted inserts.
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+
+query
+COMMIT;
+----
+COMMIT
+
+# After COMMIT the writes are durable and visible to the next (autocommitted) statement.
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+
+# --- ROLLBACK discards everything written since BEGIN --------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (3), (4);
+
+# The uncommitted rows are visible within the transaction...
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+3
+4
+
+statement ok
+ROLLBACK;
+
+# ...but vanish after ROLLBACK — only the previously committed rows remain.
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+
+# After ROLLBACK the session is back in autocommit mode: this INSERT commits on its own.
+statement ok
+INSERT INTO t VALUES (5);
+
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+5
+
+# --- Own-write visibility for UPDATE and DELETE inside a transaction ------------------------------
+
+statement ok
+CREATE TABLE k(id INT PRIMARY KEY, v INT);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO k VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+UPDATE k SET v = 99 WHERE id = 2;
+
+statement ok
+DELETE FROM k WHERE id = 3;
+
+# The transaction sees the net effect of its own INSERT + UPDATE + DELETE.
+query rowsort
+SELECT id, v FROM k;
+----
+1 10
+2 99
+
+statement ok
+COMMIT;
+
+query rowsort
+SELECT id, v FROM k;
+----
+1 10
+2 99
+
+# START TRANSACTION is a synonym for BEGIN.
+statement ok
+START TRANSACTION;
+
+statement ok
+INSERT INTO k VALUES (4, 40);
+
+statement ok
+ROLLBACK;
+
+query rowsort
+SELECT id, v FROM k;
+----
+1 10
+2 99

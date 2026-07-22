@@ -1,0 +1,30 @@
+# ORDER BY produces a deterministic order, so these results are compared position-sensitively
+# (no rowsort).
+
+statement ok
+CREATE TABLE t(a INT);
+
+statement ok
+INSERT INTO t VALUES (3),(1),(4),(1),(5),(9),(2);
+
+query
+SELECT a FROM t ORDER BY a;
+----
+1
+1
+2
+3
+4
+5
+9
+
+query
+SELECT a FROM t ORDER BY a DESC;
+----
+9
+5
+4
+3
+2
+1
+1

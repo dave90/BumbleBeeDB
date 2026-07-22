@@ -816,6 +816,15 @@ auto Binder::BindExplain(duckdb_libpgquery::PGExplainStmt *stmt) -> std::unique_
       if (strcmp(temp->defname, "schema") == 0 || strcmp(temp->defname, "s") == 0) {
         explain_options |= ExplainOptions::SCHEMA;
       }
+      if (strcmp(temp->defname, "physical") == 0 || strcmp(temp->defname, "x") == 0) {
+        explain_options |= ExplainOptions::PHYSICAL;
+      }
+      if (strcmp(temp->defname, "pipelines") == 0 || strcmp(temp->defname, "l") == 0) {
+        explain_options |= ExplainOptions::PIPELINES;
+      }
+      if (strcmp(temp->defname, "analyze") == 0 || strcmp(temp->defname, "a") == 0) {
+        explain_options |= ExplainOptions::ANALYZE;
+      }
     }
   }
   return std::make_unique<ExplainStatement>(BindStatement(stmt->query), explain_options);

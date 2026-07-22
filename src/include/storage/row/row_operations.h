@@ -67,6 +67,56 @@ struct RowOperations {
                              bool copy_strings = false);
 
   /**
+   * @brief Gather one column out of `count` rows into `col`, through explicit row/output selections.
+   *
+   * The i-th gathered value reads the row at `rows[row_sel[i]]` and lands at position `col_sel[i]` of
+   * `col`. A **null row pointer** yields NULL — that is how a LEFT join NULL-pads the build columns of
+   * an unmatched probe row without a separate emission path.
+   *
+   * @param layout The row layout.
+   * @param rows A flat `Vector` of `data_ptr_t` row pointers (null = emit NULL).
+   * @param row_sel Selects which row pointer feeds the i-th value.
+   * @param col The output column vector (flat).
+   * @param col_sel Selects which output position the i-th value lands at.
+   * @param count The number of values.
+   * @param col_no The layout column to gather.
+   * @param copy_strings When true, strings are copied into `col`'s heap; when false they reference the
+   *        row bytes in place (valid while the rows stay alive).
+   */
+  static void Gather(const RowLayout &layout, Vector &rows, const SelectionVector &row_sel, Vector &col,
+                     const SelectionVector &col_sel, idx_t count, idx_t col_no, bool copy_strings = false);
+
+  /**
+   * @brief Vectorized key equality between chunk rows and scattered rows — the hash-table verify kernel.
+   *
+   * Candidate i compares columns row `col_sel[i]` of `columns` against the row bytes at
+   * `rows[row_sel[i]]`, over the **first `key_count` layout columns** (the key prefix; any further
+   * layout columns are payload and are not compared). Candidates are filtered column by column, so each
+   * key column is one tight typed loop over the survivors of the previous column.
+   *
+   * On return `match_sel` holds the surviving candidate positions (in candidate order) and
+   * `no_match_sel` the failing ones; the return value is the match count.
+   *
+   * @param columns The probe-side chunk holding the key columns first.
+   * @param col_data `columns.Orrify()` output, computed once by the caller.
+   * @param layout The row layout of the scattered rows.
+   * @param key_count How many leading layout columns form the comparison key.
+   * @param rows A flat `Vector` of `data_ptr_t` row pointers.
+   * @param row_sel Maps candidate i to its row pointer slot.
+   * @param col_sel Maps candidate i to its `columns` row.
+   * @param count The number of candidates.
+   * @param match_sel Out: surviving candidate positions.
+   * @param no_match_sel Out: failing candidate positions.
+   * @param no_match_count Out: how many candidates failed.
+   * @param null_equal When true, two NULL keys compare equal (IS NOT DISTINCT FROM — GROUP BY
+   *        semantics); when false a NULL key on either side never matches (SQL `=` — join semantics).
+   */
+  static auto Match(DataChunk &columns, VectorData col_data[], const RowLayout &layout, idx_t key_count,
+                    Vector &rows, const SelectionVector &row_sel, const SelectionVector &col_sel, idx_t count,
+                    SelectionVector &match_sel, SelectionVector &no_match_sel, idx_t &no_match_count,
+                    bool null_equal) -> idx_t;
+
+  /**
    * @brief Gather selected key columns from a chunk into a packed array of fixed-size index keys.
    *
    * The vectorized replacement for a per-cell `GetValue` + `Store` loop when building an index. For

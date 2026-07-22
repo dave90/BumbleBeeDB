@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -487,7 +488,8 @@ struct FlatVector {
   static auto Validity(Vector &vector) -> ValidityMask & { return vector.validity_; }
   static auto Validity(const Vector &vector) -> const ValidityMask & { return vector.validity_; }
 
-  static const sel_t INCREMENTAL_VECTOR[STANDARD_VECTOR_SIZE];
+  /** The materialized identity 0..STANDARD_VECTOR_SIZE-1, for callers that need a real `sel_t` array. */
+  static const std::array<sel_t, STANDARD_VECTOR_SIZE> INCREMENTAL_VECTOR;
   /** The identity selection: GetIndex(i) == i, backed by no array at all. */
   static const SelectionVector INCREMENTAL_SELECTION_VECTOR;
 };

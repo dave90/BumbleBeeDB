@@ -1,0 +1,21 @@
+# NULL join keys must not match in the external grace hash join either. prefer_external forces the
+# out-of-core INNER join variant.
+# config: prefer_external=true
+
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1,10),(NULL,20),(2,30);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (1,100),(NULL,200),(2,300);
+
+query rowsort
+SELECT l.lv, r.rv FROM l JOIN r ON l.k = r.k;
+----
+10 100
+30 300

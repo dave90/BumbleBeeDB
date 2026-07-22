@@ -1,0 +1,60 @@
+# Negative coverage: expression/predicate features that are NOT supported today. Each must raise an
+# error (the harness asserts failure). These pin the current feature ceiling — as features land, the
+# corresponding `statement error` should move to a positive test.
+
+statement ok
+CREATE TABLE t(a INT, b INT, s VARCHAR(8));
+
+statement ok
+INSERT INTO t VALUES (1, 2, 'x');
+
+# IS NULL / IS NOT NULL — not implemented (no null-test predicate).
+statement error
+SELECT a FROM t WHERE b IS NULL;
+
+statement error
+SELECT a FROM t WHERE b IS NOT NULL;
+
+# IN / BETWEEN / LIKE — rejected in the binder.
+statement error
+SELECT a FROM t WHERE a IN (1, 2);
+
+statement error
+SELECT a FROM t WHERE a BETWEEN 1 AND 3;
+
+statement error
+SELECT a FROM t WHERE s LIKE 'x%';
+
+# NOT and unary minus — bound but not planned.
+statement error
+SELECT a FROM t WHERE NOT (a = 1);
+
+statement error
+SELECT -a FROM t;
+
+# Modulo and string concatenation — no operator in the planner.
+statement error
+SELECT a % b FROM t;
+
+statement error
+SELECT s || s FROM t;
+
+# CASE / COALESCE / CAST — not implemented in the binder.
+statement error
+SELECT CASE WHEN a = 1 THEN 1 ELSE 0 END FROM t;
+
+statement error
+SELECT COALESCE(b, 0) FROM t;
+
+statement error
+SELECT CAST(a AS BIGINT) FROM t;
+
+# Unsupported aggregates / scalar functions.
+statement error
+SELECT AVG(a) FROM t;
+
+statement error
+SELECT COUNT(DISTINCT a) FROM t;
+
+statement error
+SELECT abs(a) FROM t;

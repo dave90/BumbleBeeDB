@@ -1,0 +1,97 @@
+# UPDATE keeps the primary-key index in step with the heap: a changed key frees its old value for
+# re-insert and takes its new value out of circulation; uniqueness is enforced against occupied keys;
+# an unchanged key (or an update to a non-indexed column) leaves the index untouched.
+
+statement ok
+CREATE TABLE p(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO p VALUES (1, 10), (2, 20);
+
+# --- Moving a key to a FREE value: old value re-insertable, new value now occupied ----------------
+
+statement ok
+UPDATE p SET id = 5 WHERE id = 1;
+
+query rowsort
+SELECT id, v FROM p;
+----
+2 20
+5 10
+
+# The old key (1) is free again...
+statement ok
+INSERT INTO p VALUES (1, 99);
+
+# ...and the new key (5) is now rejected as a duplicate.
+statement error
+INSERT INTO p VALUES (5, 77);
+
+query rowsort
+SELECT id, v FROM p;
+----
+1 99
+2 20
+5 10
+
+# --- Uniqueness is enforced on UPDATE (against an occupied key) ------------------------------------
+
+statement error
+UPDATE p SET id = 2 WHERE id = 1;
+
+# Nothing changed (the transaction rolled back).
+query rowsort
+SELECT id, v FROM p;
+----
+1 99
+2 20
+5 10
+
+# --- Updating a NON-indexed column leaves the key (and the index) alone ----------------------------
+
+statement ok
+CREATE TABLE q(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO q VALUES (1, 10), (2, 20);
+
+statement ok
+UPDATE q SET v = 999 WHERE id = 1;
+
+# The key 1 was not touched, so it is still rejected as a duplicate.
+statement error
+INSERT INTO q VALUES (1, 5);
+
+query rowsort
+SELECT id, v FROM q;
+----
+1 999
+2 20
+
+# --- A batch that PERMUTES keys succeeds (deletes precede inserts) ---------------------------------
+
+statement ok
+CREATE TABLE s(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20);
+
+# Swap the two primary keys in a single statement.
+statement ok
+UPDATE s SET id = 3 - id WHERE id <= 2;
+
+query rowsort
+SELECT id, v FROM s;
+----
+1 20
+2 10
+
+# A monotonic shift of every key (no collisions) also works.
+statement ok
+UPDATE s SET id = id + 10;
+
+query rowsort
+SELECT id, v FROM s;
+----
+11 20
+12 10

@@ -17,6 +17,7 @@
 #include "common/macros.h"
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/constant_value_expression.h"
+#include "execution/expressions/logic_expression.h"
 #include "execution/plans/abstract_plan.h"
 #include "execution/plans/filter_plan.h"
 #include "execution/plans/nested_loop_join_plan.h"
@@ -76,8 +77,12 @@ auto Optimizer::IsPredicateTrue(const AbstractExpressionRef &expr) -> bool {
  * which pairs are produced — and re-index its column references from the flat
  * `#0.k` addressing the filter used to the two-sided `#0.k` / `#1.k` a join needs.
  *
- * Only fires when the join's own predicate is still the constant `true`; if the
- * join already carries a predicate, we would be silently dropping it.
+ * When the join's own predicate is still the constant `true` (a cross product) the
+ * filter simply becomes the predicate. When the join already carries an ON predicate
+ * we can still fold the filter in for an INNER join, where `A JOIN B ON p WHERE q` is
+ * equivalent to `A JOIN B ON (p AND q)` — the conjoined predicate then flows into
+ * FilterPushDown, which splits it back out per side. For outer joins this equivalence
+ * does not hold (WHERE runs after null-padding), so we leave the Filter in place.
  */
 auto Optimizer::OptimizeMergeFilterNLJ(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef {
   std::vector<AbstractPlanNodeRef> children;
@@ -102,16 +107,26 @@ auto Optimizer::OptimizeMergeFilterNLJ(const AbstractPlanNodeRef &plan) -> Abstr
   const auto &nlj_plan = dynamic_cast<const NestedLoopJoinPlanNode &>(*child_plan);
   BUMBLEBEE_ENSURE(child_plan->GetChildren().size() == 2, "NestedLoopJoin should have exactly two children.");
 
-  if (!IsPredicateTrue(nlj_plan.Predicate())) {
+  // Re-index the filter's flat `#0.k` references into the join's two-sided `#0.k` / `#1.k` form.
+  auto rewritten = RewriteExpressionForJoin(filter_plan.GetPredicate(),
+                                            nlj_plan.GetLeftPlan()->OutputSchema().GetColumnCount(),
+                                            nlj_plan.GetRightPlan()->OutputSchema().GetColumnCount());
+
+  AbstractExpressionRef merged;
+  if (IsPredicateTrue(nlj_plan.Predicate())) {
+    // Cross product: the filter becomes the join predicate outright.
+    merged = std::move(rewritten);
+  } else if (nlj_plan.GetJoinType() == JoinType::INNER) {
+    // Inner join: ON and WHERE are interchangeable, so conjoin them.
+    merged = std::make_shared<LogicExpression>(nlj_plan.Predicate(), std::move(rewritten), LogicType::And);
+  } else {
+    // Outer join with an existing predicate: folding the filter in would change the answer.
     return optimized_plan;
   }
 
-  return std::make_shared<NestedLoopJoinPlanNode>(
-      filter_plan.output_schema_, nlj_plan.GetLeftPlan(), nlj_plan.GetRightPlan(),
-      RewriteExpressionForJoin(filter_plan.GetPredicate(),
-                               nlj_plan.GetLeftPlan()->OutputSchema().GetColumnCount(),
-                               nlj_plan.GetRightPlan()->OutputSchema().GetColumnCount()),
-      nlj_plan.GetJoinType());
+  return std::make_shared<NestedLoopJoinPlanNode>(filter_plan.output_schema_, nlj_plan.GetLeftPlan(),
+                                                  nlj_plan.GetRightPlan(), std::move(merged),
+                                                  nlj_plan.GetJoinType());
 }
 
 }  // namespace bumblebee

@@ -1,0 +1,22 @@
+# SELECT * expands to every column INCLUDING the auto-generated `_id` primary key at column 0.
+# A table created without an explicit PRIMARY KEY gets `_id` as a hidden BIGINT auto-increment,
+# and `*` exposes it — so the first output column is the sequential _id (0, 1, ...).
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (10, 20), (30, 40);
+
+query rowsort
+SELECT * FROM t;
+----
+0 10 20
+1 30 40
+
+# The auto _id can be referenced explicitly by name.
+query rowsort
+SELECT _id, a FROM t;
+----
+0 10
+1 30

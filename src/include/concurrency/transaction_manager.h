@@ -46,7 +46,7 @@ struct PageVersionInfo {
  * @brief Owns transaction lifecycle and MVCC metadata: id/timestamp allocation, the live-txn map,
  * the version side-table, and the GC watermark. There is deliberately NO lock manager.
  *
- * Snapshot Isolation is the default; Serializable adds commit-time backward validation (Phase 5).
+ * Snapshot Isolation is the default; Serializable adds commit-time backward validation.
  */
 class TransactionManager {
  public:
@@ -118,6 +118,21 @@ class TransactionManager {
   }
 
   auto GetLastCommitTs() const -> timestamp_t { return last_commit_ts_.load(); }
+
+  /**
+   * @brief Seed the commit-timestamp high-water mark after recovery (clean-shutdown durability).
+   *
+   * Committed rows persist their commit ts in the on-page tuple header, but the counter that hands out
+   * read/commit timestamps lives only in memory and would otherwise restart from 0 on reopen — making
+   * every persisted row (ts >= 1) invisible to a fresh reader (whose read_ts would be 0), since the
+   * in-memory undo chains that a reader falls back to are also gone. Restoring the high-water mark makes
+   * new snapshots start at/after every persisted version. Call once at startup, before any Begin().
+   */
+  void SetLastCommitTs(timestamp_t ts) {
+    std::unique_lock lock(txn_map_mutex_);
+    last_commit_ts_.store(ts);
+    running_txns_.UpdateCommitTs(ts);
+  }
 
   /** @return The number of transactions still tracked (test observability for GC). */
   auto GetTransactionCount() -> size_t {

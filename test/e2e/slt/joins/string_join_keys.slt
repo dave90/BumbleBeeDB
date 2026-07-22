@@ -1,0 +1,29 @@
+# String join keys: two long keys sharing a 16-byte prefix must stay distinct (the key compare has to
+# run past any inlined prefix), and NULL string keys never match — including NULL = NULL.
+
+statement ok
+CREATE TABLE a(s VARCHAR, av INT);
+
+statement ok
+INSERT INTO a VALUES ('aaaaaaaaaaaaaaaa-first',1),('aaaaaaaaaaaaaaaa-second',2),('x',3),(NULL,4);
+
+statement ok
+CREATE TABLE b(s VARCHAR, bv INT);
+
+statement ok
+INSERT INTO b VALUES ('aaaaaaaaaaaaaaaa-first',10),('x',30),(NULL,40);
+
+query rowsort
+SELECT a.av, b.bv FROM a JOIN b ON a.s = b.s;
+----
+1 10
+3 30
+
+# LEFT: the long-suffix mismatch and the NULL key are preserved, NULL-padded.
+query rowsort
+SELECT a.av, b.bv FROM a LEFT JOIN b ON a.s = b.s;
+----
+1 10
+2 NULL
+3 30
+4 NULL

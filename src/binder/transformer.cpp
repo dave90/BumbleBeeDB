@@ -21,6 +21,8 @@
 #include "binder/bound_statement.h"
 #include "binder/statement/create_statement.h"
 #include "binder/statement/delete_statement.h"
+#include "binder/statement/drop_statement.h"
+#include "binder/statement/transaction_statement.h"
 #include "binder/statement/explain_statement.h"
 #include "binder/statement/insert_statement.h"
 #include "binder/statement/select_statement.h"
@@ -43,6 +45,10 @@ auto Binder::BindStatement(duckdb_libpgquery::PGNode *stmt) -> std::unique_ptr<B
       return BindStatement(reinterpret_cast<duckdb_libpgquery::PGRawStmt *>(stmt)->stmt);
     case duckdb_libpgquery::T_PGCreateStmt:
       return BindCreate(reinterpret_cast<duckdb_libpgquery::PGCreateStmt *>(stmt));
+    case duckdb_libpgquery::T_PGDropStmt:
+      return BindDrop(reinterpret_cast<duckdb_libpgquery::PGDropStmt *>(stmt));
+    case duckdb_libpgquery::T_PGTransactionStmt:
+      return BindTransaction(reinterpret_cast<duckdb_libpgquery::PGTransactionStmt *>(stmt));
     case duckdb_libpgquery::T_PGInsertStmt:
       return BindInsert(reinterpret_cast<duckdb_libpgquery::PGInsertStmt *>(stmt));
     case duckdb_libpgquery::T_PGSelectStmt:

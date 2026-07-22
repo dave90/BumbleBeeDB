@@ -1,0 +1,50 @@
+# A key permutation that spans MULTIPLE chunks (and parallel workers) must succeed: index maintenance
+# is deferred to a single statement-wide Finalize that deletes every old key before inserting any new
+# one. This only exercises the multi-chunk path on the small-vector build (STANDARD_VECTOR_SIZE = 4), so
+# eight rows span two chunks.
+#
+# require: small_vector
+
+statement ok
+CREATE TABLE p(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO p VALUES (0,0),(1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70);
+
+# Reverse every primary key: id -> 7 - id. Each row's new key is another row's old key, and the rows
+# straddle the 4-row chunk boundary — the case that used to false-conflict.
+statement ok
+UPDATE p SET id = 7 - id;
+
+query rowsort
+SELECT id, v FROM p;
+----
+0 70
+1 60
+2 50
+3 40
+4 30
+5 20
+6 10
+7 0
+
+# The permuted keys are all still enforced: re-inserting any of them is a duplicate.
+statement error
+INSERT INTO p VALUES (0, 999);
+
+# A genuine cross-chunk collision (many rows -> the same new key) is still rejected.
+statement error
+UPDATE p SET id = 100 WHERE id >= 3;
+
+# The rejected update changed nothing.
+query rowsort
+SELECT id, v FROM p;
+----
+0 70
+1 60
+2 50
+3 40
+4 30
+5 20
+6 10
+7 0

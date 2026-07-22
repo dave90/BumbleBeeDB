@@ -13,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>  // NOLINT
+#include <vector>
 
 #include "common/config.h"
 #include "gtest/gtest.h"
@@ -126,6 +128,52 @@ TEST(SingleFileDiskManagerTest, ReopenReadsBackWrittenPages) {
     EXPECT_EQ(read_buf[0], 'd');
     ASSERT_TRUE(dm.ReadPage(40, read_buf)) << "a page in the grown region survives reopen";
     EXPECT_EQ(read_buf[0], 'z');
+  }
+  std::filesystem::remove(path);
+}
+
+// Concurrent I/O through the SingleFileDiskManager: many threads write and read back their own disjoint
+// pages at once. Writes to high page ids also race EnsureCapacity (file growth) — all serialized by the
+// `db_io_latch_`, so no torn page, no lost write, and the counter reflects every write.
+TEST(SingleFileDiskManagerTest, ConcurrentWritesAndReadsDisjointPages) {
+  auto path = TempDbPath("bbdb_dm_concurrent.db");
+  std::filesystem::remove(path);
+  {
+    SingleFileDiskManager dm(path);
+
+    const int threads = 6;
+    const int pages_per_thread = 20;  // 120 pages > DEFAULT_DB_IO_SIZE => concurrent file growth
+    std::vector<std::thread> workers;
+    workers.reserve(threads);
+    for (int t = 0; t < threads; t++) {
+      workers.emplace_back([&, t] {
+        for (int i = 0; i < pages_per_thread; i++) {
+          const page_id_t page_id = t * pages_per_thread + i;
+          data_t write_buf[PAGE_SIZE];
+          FillPage(write_buf, static_cast<data_t>('A' + t));
+          ASSERT_TRUE(dm.WritePage(page_id, write_buf));
+
+          // Read our own page straight back (no other thread touches it) and verify integrity.
+          data_t read_buf[PAGE_SIZE];
+          ASSERT_TRUE(dm.ReadPage(page_id, read_buf));
+          EXPECT_EQ(0, std::memcmp(write_buf, read_buf, PAGE_SIZE));
+        }
+      });
+    }
+    for (auto &w : workers) {
+      w.join();
+    }
+
+    EXPECT_EQ(dm.GetNumWrites(), threads * pages_per_thread);
+
+    // Final single-threaded pass: every page still holds exactly its owning thread's byte.
+    for (int t = 0; t < threads; t++) {
+      for (int i = 0; i < pages_per_thread; i++) {
+        data_t read_buf[PAGE_SIZE];
+        ASSERT_TRUE(dm.ReadPage(t * pages_per_thread + i, read_buf));
+        EXPECT_EQ(read_buf[0], static_cast<data_t>('A' + t));
+      }
+    }
   }
   std::filesystem::remove(path);
 }

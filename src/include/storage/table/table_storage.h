@@ -82,6 +82,14 @@ class TableStorage {
 
   /** @brief Gather the first `count` rows named by `row_ids` into `out` (a self-contained chunk). */
   virtual void Fetch(Vector &row_ids, idx_t count, DataChunk &out) = 0;
+
+  /**
+   * @brief Return every page this storage owns to the buffer pool's free list (DROP TABLE).
+   *
+   * After this call the storage is empty and must not be used again. The default is a no-op — a
+   * backend with no reclaimable pages of its own (e.g. an external columnar file) needs nothing here.
+   */
+  virtual void FreeAllPages() {}
 };
 
 }  // namespace bumblebee

@@ -1,0 +1,21 @@
+# Non-recursive common table expressions (WITH).
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40);
+
+query
+WITH big AS (SELECT a, b FROM t WHERE b >= 20)
+SELECT COUNT(*), SUM(b) FROM big;
+----
+3 90
+
+query rowsort
+WITH big AS (SELECT a, b FROM t WHERE b >= 20)
+SELECT a FROM big;
+----
+2
+3
+4

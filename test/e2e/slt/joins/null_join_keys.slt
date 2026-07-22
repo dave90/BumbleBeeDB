@@ -1,0 +1,37 @@
+# NULL join keys never equi-match (SQL semantics: NULL = NULL is unknown, not true). This holds across
+# all three join operators: the in-memory hash join, the nested-loop join, and the external grace hash
+# join. The NULL-keyed rows (lv=20, rv=200) must NOT appear in any result.
+
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1,10),(NULL,20),(2,30);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (1,100),(NULL,200),(2,300);
+
+# Hash equi-join: NULL keys do not match.
+query rowsort
+SELECT l.lv, r.rv FROM l JOIN r ON l.k = r.k;
+----
+10 100
+30 300
+
+# Nested-loop join (an OR keeps it from becoming a hash join): NULL keys do not match either.
+query rowsort
+SELECT l.lv, r.rv FROM l JOIN r ON l.k = r.k OR l.k = r.k;
+----
+10 100
+30 300
+
+# A LEFT join keeps the NULL-keyed left row, NULL-padded (it matched nothing).
+query rowsort
+SELECT l.lv, r.rv FROM l LEFT JOIN r ON l.k = r.k;
+----
+10 100
+20 NULL
+30 300

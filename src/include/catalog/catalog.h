@@ -58,6 +58,12 @@ struct TableInfo {
   table_oid_t oid_;
   /** The physical storage backend, or null for a metadata-only catalog. */
   std::unique_ptr<TableStorage> storage_;
+  /** Column indices of the primary key; empty for a legacy table created without one. */
+  std::vector<uint32_t> pk_attrs_;
+  /** True when column 0 is the auto-generated `_id` key, which the INSERT executor fills. */
+  bool auto_id_{false};
+  /** Auto-increment high-water mark for `_id`: the next value handed out. Persisted across restarts. */
+  std::atomic<int64_t> next_id_{0};
 };
 
 /** Returned by GetTable() when the table does not exist. */
@@ -105,8 +111,9 @@ class Catalog {
    * @return std::shared_ptr<TableInfo> The new table's metadata, or NULL_TABLE_INFO
    *         if a table with that name already exists.
    */
-  auto CreateTable(const std::string &table_name, const Schema &schema,
-                   StorageFormat format = StorageFormat::ROW) -> std::shared_ptr<TableInfo> {
+  auto CreateTable(const std::string &table_name, const Schema &schema, StorageFormat format = StorageFormat::ROW,
+                   const std::vector<uint32_t> &pk_attrs = {}, bool auto_id = false)
+      -> std::shared_ptr<TableInfo> {
     std::lock_guard lk(latch_);
     if (table_names_.find(table_name) != table_names_.end()) {
       return NULL_TABLE_INFO;
@@ -125,16 +132,48 @@ class Catalog {
     }
 
     auto table_info = std::make_shared<TableInfo>(schema, table_name, table_oid, std::move(storage));
+    table_info->pk_attrs_ = pk_attrs;
+    table_info->auto_id_ = auto_id;
     tables_.emplace(table_oid, table_info);
     table_names_.emplace(table_name, table_oid);
     return table_info;
   }
 
   /**
+   * @brief Build a B+tree index over `key_attrs`, choosing the fixed KeySize from the key's byte width.
+   *
+   * A convenience over the `CreateIndex<KeySize>` template for callers that only know the width at run
+   * time (the auto primary-key index). Rounds the inlined key width up to 8/16/32/64 — the instantiated
+   * sizes — mirroring `Database::LoadIndexDispatch` on the reload side.
+   */
+  auto CreateIndexForKey(const std::string &index_name, const std::string &table_name,
+                         const std::vector<uint32_t> &key_attrs) -> std::shared_ptr<IndexInfo> {
+    auto table_info = GetTable(table_name);
+    if (table_info == NULL_TABLE_INFO) {
+      return NULL_INDEX_INFO;
+    }
+    const auto width = Schema::CopySchema(&table_info->schema_, key_attrs).GetInlinedStorageSize();
+    if (width <= 8) {
+      return CreateIndex<8>(index_name, table_name, key_attrs);
+    }
+    if (width <= 16) {
+      return CreateIndex<16>(index_name, table_name, key_attrs);
+    }
+    if (width <= 32) {
+      return CreateIndex<32>(index_name, table_name, key_attrs);
+    }
+    if (width <= 64) {
+      return CreateIndex<64>(index_name, table_name, key_attrs);
+    }
+    throw NotImplementedException("primary key wider than 64 bytes cannot be indexed");
+  }
+
+  /**
    * @brief Recovery: register a table over pages already on disk (no allocation, no re-init).
    */
   auto LoadTable(table_oid_t oid, const std::string &table_name, const Schema &schema, page_id_t first_page_id,
-                 page_id_t last_page_id, StorageFormat format) -> std::shared_ptr<TableInfo> {
+                 page_id_t last_page_id, StorageFormat format, const std::vector<uint32_t> &pk_attrs = {},
+                 bool auto_id = false, int64_t next_id = 0) -> std::shared_ptr<TableInfo> {
     std::lock_guard lk(latch_);
     std::unique_ptr<TableStorage> storage;
     if (bpm_ != nullptr) {
@@ -148,9 +187,29 @@ class Catalog {
       }
     }
     auto table_info = std::make_shared<TableInfo>(schema, table_name, oid, std::move(storage));
+    table_info->pk_attrs_ = pk_attrs;
+    table_info->auto_id_ = auto_id;
+    table_info->next_id_.store(next_id);
     tables_.emplace(oid, table_info);
     table_names_.emplace(table_name, oid);
     return table_info;
+  }
+
+  /** @return Every index defined on `table_name` (for insert-time index maintenance). */
+  auto GetTableIndexes(const std::string &table_name) const -> std::vector<std::shared_ptr<IndexInfo>> {
+    std::lock_guard lk(latch_);
+    std::vector<std::shared_ptr<IndexInfo>> out;
+    auto it = index_names_.find(table_name);
+    if (it == index_names_.end()) {
+      return out;
+    }
+    for (const auto &[iname, ioid] : it->second) {
+      auto info = indexes_.find(ioid);
+      if (info != indexes_.end()) {
+        out.push_back(info->second);
+      }
+    }
+    return out;
   }
 
   /**
@@ -304,6 +363,79 @@ class Catalog {
       out.push_back(info);
     }
     return out;
+  }
+
+  /**
+   * @brief Drop every table and index (the shell's `\clear`). Empties the in-memory catalog metadata.
+   *
+   * Every table's heap pages and every index's B+ tree pages are returned to the buffer pool's
+   * (persistent) free list. The oid allocators are deliberately NOT rewound, so a subsequent CREATE
+   * cannot reuse a dropped table's oid.
+   *
+   * @return The number of tables dropped.
+   */
+  auto DropAllTables() -> size_t {
+    std::lock_guard lk(latch_);
+    const size_t dropped = tables_.size();
+    for (auto &[ioid, info] : indexes_) {
+      if (info->index_ != nullptr) {
+        info->index_->FreeAllPages();
+      }
+    }
+    for (auto &[oid, info] : tables_) {
+      if (info->storage_ != nullptr) {
+        info->storage_->FreeAllPages();
+      }
+    }
+    tables_.clear();
+    table_names_.clear();
+    indexes_.clear();
+    index_names_.clear();
+    return dropped;
+  }
+
+  /**
+   * @brief Drop a single table and every index defined on it.
+   *
+   * Removes the table's metadata (and its indexes) from the in-memory catalog, so subsequent lookups —
+   * and the next `SerializeCatalog` — no longer see it. The table's heap pages and every index's B+ tree
+   * pages are returned to the buffer pool's (persistent) free list, so a later CREATE reuses that space
+   * instead of growing the file. The oid allocators are deliberately NOT rewound, so a later CREATE
+   * cannot reuse the dropped table's oid.
+   *
+   * @param table_name The table to drop.
+   * @return True if a table was dropped, false if no table with that name exists.
+   */
+  auto DropTable(const std::string &table_name) -> bool {
+    std::lock_guard lk(latch_);
+    auto name_it = table_names_.find(table_name);
+    if (name_it == table_names_.end()) {
+      return false;
+    }
+    const auto table_oid = name_it->second;
+
+    // Drop every index defined on the table, reclaiming each B+ tree's pages first.
+    auto idx_it = index_names_.find(table_name);
+    if (idx_it != index_names_.end()) {
+      for (const auto &[iname, ioid] : idx_it->second) {
+        auto info = indexes_.find(ioid);
+        if (info != indexes_.end() && info->second->index_ != nullptr) {
+          info->second->index_->FreeAllPages();
+        }
+        indexes_.erase(ioid);
+      }
+      index_names_.erase(idx_it);
+    }
+
+    // Reclaim the table's heap pages before dropping its metadata.
+    auto tbl_it = tables_.find(table_oid);
+    if (tbl_it != tables_.end() && tbl_it->second->storage_ != nullptr) {
+      tbl_it->second->storage_->FreeAllPages();
+    }
+
+    tables_.erase(table_oid);
+    table_names_.erase(name_it);
+    return true;
   }
 
   /** @return A snapshot of every index's metadata (for persisting the catalog). */

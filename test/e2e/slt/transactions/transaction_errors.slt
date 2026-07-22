@@ -1,0 +1,69 @@
+# Error and edge-case handling for explicit transactions: nested BEGIN, stray COMMIT/ROLLBACK, a failed
+# statement aborting the whole transaction, and the current (non-transactional) treatment of DDL.
+
+statement ok
+CREATE TABLE t(id INT PRIMARY KEY, v INT);
+
+# A stray COMMIT / ROLLBACK with no open transaction is an error.
+statement error
+COMMIT;
+
+statement error
+ROLLBACK;
+
+# Nested BEGIN is rejected (there are no savepoints).
+statement ok
+BEGIN;
+
+statement error
+BEGIN;
+
+# The first transaction is still open after the rejected nested BEGIN — clean it up.
+statement ok
+ROLLBACK;
+
+# --- A failed statement aborts the whole transaction ---------------------------------------------
+
+statement ok
+INSERT INTO t VALUES (1, 10);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (2, 20);
+
+# This duplicate-key INSERT fails, which aborts the transaction (discarding the (2,20) write too).
+statement error
+INSERT INTO t VALUES (1, 99);
+
+# The transaction is already gone, so COMMIT now finds nothing to commit.
+statement error
+COMMIT;
+
+# Only the row committed before the transaction survives; (2,20) was rolled back with the abort.
+query rowsort
+SELECT id, v FROM t;
+----
+1 10
+
+# --- DDL is NOT transactional (known limitation): the catalog is mutated immediately ---------------
+# A table created inside a transaction is NOT undone by ROLLBACK.
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE ephemeral(x INT);
+
+statement ok
+ROLLBACK;
+
+# The table still exists despite the ROLLBACK (catalog DDL bypasses the transaction).
+statement ok
+INSERT INTO ephemeral VALUES (1);
+
+query
+SELECT x FROM ephemeral;
+----
+1

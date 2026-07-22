@@ -1,0 +1,23 @@
+# CROSS JOIN (comma join with no equality) — the full Cartesian product, run as a nested-loop join.
+
+statement ok
+CREATE TABLE a(x INT);
+
+statement ok
+INSERT INTO a VALUES (1),(2);
+
+statement ok
+CREATE TABLE b(y INT);
+
+statement ok
+INSERT INTO b VALUES (10),(20),(30);
+
+query rowsort
+SELECT a.x, b.y FROM a, b;
+----
+1 10
+1 20
+1 30
+2 10
+2 20
+2 30

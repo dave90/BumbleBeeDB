@@ -1,0 +1,109 @@
+# ORDER BY through the out-of-core external merge sort: prefer_external forces it, and the tiny
+# budget forces the sink to flush multiple sorted runs, so the source's k-way merge is exercised
+# (on the small-vector build even a handful of rows spans several chunks and runs).
+# NOTE: no LIMIT here on purpose — ORDER BY + LIMIT collapses to the in-memory TopN instead.
+# config: prefer_external=true max_memory=4096
+
+statement ok
+CREATE TABLE t(x INT, s VARCHAR(64));
+
+statement ok
+INSERT INTO t VALUES (30, 'ccc'), (10, 'aaa'), (50, 'a much longer string that is not inlined anywhere'), (20, 'bbb'), (40, 'ddd');
+
+statement ok
+INSERT INTO t VALUES (5, 'e'), (45, 'f'), (15, 'g'), (35, 'h'), (25, 'i');
+
+query
+SELECT x FROM t ORDER BY x;
+----
+5
+10
+15
+20
+25
+30
+35
+40
+45
+50
+
+query
+SELECT x, s FROM t ORDER BY x DESC;
+----
+50 'a much longer string that is not inlined anywhere'
+45 'f'
+40 'ddd'
+35 'h'
+30 'ccc'
+25 'i'
+20 'bbb'
+15 'g'
+10 'aaa'
+5 'e'
+
+# String sort keys: the encoded __key column carries the whole (non-inlined) string.
+query
+SELECT s FROM t ORDER BY s;
+----
+'a much longer string that is not inlined anywhere'
+'aaa'
+'bbb'
+'ccc'
+'ddd'
+'e'
+'f'
+'g'
+'h'
+'i'
+
+# NULLs keep the engine convention through the external path too: last in ASC, first in DESC.
+statement ok
+INSERT INTO t VALUES (NULL, 'n1'), (NULL, 'n2');
+
+query
+SELECT x FROM t ORDER BY x;
+----
+5
+10
+15
+20
+25
+30
+35
+40
+45
+50
+NULL
+NULL
+
+query
+SELECT x FROM t ORDER BY x DESC;
+----
+NULL
+NULL
+50
+45
+40
+35
+30
+25
+20
+15
+10
+5
+
+# Multi-key with mixed directions.
+statement ok
+CREATE TABLE m(g INT, a INT);
+
+statement ok
+INSERT INTO m VALUES (2,5),(1,9),(1,3),(2,1),(1,9);
+
+query
+SELECT g, a FROM m ORDER BY g ASC, a DESC;
+----
+1 9
+1 9
+1 3
+2 5
+2 1

@@ -1,0 +1,35 @@
+# Arithmetic in the SELECT list: the four supported operators (+ - * /). Division of integers
+# truncates toward zero; any operand being NULL makes the whole expression NULL.
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (10, 3);
+
+query
+SELECT a + b, a - b, a * b, a / b FROM t;
+----
+13 7 30 3
+
+# Expression in a WHERE-filtered projection.
+statement ok
+INSERT INTO t VALUES (20, 4);
+
+query rowsort
+SELECT a * b FROM t WHERE a >= 10;
+----
+30
+80
+
+# NULL propagates through arithmetic.
+statement ok
+CREATE TABLE n(a INT, b INT);
+
+statement ok
+INSERT INTO n VALUES (5, NULL);
+
+query
+SELECT a + b FROM n;
+----
+NULL

@@ -286,6 +286,68 @@ TEST(PersistenceTest, MultiPageTableSurvivesRestart) {
   std::filesystem::remove(path);
 }
 
+// Rows committed in one session are VISIBLE through an MVCC snapshot in the next — the timestamp
+// high-water mark is persisted and restored, so a fresh reader's read_ts is not below the committed
+// rows' commit ts. Regression for: after reopen the commit counter restarted at 0, leaving every
+// persisted row (ts >= 1) invisible to SELECT even though its bytes were on disk. (ScanAll uses a raw,
+// visibility-free scan, so it cannot catch this — this test reads through MakeMvccScan on purpose.)
+TEST(PersistenceTest, CommittedRowsVisibleThroughMvccScanAfterRestart) {
+  auto path = TempDbPath("bbdb_persist_mvcc_visibility.db");
+  std::filesystem::remove(path);
+
+  auto one_row = [](const Schema &schema, int32_t id, const std::string &name) {
+    DataChunk chunk;
+    chunk.Initialize(TypesOf(schema));
+    chunk.SetValue(0, 0, Value(id));
+    chunk.SetValue(1, 0, Value(name));
+    chunk.SetCardinality(1);
+    return chunk;
+  };
+
+  table_oid_t oid{};
+  {
+    Database db(path, 32);
+    auto ti = db.GetCatalog().CreateTable("t", TwoColSchema());
+    oid = ti->oid_;
+    auto &tm = db.GetTransactionManager();
+    auto &heap = static_cast<TableHeap &>(*ti->storage_);
+    for (const auto &[id, name] : {std::pair<int32_t, std::string>{1, "alice"}, {2, "bob"}, {3, "carol"}}) {
+      auto *txn = tm.Begin();
+      auto chunk = one_row(ti->schema_, id, name);
+      Vector rids{LogicalType{LogicalTypeId::BIGINT}};
+      MvccInsert(&tm, txn, oid, heap, chunk, rids);
+      ASSERT_TRUE(tm.Commit(txn));
+    }
+    db.Close();
+  }
+  {
+    Database db(path, 32);
+    auto ti = db.GetCatalog().GetTable("t");
+    ASSERT_NE(ti, nullptr);
+    auto &tm = db.GetTransactionManager();
+    auto &heap = static_cast<TableHeap &>(*ti->storage_);
+
+    auto *reader = tm.Begin();  // read_ts must be restored to >= the persisted rows' commit ts
+    auto scan = heap.MakeMvccScan(&tm, reader, ti->oid_, {});
+    DataChunk out;
+    out.Initialize(TypesOf(ti->schema_));
+    std::vector<std::pair<int32_t, std::string>> rows;
+    while (scan->Next(out)) {
+      for (idx_t i = 0; i < out.GetSize(); i++) {
+        rows.emplace_back(out.GetValue(0, i).GetAs<int32_t>(), out.GetValue(1, i).GetString());
+      }
+    }
+    ASSERT_TRUE(tm.Commit(reader));
+
+    ASSERT_EQ(rows.size(), 3U) << "committed rows must be visible to a fresh MVCC snapshot after reopen";
+    std::sort(rows.begin(), rows.end());
+    EXPECT_EQ(rows[0], std::make_pair(1, std::string("alice")));
+    EXPECT_EQ(rows[1], std::make_pair(2, std::string("bob")));
+    EXPECT_EQ(rows[2], std::make_pair(3, std::string("carol")));
+  }
+  std::filesystem::remove(path);
+}
+
 // A transaction left open at Close() is aborted before the flush, so its uncommitted rows never reach
 // disk: reopening sees only the committed baseline. Without the abort-on-close, the uncommitted row —
 // stamped with a temp ts whose in-memory undo chain is gone — would be flushed and corrupt the reopen.

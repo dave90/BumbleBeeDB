@@ -1,0 +1,118 @@
+# DROP TABLE removes a table (and its primary-key index) from the catalog. A dropped table can no
+# longer be queried, its name becomes free again, and IF EXISTS turns a missing table into a no-op.
+
+statement ok
+CREATE TABLE t(v INT);
+
+statement ok
+INSERT INTO t VALUES (1),(2),(3);
+
+# DROP reports how many tables it removed (used as a `query`).
+query
+DROP TABLE t;
+----
+Dropped 1 table(s)
+
+# The table is gone: querying it is an error.
+statement error
+SELECT * FROM t;
+
+# The name is free again — recreate it with a completely different schema.
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (10, 20);
+
+# The recreated table is fresh: its auto `_id` restarts at 0 and the old rows are gone.
+query
+SELECT _id, a, b FROM t;
+----
+0 10 20
+
+# Dropping a table that does not exist is an error...
+statement error
+DROP TABLE missing;
+
+# ...unless IF EXISTS is given, which makes it a no-op that drops zero tables.
+query
+DROP TABLE IF EXISTS missing;
+----
+Dropped 0 table(s)
+
+# DROP TABLE can name several tables at once.
+statement ok
+CREATE TABLE a(x INT);
+
+statement ok
+CREATE TABLE b(y INT);
+
+query
+DROP TABLE a, b;
+----
+Dropped 2 table(s)
+
+statement error
+SELECT * FROM a;
+
+statement error
+SELECT * FROM b;
+
+# Dropping a table with an explicit PRIMARY KEY also drops its auto index, so the same table (and key
+# values) can be recreated and re-inserted cleanly.
+statement ok
+CREATE TABLE p(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO p VALUES (1, 100), (2, 200);
+
+statement ok
+DROP TABLE p;
+
+statement ok
+CREATE TABLE p(id INT PRIMARY KEY, v INT);
+
+# The key 1 is available again (the old index was dropped with the table).
+statement ok
+INSERT INTO p VALUES (1, 999);
+
+query
+SELECT id, v FROM p;
+----
+1 999
+
+# Only DROP TABLE is supported — DROP INDEX / VIEW / etc. are rejected.
+statement error
+DROP INDEX some_index;
+
+# A table used only in a join is independent: dropping an unrelated table leaves the join working...
+statement ok
+CREATE TABLE l(k INT, lv INT);
+
+statement ok
+INSERT INTO l VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE r(k INT, rv INT);
+
+statement ok
+INSERT INTO r VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE TABLE junk(z INT);
+
+statement ok
+DROP TABLE junk;
+
+query rowsort
+SELECT l.lv, r.rv FROM l JOIN r ON l.k = r.k;
+----
+10 100
+20 200
+
+# ...but joining against a dropped table is an error.
+statement ok
+DROP TABLE r;
+
+statement error
+SELECT * FROM l JOIN r ON l.k = r.k;

@@ -1,0 +1,37 @@
+# Explicit PRIMARY KEY: uniqueness is enforced on INSERT, and UPDATE/DELETE that match no rows
+# report 0 affected.
+
+statement ok
+CREATE TABLE pk(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO pk VALUES (1, 10);
+
+# A duplicate primary key is rejected.
+statement error
+INSERT INTO pk VALUES (1, 20);
+
+statement ok
+INSERT INTO pk VALUES (2, 20);
+
+query rowsort
+SELECT id, v FROM pk;
+----
+1 10
+2 20
+
+# UPDATE / DELETE matching zero rows succeed and report 0.
+query
+UPDATE pk SET v = 99 WHERE id = 5;
+----
+0
+
+query
+DELETE FROM pk WHERE id = 5;
+----
+0
+
+query
+SELECT COUNT(*) FROM pk;
+----
+2

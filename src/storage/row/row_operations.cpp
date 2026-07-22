@@ -68,6 +68,134 @@ void TemplatedFullScan(data_ptr_t *ptrs, Vector &col, idx_t count, idx_t col_off
   }
 }
 
+/** @brief Load a fixed-width column out of `count` selected rows into the selected slots of `col`. */
+template <class T>
+void TemplatedGather(data_ptr_t *ptrs, const SelectionVector &row_sel, Vector &col, const SelectionVector &col_sel,
+                     idx_t count, idx_t col_offset) {
+  auto data = FlatVector::GetData<T>(col);
+  for (idx_t i = 0; i < count; i++) {
+    auto row = ptrs[row_sel.GetIndex(i)];
+    if (row != nullptr) {
+      data[col_sel.GetIndex(i)] = Load<T>(row + col_offset);
+    }
+  }
+}
+
+/**
+ * @brief Filter the candidates on one fixed-width key column.
+ *
+ * Reads the survivors of the previous column through `cur_sel`, keeps the still-equal ones in
+ * `next_sel` and appends the failures to `no_match_sel` (both as candidate positions).
+ */
+template <class T, bool NULL_EQUAL>
+auto TemplatedMatchCol(const VectorData &col, data_ptr_t *rows, const SelectionVector &row_sel,
+                       const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count,
+                       idx_t col_offset, idx_t col_no, SelectionVector &next_sel, SelectionVector &no_match_sel,
+                       idx_t &no_match_count) -> idx_t {
+  auto data = reinterpret_cast<const T *>(col.data_);
+  idx_t survivors = 0;
+  for (idx_t p = 0; p < count; p++) {
+    const idx_t cand = cur_sel.GetIndex(p);
+    const auto row = rows[row_sel.GetIndex(cand)];
+    const idx_t col_row = col.sel_->GetIndex(col_sel.GetIndex(cand));
+    const bool col_valid = (col.validity_ == nullptr) || col.validity_->RowIsValid(col_row);
+    const bool row_valid = RowIsValid(row, col_no);
+    bool equal;
+    if (col_valid && row_valid) {
+      equal = data[col_row] == Load<T>(row + col_offset);
+    } else if (NULL_EQUAL) {
+      equal = !col_valid && !row_valid;  // IS NOT DISTINCT FROM: NULL == NULL
+    } else {
+      equal = false;  // SQL '=': a NULL key never matches
+    }
+    if (equal) {
+      next_sel.SetIndex(survivors++, cand);
+    } else {
+      no_match_sel.SetIndex(no_match_count++, cand);
+    }
+  }
+  return survivors;
+}
+
+/** @brief Filter the candidates on one variable-length (string) key column. */
+template <bool NULL_EQUAL>
+auto TemplatedMatchStringCol(const VectorData &col, data_ptr_t *rows, const SelectionVector &row_sel,
+                             const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count,
+                             idx_t col_offset, idx_t col_no, SelectionVector &next_sel,
+                             SelectionVector &no_match_sel, idx_t &no_match_count) -> idx_t {
+  auto data = reinterpret_cast<const string_t *>(col.data_);
+  idx_t survivors = 0;
+  for (idx_t p = 0; p < count; p++) {
+    const idx_t cand = cur_sel.GetIndex(p);
+    const auto row = rows[row_sel.GetIndex(cand)];
+    const idx_t col_row = col.sel_->GetIndex(col_sel.GetIndex(cand));
+    const bool col_valid = (col.validity_ == nullptr) || col.validity_->RowIsValid(col_row);
+    const bool row_valid = RowIsValid(row, col_no);
+    bool equal;
+    if (col_valid && row_valid) {
+      const auto handle = Load<StringHandle>(row + col_offset);
+      const auto &str = data[col_row];
+      equal = handle.length_ == str.Size() &&
+              std::memcmp(row + handle.offset_, str.GetDataUnsafe(), handle.length_) == 0;
+    } else if (NULL_EQUAL) {
+      equal = !col_valid && !row_valid;
+    } else {
+      equal = false;
+    }
+    if (equal) {
+      next_sel.SetIndex(survivors++, cand);
+    } else {
+      no_match_sel.SetIndex(no_match_count++, cand);
+    }
+  }
+  return survivors;
+}
+
+/** @brief Dispatch one key column of Match on its physical type. */
+template <bool NULL_EQUAL>
+auto MatchColumn(const VectorData &col, PhysicalType type, data_ptr_t *rows, const SelectionVector &row_sel,
+                 const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count, idx_t col_offset,
+                 idx_t col_no, SelectionVector &next_sel, SelectionVector &no_match_sel, idx_t &no_match_count)
+    -> idx_t {
+  switch (type) {
+    case PhysicalType::TINYINT:
+      return TemplatedMatchCol<int8_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                   next_sel, no_match_sel, no_match_count);
+    case PhysicalType::SMALLINT:
+      return TemplatedMatchCol<int16_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                    next_sel, no_match_sel, no_match_count);
+    case PhysicalType::INTEGER:
+      return TemplatedMatchCol<int32_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                    next_sel, no_match_sel, no_match_count);
+    case PhysicalType::BIGINT:
+      return TemplatedMatchCol<int64_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                    next_sel, no_match_sel, no_match_count);
+    case PhysicalType::UTINYINT:
+      return TemplatedMatchCol<uint8_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                    next_sel, no_match_sel, no_match_count);
+    case PhysicalType::USMALLINT:
+      return TemplatedMatchCol<uint16_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                     next_sel, no_match_sel, no_match_count);
+    case PhysicalType::UINTEGER:
+      return TemplatedMatchCol<uint32_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                     next_sel, no_match_sel, no_match_count);
+    case PhysicalType::UBIGINT:
+      return TemplatedMatchCol<uint64_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                     next_sel, no_match_sel, no_match_count);
+    case PhysicalType::FLOAT:
+      return TemplatedMatchCol<float, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                  next_sel, no_match_sel, no_match_count);
+    case PhysicalType::DOUBLE:
+      return TemplatedMatchCol<double, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                   next_sel, no_match_sel, no_match_count);
+    case PhysicalType::STRING:
+      return TemplatedMatchStringCol<NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                 next_sel, no_match_sel, no_match_count);
+    default:
+      throw NotImplementedException("RowOperations::Match: unsupported physical type");
+  }
+}
+
 }  // namespace
 
 void RowOperations::ScatterKeys(DataChunk &chunk, const std::vector<uint32_t> &src_cols,
@@ -273,6 +401,114 @@ void RowOperations::FullScanColumn(const RowLayout &layout, Vector &rows, Vector
       mask.SetInvalidUnsafe(i);
     }
   }
+}
+
+void RowOperations::Gather(const RowLayout &layout, Vector &rows, const SelectionVector &row_sel, Vector &col,
+                           const SelectionVector &col_sel, idx_t count, idx_t col_no, bool copy_strings) {
+  if (count == 0) {
+    return;
+  }
+  auto ptrs = FlatVector::GetData<data_ptr_t>(rows);
+  const auto col_offset = layout.GetOffsets()[col_no];
+  BUMBLEBEE_ASSERT(col.GetVectorType() == VectorType::FLAT_VECTOR, "RowOperations::Gather: the output must be flat");
+
+  switch (col.GetType()) {
+    case PhysicalType::TINYINT:
+      TemplatedGather<int8_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::SMALLINT:
+      TemplatedGather<int16_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::INTEGER:
+      TemplatedGather<int32_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::BIGINT:
+      TemplatedGather<int64_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::UTINYINT:
+      TemplatedGather<uint8_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::USMALLINT:
+      TemplatedGather<uint16_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::UINTEGER:
+      TemplatedGather<uint32_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::UBIGINT:
+      TemplatedGather<uint64_t>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::FLOAT:
+      TemplatedGather<float>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::DOUBLE:
+      TemplatedGather<double>(ptrs, row_sel, col, col_sel, count, col_offset);
+      break;
+    case PhysicalType::STRING: {
+      auto out = FlatVector::GetData<string_t>(col);
+      for (idx_t i = 0; i < count; i++) {
+        auto row = ptrs[row_sel.GetIndex(i)];
+        if (row == nullptr) {
+          continue;  // the validity pass below emits the NULL
+        }
+        auto handle = Load<StringHandle>(row + col_offset);
+        auto *bytes = reinterpret_cast<const char *>(row + handle.offset_);
+        out[col_sel.GetIndex(i)] = copy_strings ? StringVector::AddString(col, bytes, handle.length_)
+                                                : string_t(bytes, handle.length_);
+      }
+      break;
+    }
+    default:
+      throw NotImplementedException("RowOperations::Gather: unsupported physical type");
+  }
+
+  // NULL out every value whose row is null (LEFT-join padding) or whose validity bit is clear.
+  auto &mask = col.Validity();
+  bool allocated = false;
+  for (idx_t i = 0; i < count; i++) {
+    auto row = ptrs[row_sel.GetIndex(i)];
+    if (row == nullptr || !RowIsValid(row, col_no)) {
+      if (!allocated) {
+        mask.EnsureWritable(STANDARD_VECTOR_SIZE);
+        allocated = true;
+      }
+      mask.SetInvalidUnsafe(col_sel.GetIndex(i));
+    }
+  }
+}
+
+auto RowOperations::Match(DataChunk &columns, VectorData col_data[], const RowLayout &layout, idx_t key_count,
+                          Vector &rows, const SelectionVector &row_sel, const SelectionVector &col_sel, idx_t count,
+                          SelectionVector &match_sel, SelectionVector &no_match_sel, idx_t &no_match_count,
+                          bool null_equal) -> idx_t {
+  no_match_count = 0;
+  if (count == 0) {
+    return 0;
+  }
+  auto ptrs = FlatVector::GetData<data_ptr_t>(rows);
+  const auto &offsets = layout.GetOffsets();
+  const auto &types = layout.GetTypes();
+  BUMBLEBEE_ASSERT(key_count <= types.size() && key_count <= columns.ColumnCount(),
+                   "RowOperations::Match: the key prefix exceeds the layout");
+
+  // Filter column by column: `cur` holds the surviving candidate positions, `next` receives the ones
+  // still equal after this column. Failures accumulate in no_match_sel across all columns.
+  SelectionVector cur(count);
+  SelectionVector next(count);
+  for (idx_t i = 0; i < count; i++) {
+    cur.SetIndex(i, i);
+  }
+  idx_t remaining = count;
+  for (idx_t c = 0; c < key_count && remaining > 0; c++) {
+    remaining = null_equal ? MatchColumn<true>(col_data[c], types[c].GetPhysicalType(), ptrs, row_sel, col_sel, cur,
+                                               remaining, offsets[c], c, next, no_match_sel, no_match_count)
+                           : MatchColumn<false>(col_data[c], types[c].GetPhysicalType(), ptrs, row_sel, col_sel, cur,
+                                                remaining, offsets[c], c, next, no_match_sel, no_match_count);
+    std::swap(cur, next);
+  }
+  for (idx_t i = 0; i < remaining; i++) {
+    match_sel.SetIndex(i, cur.GetIndex(i));
+  }
+  return remaining;
 }
 
 }  // namespace bumblebee

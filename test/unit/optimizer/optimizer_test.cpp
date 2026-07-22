@@ -232,6 +232,71 @@ TEST(OptimizerTest, FilterPushDownPushesToBothSides) {
   EXPECT_NE(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(1)).filter_predicate_, nullptr);
 }
 
+TEST(OptimizerTest, FilterPushDownWorksThroughExplicitInnerJoinOn) {
+  auto catalog = MakeTestCatalog();
+  // Same intent as the comma-join case, but written as `INNER JOIN ... ON`. The ON
+  // clause leaves the join with a live predicate, so MergeFilterNLJ must conjoin the
+  // WHERE filter into it (rather than bailing) for pushdown to then split it out.
+  auto plan = TryOptimize(*catalog, "SELECT * FROM a JOIN b ON a.x = b.x WHERE a.y > 10");
+
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::HashJoin), 1U);
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::NestedLoopJoin), 0U);
+  // The filter reaches the scan of `a` — no stray Filter node is left above the join.
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::Filter), 0U);
+
+  auto join = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(join, nullptr);
+  const auto &left_scan = dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(0));
+  ASSERT_NE(left_scan.filter_predicate_, nullptr);
+  EXPECT_EQ(left_scan.filter_predicate_->ToString(), "(#0.1>10)");
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(1)).filter_predicate_, nullptr);
+}
+
+TEST(OptimizerTest, FilterPushDownPushesBothSidesThroughInnerJoinOn) {
+  auto catalog = MakeTestCatalog();
+  // Two single-table conjuncts in the WHERE, one per side, on top of an explicit ON key.
+  auto plan = TryOptimize(*catalog, "SELECT * FROM a JOIN b ON a.x = b.x WHERE a.y > 10 AND b.y < 5");
+
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::HashJoin), 1U);
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::Filter), 0U);
+
+  auto join = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(join, nullptr);
+  const auto &left_scan = dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(0));
+  const auto &right_scan = dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(1));
+  ASSERT_NE(left_scan.filter_predicate_, nullptr);
+  ASSERT_NE(right_scan.filter_predicate_, nullptr);
+  EXPECT_EQ(left_scan.filter_predicate_->ToString(), "(#0.1>10)");
+  EXPECT_EQ(right_scan.filter_predicate_->ToString(), "(#0.1<5)");
+}
+
+TEST(OptimizerTest, FilterPushDownLeavesRightJoinWhereFilterAlone) {
+  auto catalog = MakeTestCatalog();
+  // RIGHT join is likewise non-preserving on the left; folding a WHERE filter in
+  // would change the answer, so the Filter must survive above the join.
+  auto plan = TryOptimize(*catalog, "SELECT * FROM a RIGHT JOIN b ON a.x = b.x WHERE b.y > 10");
+
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::Filter), 1U);
+  auto join = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(join, nullptr);
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(0)).filter_predicate_, nullptr);
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(1)).filter_predicate_, nullptr);
+}
+
+TEST(OptimizerTest, FilterPushDownLeavesOuterJoinWhereFilterAlone) {
+  auto catalog = MakeTestCatalog();
+  // A WHERE filter on a LEFT join runs after null-padding, so it is NOT equivalent to
+  // an ON predicate and must not be folded into (nor pushed below) the join.
+  auto plan = TryOptimize(*catalog, "SELECT * FROM a LEFT JOIN b ON a.x = b.x WHERE a.y > 10");
+
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::Filter), 1U);
+  auto join = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(join, nullptr);
+  // Neither scan absorbs the filter — it stays above the join.
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(0)).filter_predicate_, nullptr);
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(1)).filter_predicate_, nullptr);
+}
+
 TEST(OptimizerTest, FilterPushDownLeavesAPureJoinPredicateAlone) {
   auto catalog = MakeTestCatalog();
   auto plan = TryOptimize(*catalog, "SELECT * FROM a, b WHERE a.x = b.x");

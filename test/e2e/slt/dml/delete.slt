@@ -1,0 +1,28 @@
+# DELETE reports the number of rows removed and the rows are gone afterwards.
+
+statement ok
+CREATE TABLE t(a INT);
+
+statement ok
+INSERT INTO t VALUES (1),(2),(3),(4);
+
+query
+DELETE FROM t WHERE a > 2;
+----
+2
+
+query rowsort
+SELECT a FROM t;
+----
+1
+2
+
+query
+DELETE FROM t;
+----
+2
+
+query
+SELECT COUNT(*) FROM t;
+----
+0

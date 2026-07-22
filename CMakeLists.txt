@@ -60,8 +60,11 @@ FetchContent_MakeAvailable(googletest)
 # unit. libstdc++ (GCC) does not transitively expose as many standard headers
 # as libc++, so sources that relied on those transitive includes fail to build.
 # See src/include/std_prelude.hpp. (GCC/Clang flag; skip on MSVC.)
+# CXX-only: the prelude is a C++ header, so it must not be force-included into C sources
+# (e.g. the vendored third_party/linenoise/linenoise.c).
 if(NOT MSVC)
-    add_compile_options(-include ${CMAKE_SOURCE_DIR}/src/include/std_prelude.hpp)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-include>
+                        $<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/src/include/std_prelude.hpp>)
 endif()
 
 # Enable a sanitizer in Debug builds. Select with -DSANITIZER=address (default) or -DSANITIZER=thread.
@@ -111,11 +114,25 @@ target_compile_definitions(bumblebee_lib
         $<$<CONFIG:Release>:LOG_LEVEL=2>
 )
 
+# STANDARD_VECTOR_SIZE is a compile-time constant (it sizes fixed-extent arrays), so it can only be
+# lowered by a rebuild. Configure a separate build tree with -DBBDB_VECTOR_SIZE=4 to produce a
+# "small-vector" binary that exercises the multi-chunk paths on a handful of rows; the e2e harness
+# points BBDB_SLT_BIN at it. Default 1024 = the production value.
+set(BBDB_VECTOR_SIZE 1024 CACHE STRING "STANDARD_VECTOR_SIZE for this build (lower it for multi-chunk tests)")
+target_compile_definitions(bumblebee_lib PUBLIC BUMBLEBEE_STANDARD_VECTOR_SIZE=${BBDB_VECTOR_SIZE})
+
+# ----------------------------------------
+# linenoise: vendored single-file C line editor for the interactive shell (arrow keys + history).
+# Built as its own C target so the C++ prelude/force-include never reaches it.
+# ----------------------------------------
+add_library(linenoise STATIC third_party/linenoise/linenoise.c)
+target_include_directories(linenoise PUBLIC ${PROJECT_SOURCE_DIR}/third_party/linenoise)
+
 # ----------------------------------------
 # Main application executable
 # ----------------------------------------
 add_executable(${PROJECT_NAME} src/main/main.cpp)
-target_link_libraries(${PROJECT_NAME} PRIVATE bumblebee_lib)
+target_link_libraries(${PROJECT_NAME} PRIVATE bumblebee_lib linenoise)
 
 # ----------------------------------------
 # Unit tests

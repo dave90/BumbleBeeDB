@@ -32,6 +32,8 @@ namespace {
   throw ExecutionException("write-write conflict: a concurrent transaction modified this row");
 }
 
+}  // namespace  (close the anonymous namespace: ApplyMvccModify is shared with the index-aware DML path)
+
 /**
  * @brief The shared write path for update (is_delete=false) and delete (is_delete=true).
  *
@@ -83,6 +85,8 @@ void ApplyMvccModify(TransactionManager *txn_mgr, Transaction *txn, table_oid_t 
   }
   txn->AppendWriteSet(oid, rid);
 }
+
+namespace {
 
 /** @brief A flat Vector of `data_ptr_t` pointing at each row buffer, for the row→column decode. */
 auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UBIGINT}}; }
