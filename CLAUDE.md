@@ -164,14 +164,24 @@ Current limitations to keep in mind (several are pinned by tests in `test/e2e/sl
   when none is declared; a B+tree index enforces PK uniqueness; index maintenance is INSERT-only.
 - Durability is clean-shutdown only (no WAL yet). Persistent instances write `bb.db` (or `--db`).
 - Concurrency: MVCC snapshot isolation by default, Serializable via commit-time validation; no
-  lock manager.
+  lock manager. Transaction timeout is GC-driven only (`\gc` / `--txn-timeout`); nothing runs GC
+  in the background.
+- `INSERT INTO t SELECT ... FROM t` (the insert's own target table) uses statement-snapshot
+  semantics: the scan sees only rows present when it started, so a self-insert doubles the table
+  (no Halloween problem). NULL is an untyped literal that fits any column type; `IS [NOT] NULL`
+  is supported; integer literals up to the int64 range bind as BIGINT.
 
 ## Shell (useful when debugging by hand)
 
 `./build/BumbleBee` opens durable `bb.db` in cwd; `\help` for meta-commands. Flags: `--memory/-m`,
 `--db <path>`, `-c "<sql>"` (one-shot), `--no-seed`, `--max-memory <bytes>`, `--threads <n>`,
-`--prefer-external`, `--morsel-pages <n>`, `--frames <n>`, `--test-protocol` (machine-readable,
+`--prefer-external`, `--morsel-pages <n>`, `--frames <n>`, `--txn-timeout <ms>` (transaction
+timeout, default 2h — runtime-configurable, no special build), `--test-protocol` (machine-readable,
 used by the e2e harness). `EXPLAIN <q>` / `EXPLAIN (physical) <q>` shows plans without running.
+`\session <name>` switches between named sessions (each can hold its own open transaction —
+how the e2e concurrent-transaction tests interleave deterministically); `\gc` drives
+`TransactionManager::GarbageCollection()`, the only transaction-timeout enforcer (nothing runs GC
+automatically).
 
 ## Workflow expectations for changes
 

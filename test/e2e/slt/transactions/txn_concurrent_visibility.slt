@@ -1,0 +1,166 @@
+# Snapshot-isolation visibility across concurrent transactions. Records carry a connection label
+# (`statement ok s1`) selecting a named shell session; each session holds its own open transaction,
+# so several transactions are interleaved deterministically in one single-threaded process — the
+# concurrency semantics come entirely from MVCC snapshots, not from threads.
+
+statement ok
+CREATE TABLE t(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10);
+
+# --- Uncommitted INSERTs are invisible to other sessions -------------------------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s1
+INSERT INTO t VALUES (2, 20);
+
+# s1 sees its own uncommitted row...
+query rowsort s1
+SELECT id, v FROM t;
+----
+1 10
+2 20
+
+# ...but an autocommitted read in s2 does not...
+query s2
+SELECT COUNT(*) FROM t;
+----
+1
+
+# ...and neither does a transaction s2 opens now (its snapshot predates s1's commit).
+statement ok s2
+BEGIN;
+
+query s2
+SELECT COUNT(*) FROM t;
+----
+1
+
+statement ok s1
+COMMIT;
+
+# s2's snapshot was taken at its BEGIN, so it STILL does not see s1's now-committed row.
+query s2
+SELECT COUNT(*) FROM t;
+----
+1
+
+statement ok s2
+COMMIT;
+
+# After s2 ends its transaction, a fresh statement sees s1's commit.
+query s2
+SELECT COUNT(*) FROM t;
+----
+2
+
+# --- An uncommitted UPDATE: other sessions keep reading the old version ----------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s1
+UPDATE t SET v = 99 WHERE id = 1;
+
+query s1
+SELECT v FROM t WHERE id = 1;
+----
+99
+
+query s2
+SELECT v FROM t WHERE id = 1;
+----
+10
+
+statement ok s1
+COMMIT;
+
+query s2
+SELECT v FROM t WHERE id = 1;
+----
+99
+
+# --- An uncommitted DELETE: the row stays visible to an older snapshot -----------------------------
+
+statement ok s2
+BEGIN;
+
+statement ok s1
+BEGIN;
+
+statement ok s1
+DELETE FROM t WHERE id = 2;
+
+# s1 no longer sees the row; s2's older snapshot still does.
+query s1
+SELECT COUNT(*) FROM t;
+----
+1
+
+query s2
+SELECT COUNT(*) FROM t;
+----
+2
+
+statement ok s1
+COMMIT;
+
+# Still visible to s2: its snapshot predates the deleting commit.
+query s2
+SELECT COUNT(*) FROM t;
+----
+2
+
+statement ok s2
+COMMIT;
+
+query s2
+SELECT COUNT(*) FROM t;
+----
+1
+
+# --- Two read-only transactions over the same table are both stable --------------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s2
+BEGIN;
+
+query s1
+SELECT v FROM t WHERE id = 1;
+----
+99
+
+query s2
+SELECT v FROM t WHERE id = 1;
+----
+99
+
+# A third session commits a change; neither open snapshot moves.
+statement ok s3
+UPDATE t SET v = 7 WHERE id = 1;
+
+query s1
+SELECT v FROM t WHERE id = 1;
+----
+99
+
+query s2
+SELECT v FROM t WHERE id = 1;
+----
+99
+
+statement ok s1
+COMMIT;
+
+statement ok s2
+COMMIT;
+
+query
+SELECT v FROM t WHERE id = 1;
+----
+7

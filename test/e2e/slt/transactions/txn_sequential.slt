@@ -1,0 +1,224 @@
+# Chains of transactions in one session: each transaction's snapshot must include everything
+# committed before its BEGIN, rollback-then-redo must work on the same rows and primary keys, one
+# ROLLBACK must undo writes to several tables atomically, and reads through real operators (JOIN,
+# GROUP BY, ORDER BY, DISTINCT) must see the transaction's own uncommitted writes.
+
+statement ok
+CREATE TABLE acc(id INT PRIMARY KEY, owner VARCHAR(20), bal INT);
+
+# --- Transactions building on each other, interleaved with autocommit statements -------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO acc VALUES (1, 'alice', 100);
+
+statement ok
+COMMIT;
+
+# Autocommitted statement between the two transactions.
+statement ok
+INSERT INTO acc VALUES (2, 'bob', 200);
+
+statement ok
+BEGIN;
+
+# The second transaction's snapshot sees both the committed txn's row and the autocommitted row.
+query rowsort
+SELECT id, owner, bal FROM acc;
+----
+1 'alice' 100
+2 'bob' 200
+
+statement ok
+UPDATE acc SET bal = bal + 50 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query
+SELECT bal FROM acc WHERE id = 1;
+----
+150
+
+# --- Rollback, then redo the SAME work and commit (same rows, same PKs) ----------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE acc SET bal = 0 WHERE id = 2;
+
+statement ok
+ROLLBACK;
+
+query
+SELECT bal FROM acc WHERE id = 2;
+----
+200
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE acc SET bal = 0 WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query
+SELECT bal FROM acc WHERE id = 2;
+----
+0
+
+# --- Delete + re-insert the same primary key within one transaction --------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM acc WHERE id = 2;
+
+statement ok
+INSERT INTO acc VALUES (2, 'bea', 500);
+
+query rowsort
+SELECT id, owner, bal FROM acc;
+----
+1 'alice' 150
+2 'bea' 500
+
+statement ok
+COMMIT;
+
+query
+SELECT owner, bal FROM acc WHERE id = 2;
+----
+'bea' 500
+
+# --- One ROLLBACK undoes writes to several tables atomically ---------------------------------------
+
+statement ok
+CREATE TABLE log(msg VARCHAR(40));
+
+statement ok
+CREATE TABLE audit(n INT);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE acc SET bal = 9999 WHERE id = 1;
+
+statement ok
+INSERT INTO log VALUES ('tampered');
+
+statement ok
+INSERT INTO audit VALUES (1);
+
+statement ok
+ROLLBACK;
+
+query
+SELECT bal FROM acc WHERE id = 1;
+----
+150
+
+query
+SELECT COUNT(*) FROM log;
+----
+0
+
+query
+SELECT COUNT(*) FROM audit;
+----
+0
+
+# --- Real operators read the transaction's own uncommitted writes ----------------------------------
+
+statement ok
+CREATE TABLE txlog(acct INT, amount INT);
+
+statement ok
+INSERT INTO txlog VALUES (1, 10), (1, 20), (2, 5);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO txlog VALUES (1, 70), (2, 5), (2, 40);
+
+# JOIN: uncommitted txlog rows join against committed acc rows.
+query rowsort
+SELECT acc.owner, txlog.amount FROM acc JOIN txlog ON acc.id = txlog.acct WHERE txlog.amount >= 40;
+----
+'alice' 70
+'bea' 40
+
+# GROUP BY + aggregates over the mix of committed and own-uncommitted rows.
+query rowsort
+SELECT acct, COUNT(*), SUM(amount) FROM txlog GROUP BY acct;
+----
+1 3 100
+2 3 50
+
+# DISTINCT sees the uncommitted duplicate (2, 5) as one value.
+query rowsort
+SELECT DISTINCT amount FROM txlog WHERE acct = 2;
+----
+40
+5
+
+# ORDER BY ... LIMIT (TopN) over uncommitted rows.
+query
+SELECT amount FROM txlog ORDER BY amount DESC LIMIT 2;
+----
+70
+40
+
+statement ok
+ROLLBACK;
+
+query
+SELECT COUNT(*), SUM(amount) FROM txlog;
+----
+3 35
+
+# --- An aborted transaction (execution error) does not poison the next one ------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO acc VALUES (3, 'carol', 300);
+
+# Duplicate primary key: an EXECUTION failure, so the whole transaction aborts (carol's row too).
+statement error
+INSERT INTO acc VALUES (1, 'dup', 0);
+
+statement error
+COMMIT;
+
+query rowsort
+SELECT id FROM acc;
+----
+1
+2
+
+# A fresh transaction on the same table works normally afterwards.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO acc VALUES (3, 'carol', 300);
+
+statement ok
+COMMIT;
+
+query rowsort
+SELECT id, owner FROM acc;
+----
+1 'alice'
+2 'bea'
+3 'carol'

@@ -38,7 +38,8 @@ namespace bumblebee {
  */
 class Database {
  public:
-  explicit Database(const std::filesystem::path &db_file, size_t num_frames = BUFFER_POOL_SIZE);
+  explicit Database(const std::filesystem::path &db_file, size_t num_frames = BUFFER_POOL_SIZE,
+                    duration_t txn_timeout = DEFAULT_TXN_TIMEOUT);
   ~Database();
 
   DISALLOW_COPY_AND_MOVE(Database);

@@ -1,0 +1,125 @@
+# Transactions over more data than one vector (STANDARD_VECTOR_SIZE = 1024 rows on the normal build):
+# a three-way cross join over a 16-row seed table inserts 16^3 = 4096 rows in one statement, so
+# rollback/commit and own-write visibility are exercised across many chunks (and across MANY more on
+# the small-vector build, where a chunk holds 4 rows). Aggregates verify the net effect instead of
+# listing thousands of rows.
+#
+# (Self-referencing `INSERT INTO t SELECT ... FROM t` also works — statement-snapshot semantics,
+# pinned in dml/insert_select_self.slt; the separate seed table here just makes the arithmetic
+# of the expected aggregates obvious.)
+
+statement ok
+CREATE TABLE seed(v INT);
+
+statement ok
+INSERT INTO seed VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11), (12), (13), (14), (15), (16);
+
+statement ok
+CREATE TABLE t(v INT);
+
+# --- ROLLBACK of a large multi-chunk insert --------------------------------------------------------
+
+statement ok
+BEGIN;
+
+# 16^3 = 4096 rows: each seed value appears 16*16 = 256 times, so SUM = 136 * 256 = 34816.
+query
+INSERT INTO t SELECT a.v FROM seed a, seed b, seed c;
+----
+4096
+
+# The transaction sees all of its own uncommitted rows, across every chunk.
+query
+SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM t;
+----
+4096 34816 1 16
+
+statement ok
+ROLLBACK;
+
+query
+SELECT COUNT(*) FROM t;
+----
+0
+
+# --- COMMIT of the same multi-chunk insert ---------------------------------------------------------
+
+statement ok
+BEGIN;
+
+query
+INSERT INTO t SELECT a.v FROM seed a, seed b, seed c;
+----
+4096
+
+statement ok
+COMMIT;
+
+query
+SELECT COUNT(*), SUM(v), MIN(v), MAX(v) FROM t;
+----
+4096 34816 1 16
+
+# --- A large UPDATE (half the table) rolled back restores every row --------------------------------
+# 2048 rows have v <= 8 (their sum is 36 * 256 = 9216); adding 100 to each raises the total by 204800.
+
+statement ok
+BEGIN;
+
+query
+UPDATE t SET v = v + 100 WHERE v <= 8;
+----
+2048
+
+query
+SELECT COUNT(*), SUM(v) FROM t;
+----
+4096 239616
+
+statement ok
+ROLLBACK;
+
+query
+SELECT COUNT(*), SUM(v) FROM t;
+----
+4096 34816
+
+# --- A large DELETE (3/4 of the table) rolled back, then committed ---------------------------------
+# v > 4 covers 12 values * 256 = 3072 rows; the 1024 survivors (v in 1..4) sum to 10 * 256 = 2560.
+
+statement ok
+BEGIN;
+
+query
+DELETE FROM t WHERE v > 4;
+----
+3072
+
+query
+SELECT COUNT(*), SUM(v) FROM t;
+----
+1024 2560
+
+statement ok
+ROLLBACK;
+
+query
+SELECT COUNT(*), SUM(v) FROM t;
+----
+4096 34816
+
+statement ok
+BEGIN;
+
+query
+DELETE FROM t WHERE v > 4;
+----
+3072
+
+statement ok
+COMMIT;
+
+query
+SELECT COUNT(*), SUM(v) FROM t;
+----
+1024 2560

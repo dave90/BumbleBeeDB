@@ -16,6 +16,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "catalog/catalog.h"
@@ -164,15 +165,20 @@ class StringVectorWriter : public ResultWriter {
  */
 class BumbleBeeInstance {
  public:
-  /** @brief An in-memory instance: no buffer pool, no disk, no persistence. */
-  BumbleBeeInstance();
+  /**
+   * @brief An in-memory instance: no buffer pool, no disk, no persistence.
+   * @param txn_timeout How long a transaction may stay open before `\gc` aborts it (tests lower it).
+   */
+  explicit BumbleBeeInstance(duration_t txn_timeout = DEFAULT_TXN_TIMEOUT);
 
   /**
    * @brief A durable instance backed by `db_file`: owns a `Database` and takes its catalog from there.
-   * @param db_file    The database file to open (created if absent).
-   * @param num_frames Buffer-pool size in frames (defaults to the standard pool size).
+   * @param db_file     The database file to open (created if absent).
+   * @param num_frames  Buffer-pool size in frames (defaults to the standard pool size).
+   * @param txn_timeout How long a transaction may stay open before `\gc` aborts it (tests lower it).
    */
-  explicit BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames = BUFFER_POOL_SIZE);
+  explicit BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames = BUFFER_POOL_SIZE,
+                             duration_t txn_timeout = DEFAULT_TXN_TIMEOUT);
 
   ~BumbleBeeInstance();
 
@@ -222,14 +228,27 @@ class BumbleBeeInstance {
   void CmdDescribeTable(const std::string &table_name, ResultWriter &writer);
   void CmdDisplayHelp(ResultWriter &writer);
   void CmdClear(ResultWriter &writer);
+  void CmdGarbageCollect(ResultWriter &writer);
   void WriteOneCell(const std::string &cell, ResultWriter &writer);
 
   /**
-   * The explicit transaction opened by BEGIN, or null when statements autocommit. While set, every DML /
-   * SELECT statement runs inside it (seeing its own uncommitted writes) until COMMIT or ROLLBACK; a
-   * statement that errors aborts and clears it. Non-owning — the transaction manager owns the object.
+   * The current session's explicit transaction (opened by BEGIN), or null when its statements
+   * autocommit. While set, every DML / SELECT statement runs inside it (seeing its own uncommitted
+   * writes) until COMMIT or ROLLBACK; a statement that errors aborts and clears it. Non-owning — the
+   * transaction manager owns the object.
    */
-  Transaction *active_txn_{nullptr};
+  auto ActiveTxn() -> Transaction *& { return session_txns_[current_session_]; }
+
+  /**
+   * Per-session explicit-transaction state. The shell is single-threaded, but `\session <name>`
+   * switches which named session subsequent statements run in — each session can hold its own open
+   * transaction, which is what makes deterministic concurrent-transaction tests (MVCC visibility,
+   * write-write conflicts) possible through one shell process. Statements still execute one at a
+   * time; only the transaction they join differs.
+   */
+  std::unordered_map<std::string, Transaction *> session_txns_;
+  /** The session subsequent statements run in; `\session <name>` switches it (created on first use). */
+  std::string current_session_{"default"};
 
   /** Durable backing (disk + BPM + catalog + txn manager); null for an in-memory instance. */
   std::unique_ptr<Database> db_;

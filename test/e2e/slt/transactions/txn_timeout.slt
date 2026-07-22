@@ -1,0 +1,121 @@
+# Transaction timeout: a transaction open longer than `txn_timeout` (milliseconds, set per-file via
+# `# config:` — runtime-configurable, no special build needed) is aborted by the next `\gc` pass,
+# and its writes are rolled back. Enforcement is deliberately GC-driven (nothing runs GC in the
+# background), so the test is deterministic: sleep past the timeout, then trigger `\gc` explicitly.
+# config: txn_timeout=100
+
+statement ok
+CREATE TABLE t(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10);
+
+# --- A transaction that outlives the timeout is aborted by \gc; its writes vanish ------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (2, 20);
+
+statement ok
+UPDATE t SET v = 99 WHERE id = 1;
+
+sleep 300
+
+# The timeout (100ms) has passed: this GC pass aborts the transaction and reports it.
+query
+\gc
+----
+GC: aborted 1 timed-out transaction(s)
+
+# The session dropped back to autocommit — the transaction is gone, so COMMIT has nothing to commit.
+statement error
+COMMIT;
+
+# Both the INSERT and the UPDATE were rolled back; the pre-transaction state is intact.
+query rowsort
+SELECT id, v FROM t;
+----
+1 10
+
+# --- After a timeout abort, the same session works normally again ----------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (2, 20);
+
+statement ok
+COMMIT;
+
+query rowsort
+SELECT id, v FROM t;
+----
+1 10
+2 20
+
+# --- A transaction that commits within the timeout is unaffected by \gc ----------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE t SET v = 11 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query
+\gc
+----
+GC: aborted 0 timed-out transaction(s)
+
+query rowsort
+SELECT id, v FROM t;
+----
+1 11
+2 20
+
+# --- Only the expired transaction is reaped: a younger concurrent one survives ---------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s1
+UPDATE t SET v = 1000 WHERE id = 1;
+
+sleep 300
+
+# s2's transaction starts AFTER the sleep, so only s1's has outlived the 100ms timeout.
+statement ok s2
+BEGIN;
+
+statement ok s2
+UPDATE t SET v = 2000 WHERE id = 2;
+
+query s2
+\gc
+----
+GC: aborted 1 timed-out transaction(s)
+
+# s1's transaction is gone (write rolled back)...
+statement error s1
+COMMIT;
+
+# ...while s2's survived the pass intact, its write still pending and committable.
+query s2
+SELECT id, v FROM t;
+----
+1 11
+2 2000
+
+statement ok s2
+COMMIT;
+
+query rowsort
+SELECT id, v FROM t;
+----
+1 11
+2 2000

@@ -15,6 +15,12 @@ SQLite/bustub sqllogictest format:
     1
     2
 
+    sleep 300               # real pause in ms (transaction-timeout tests)
+
+A ``statement`` / ``query`` directive may carry a *connection label* (``statement ok s1``,
+``query rowsort s2``): the record then runs in that named shell session (``\session`` is emitted
+on change), letting several sessions hold concurrent open transactions deterministically.
+
 Lines beginning with ``#`` are comments. A few ``#`` comments are also *directives*
 that configure the whole file (they may appear anywhere, but conventionally sit in a
 header block):
@@ -32,6 +38,7 @@ delimit a record's output with an ``\\echo`` sentinel.
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,12 +50,14 @@ NULL_TOKEN = "NULL"
 # `# config:` keys that map to a BumbleBee CLI flag. Only knobs with an OBSERVABLE effect through the
 # in-memory shell are exposed, so a `.slt` cannot set something that silently does nothing. Unknown keys
 # are a hard error (typo protection). Deliberately omitted: `morsel_size` (no consumer until the columnar
-# scan lands), `frames` (the harness always runs in-memory, which ignores it), and `txn_limit` (an active-
-# transaction cap is unobservable while every statement autocommits — it lands with explicit transactions).
+# scan lands) and `frames` (the harness always runs in-memory, which ignores it).
 _CONFIG_FLAGS = {
     "max_memory": "--max-memory",
     "morsel_pages": "--morsel-pages",
     "threads": "--threads",
+    # Transaction timeout in MILLISECONDS, enforced when a record runs `\gc`. Runtime-configurable
+    # (unlike the compile-time vector size), so a timeout test needs no dedicated build.
+    "txn_timeout": "--txn-timeout",
 }
 # Boolean config keys map to a bare flag when truthy.
 _CONFIG_BOOL_FLAGS = {
@@ -64,12 +73,18 @@ class SltError(Exception):
 class Record:
     """One executable `.slt` record."""
 
-    kind: str  # "statement" or "query"
+    kind: str  # "statement", "query" or "sleep"
     sql: str
     line: int  # 1-based line where the record's directive appears (for error messages)
     expect_error: bool = False  # statement error
     sort: bool = False  # query rowsort
     expected: list[str] = field(default_factory=list)  # query expected rows
+    # Which named shell session the record runs in (sqllogictest connection label: the optional
+    # last token of `statement ok s1` / `query rowsort s2`). The runner emits `\session <name>`
+    # when this differs from the previous record's session, so several sessions — each with its
+    # own open transaction — can be interleaved deterministically within one file.
+    session: str = "default"
+    sleep_ms: int = 0  # kind == "sleep": how long to pause before the next record
 
 
 @dataclass
@@ -134,21 +149,33 @@ def parse_slt(path: Path) -> SltFile:
         if head == "halt":
             break
         if head == "sleep":
-            i += 1  # accepted for grammar compatibility; a no-op for deterministic tests
+            # `sleep <ms>`: a real pause, in milliseconds — used by the transaction-timeout tests to
+            # outlive a `# config: txn_timeout=<ms>` before triggering `\gc`.
+            if len(tokens) != 2 or not tokens[1].isdigit():
+                raise SltError(f"line {i + 1}: 'sleep' wants a duration in ms: sleep 300")
+            result.records.append(Record(kind="sleep", sql="", line=i + 1, sleep_ms=int(tokens[1])))
+            i += 1
             continue
 
         if head == "statement":
             if len(tokens) < 2 or tokens[1] not in ("ok", "error"):
                 raise SltError(f"line {i + 1}: 'statement' must be 'ok' or 'error'")
             expect_error = tokens[1] == "error"
+            session = tokens[2] if len(tokens) > 2 else "default"
             sql_lines, i = _consume_sql(lines, i + 1)
             result.records.append(
-                Record(kind="statement", sql="\n".join(sql_lines), line=i, expect_error=expect_error)
+                Record(kind="statement", sql="\n".join(sql_lines), line=i, expect_error=expect_error,
+                       session=session)
             )
             continue
 
         if head == "query":
             sort = "rowsort" in tokens[1:]
+            # Any modifier token that is not `rowsort` is a connection label (sqllogictest style).
+            labels = [t for t in tokens[1:] if t != "rowsort"]
+            if len(labels) > 1:
+                raise SltError(f"line {i + 1}: at most one connection label per query record")
+            session = labels[0] if labels else "default"
             directive_line = i + 1
             sql_lines: list[str] = []
             i += 1
@@ -170,6 +197,7 @@ def parse_slt(path: Path) -> SltFile:
                     line=directive_line,
                     sort=sort,
                     expected=[e for e in expected if e.strip() != ""],
+                    session=session,
                 )
             )
             continue
@@ -206,6 +234,9 @@ class BumbleBeeSession:
             bufsize=1,  # line-buffered
         )
         self._token = 0
+        # The shell starts in session "default"; a record with a different connection label makes
+        # run_record emit a `\session` switch (which produces no output) before its SQL.
+        self._session = "default"
         # Sync past any startup output before the first record.
         self._exec("\\echo __READY__", token_only=True)
 
@@ -239,8 +270,14 @@ class BumbleBeeSession:
     def run_record(self, record: Record) -> tuple[bool, str, list[str]]:
         """Execute one record; return (succeeded, error_message, result_rows)."""
         sql = record.sql.strip()
-        if not sql.endswith(";"):
+        # Meta-commands (`\gc`, ...) are single whole-line statements: no terminating semicolon.
+        if not sql.endswith(";") and not sql.startswith("\\"):
             sql += ";"
+        # Switch the shell to the record's session first, when it differs. `\session` is silent, so
+        # it contributes only an "ok" status line, never output rows.
+        if record.session != self._session:
+            sql = f"\\session {record.session}\n" + sql
+            self._session = record.session
         status, output = self._exec(sql)
         errored = any(s.startswith("err") for s in status)
         err_msg = next((s[len("err"):].strip() for s in status if s.startswith("err")), "")
@@ -286,6 +323,9 @@ def run_slt_file(path: Path, binary: str, is_small_vector_build: bool) -> None:
     session = BumbleBeeSession(binary, slt.cli_flags(), slt.seed_mock)
     try:
         for record in slt.records:
+            if record.kind == "sleep":
+                time.sleep(record.sleep_ms / 1000.0)
+                continue
             ok, err_msg, rows = session.run_record(record)
             loc = f"{path.name}:{record.line}"
             if record.kind == "statement":

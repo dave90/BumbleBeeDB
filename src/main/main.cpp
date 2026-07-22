@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <cerrno>
+#include <chrono>  // NOLINT
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -87,6 +88,9 @@ auto main(int argc, char **argv) -> int {
   bumblebee::idx_t morsel_pages = bumblebee::MORSEL_PAGES;
   bumblebee::idx_t morsel_size = bumblebee::MORSEL_SIZE;
   size_t num_frames = bumblebee::BUFFER_POOL_SIZE;
+  // How long a transaction may stay open before `\gc` aborts it. Runtime-configurable (unlike the
+  // compile-time STANDARD_VECTOR_SIZE) so tests can shrink it to milliseconds via `--txn-timeout`.
+  bumblebee::duration_t txn_timeout = bumblebee::DEFAULT_TXN_TIMEOUT;
   // How many result rows the interactive shell prints before truncating; 0 shows all. Keeps a giant
   // SELECT from flooding the terminal.
   bumblebee::idx_t max_rows = 100;
@@ -111,13 +115,15 @@ auto main(int argc, char **argv) -> int {
       morsel_size = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
     } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
       num_frames = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+    } else if (std::strcmp(argv[i], "--txn-timeout") == 0 && i + 1 < argc) {
+      txn_timeout = std::chrono::milliseconds(std::strtoull(argv[++i], nullptr, 10));
     } else if (std::strcmp(argv[i], "--max-rows") == 0 && i + 1 < argc) {
       max_rows = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
     }
   }
 
-  auto instance = in_memory ? std::make_unique<bumblebee::BumbleBeeInstance>()
-                            : std::make_unique<bumblebee::BumbleBeeInstance>(db_path, num_frames);
+  auto instance = in_memory ? std::make_unique<bumblebee::BumbleBeeInstance>(txn_timeout)
+                            : std::make_unique<bumblebee::BumbleBeeInstance>(db_path, num_frames, txn_timeout);
   instance->prefer_external_ = prefer_external;
   instance->max_memory_ = max_memory;
   instance->max_threads_ = max_threads;

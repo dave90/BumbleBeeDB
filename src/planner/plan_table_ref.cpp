@@ -138,14 +138,33 @@ auto Planner::PlanExpressionListRef(const BoundExpressionListRef &table_ref) -> 
     all_exprs.emplace_back(std::move(row_exprs));
   }
 
-  // The rows are all the same width, so the first one gives the schema.
-  const auto &first_row = all_exprs[0];
+  // The rows are all the same width. A column's type is the common supertype across ALL rows (not
+  // just the first): an untyped NULL (UNKNOWN) yields to any typed cell — so (NULL),(20) infers
+  // INTEGER — and mixed numeric widths widen. An all-NULL column stays UNKNOWN and is resolved by
+  // the cast its consumer (e.g. PlanInsert, against the target column) puts on top.
+  const idx_t width = all_exprs[0].size();
   std::vector<Column> cols;
-  cols.reserve(first_row.size());
-  size_t idx = 0;
-  for (const auto &col : first_row) {
-    cols.emplace_back(col->GetReturnType().WithColumnName(fmt::format("{}.{}", table_ref.identifier_, idx)));
-    idx++;
+  cols.reserve(width);
+  for (idx_t idx = 0; idx < width; idx++) {
+    LogicalType common = all_exprs[0][idx]->GetReturnType().GetType();
+    for (idx_t r = 1; r < all_exprs.size(); r++) {
+      common = LogicalType::CommonType(common, all_exprs[r][idx]->GetReturnType().GetType());
+    }
+    // Take the Column of the first row already AT the common type — it carries the extra metadata a
+    // variable-length type needs (a VARCHAR's length). Only when no row matches exactly (a widened
+    // numeric, or an all-NULL column) is the bare fixed-size constructor safe to use.
+    const auto name = fmt::format("{}.{}", table_ref.identifier_, idx);
+    bool found = false;
+    for (const auto &row : all_exprs) {
+      if (row[idx]->GetReturnType().GetType() == common) {
+        cols.emplace_back(row[idx]->GetReturnType().WithColumnName(name));
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      cols.emplace_back(Column{name, common});
+    }
   }
 
   return std::make_shared<ValuesPlanNode>(std::make_shared<Schema>(cols), std::move(all_exprs));

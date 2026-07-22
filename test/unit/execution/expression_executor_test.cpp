@@ -21,6 +21,7 @@
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/comparison_expression.h"
 #include "execution/expressions/constant_value_expression.h"
+#include "execution/expressions/is_null_expression.h"
 #include "execution/expressions/logic_expression.h"
 #include "gtest/gtest.h"
 #include "type/logical_type.h"
@@ -142,6 +143,45 @@ TEST(ExpressionExecutorTest, CastToSameTypeIsIdentity) {
 
   EXPECT_EQ(out.GetValue(0).GetAs<int>(), 5);
   EXPECT_EQ(out.GetValue(2).GetAs<int>(), 7);
+}
+
+TEST(ExpressionExecutorTest, IsNullReadsValidityNotValues) {
+  // Rows 1 and 3 are NULL. IS NULL selects exactly those; IS NOT NULL the complement.
+  auto chunk = MakeChunk({5, 0, 7, 0}, {0, 0, 0, 0});
+  chunk.SetValue(0, 1, Value::Null(kInt));
+  chunk.SetValue(0, 3, Value::Null(kInt));
+
+  auto is_null = std::make_shared<IsNullExpression>(Col(0), /*negated=*/false);
+  ExpressionExecutor exec(*is_null);
+  SelectionVector sel(chunk.GetSize());
+  ASSERT_EQ(exec.Select(chunk, sel), 2U);
+  EXPECT_EQ(sel.GetIndex(0), 1U);
+  EXPECT_EQ(sel.GetIndex(1), 3U);
+
+  auto is_not_null = std::make_shared<IsNullExpression>(Col(0), /*negated=*/true);
+  ExpressionExecutor exec_not(*is_not_null);
+  SelectionVector not_sel(chunk.GetSize());
+  ASSERT_EQ(exec_not.Select(chunk, not_sel), 2U);
+  EXPECT_EQ(not_sel.GetIndex(0), 0U);
+  EXPECT_EQ(not_sel.GetIndex(1), 2U);
+}
+
+TEST(ExpressionExecutorTest, CastFromUnknownIsNullBroadcast) {
+  // The untyped NULL literal (UNKNOWN) casts to any type as a NULL of that type — this is what
+  // lets `INSERT ... VALUES (NULL)` / `SET col = NULL` target VARCHAR/BIGINT/DOUBLE columns.
+  auto chunk = MakeChunk({1, 2, 3}, {0, 0, 0});
+  auto null_const = std::make_shared<ConstantValueExpression>(Value::Null());
+  ASSERT_EQ(null_const->GetReturnType().GetType().GetTypeId(), LogicalTypeId::UNKNOWN);
+
+  for (const auto target : {LogicalTypeId::STRING, LogicalTypeId::BIGINT, LogicalTypeId::DOUBLE}) {
+    auto cast = std::make_shared<CastExpression>(null_const, LogicalType(target));
+    ExpressionExecutor exec(*cast);
+    Vector out{LogicalType(target)};
+    exec.ExecuteExpression(chunk, out);
+    for (idx_t i = 0; i < chunk.GetSize(); i++) {
+      EXPECT_TRUE(out.GetValue(i).IsNull());
+    }
+  }
 }
 
 }  // namespace bumblebee

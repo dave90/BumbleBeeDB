@@ -29,6 +29,7 @@
 #include "execution/expressions/abstract_expression.h"
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/constant_value_expression.h"
+#include "execution/expressions/is_null_expression.h"
 #include "execution/plans/abstract_plan.h"
 #include "fmt/format.h"
 #include "planner/planner.h"
@@ -169,6 +170,16 @@ auto Planner::PlanExpression(const BoundExpression &expr, const std::vector<Abst
       const auto &alias_expr = dynamic_cast<const BoundAlias &>(expr);
       auto [_, child_expr] = PlanExpression(*alias_expr.child_, children);
       return std::make_tuple(alias_expr.alias_, std::move(child_expr));
+    }
+    case ExpressionType::UNARY_OP: {
+      const auto &unary_expr = dynamic_cast<const BoundUnaryOp &>(expr);
+      auto [_, arg] = PlanExpression(*unary_expr.arg_, children);
+      if (unary_expr.op_name_ == "is_null" || unary_expr.op_name_ == "is_not_null") {
+        return std::make_tuple(
+            UNNAMED_COLUMN,
+            std::make_shared<IsNullExpression>(std::move(arg), unary_expr.op_name_ == "is_not_null"));
+      }
+      throw PlannerException(fmt::format("the unary operator {} cannot be planned", unary_expr.op_name_));
     }
     default:
       break;

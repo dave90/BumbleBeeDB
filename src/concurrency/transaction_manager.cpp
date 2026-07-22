@@ -213,7 +213,8 @@ void TransactionManager::AbortAllRunning() {
   }
 }
 
-void TransactionManager::GarbageCollection() {
+auto TransactionManager::GarbageCollection() -> GcStats {
+  GcStats stats;
   // TODO(item 4): prune stale entries from version_info_. Reclaiming a committed txn below drops its
   // undo logs (the bulk of the memory), but the per-slot head UndoLinks it left in version_info_ are
   // not removed here. They are harmless — GetUndoLogOptional returns nullopt for a collected txn, so
@@ -252,6 +253,7 @@ void TransactionManager::GarbageCollection() {
     auto state = txn->state_.load();
     if (state == TransactionState::RUNNING || state == TransactionState::TAINTED) {
       Abort(txn.get());
+      stats.timed_out_++;
     }
   }
 
@@ -272,10 +274,12 @@ void TransactionManager::GarbageCollection() {
     }
     if (collectible) {
       it = txn_map_.erase(it);
+      stats.reclaimed_++;
     } else {
       ++it;
     }
   }
+  return stats;
 }
 
 auto TransactionManager::VerifyTxn(Transaction *txn) -> bool {

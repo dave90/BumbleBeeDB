@@ -46,11 +46,40 @@ SELECT a FROM t;
 ----
 2
 1
+
+sleep 300               # pause for 300 ms (used by the transaction-timeout tests)
 ```
 
-- Result columns are space-separated; `NULL` renders literally as `NULL`.
+- Result columns are space-separated; `NULL` renders literally as `NULL`; strings render quoted
+  (`'alice'`).
 - `DELETE` / `UPDATE` / `INSERT` used as a `query` compare against the affected-row count.
 - Use `rowsort` whenever the operator (hash aggregate / hash join) does not guarantee row order.
+- A record's SQL may also be a shell meta-command (e.g. `query` + `\gc`).
+
+### Connection labels (concurrent transactions)
+
+A `statement` / `query` directive may carry a connection label — an extra token naming a shell
+session (`default` when omitted):
+
+```
+statement ok s1
+BEGIN;
+
+statement ok s1
+INSERT INTO t VALUES (1);
+
+# s2 must not see s1's uncommitted row
+query s2
+SELECT COUNT(*) FROM t;
+----
+0
+```
+
+The runner emits `\session <label>` (silent) whenever the label changes, so each session holds its
+own open transaction inside the single shell process. Statements still execute one at a time —
+interleavings are fully deterministic; the concurrency semantics (snapshot visibility,
+first-committer-wins conflicts) come from MVCC. True thread-level races belong in the TSan unit
+tests, not here.
 
 ## Directives (`#` comments)
 
@@ -69,10 +98,10 @@ with an observable effect are accepted; an unknown key fails the test loudly (ty
 | `max_memory` | per-query memory budget (bytes) before an out-of-core operator spills |
 | `threads` | worker-thread cap for the query |
 | `prefer_external` | `true` forces the out-of-core join/sort variants |
+| `txn_timeout` | transaction timeout in **milliseconds**, enforced when a record runs `\gc` — runtime-configurable (unlike the compile-time vector size), so timeout tests need no dedicated build |
 
 Deliberately not exposed yet (they would be silent no-ops): `morsel_size` (no consumer until the columnar
-scan lands), `frames` (the in-memory backend ignores it), and `txn_limit` (an active-transaction cap is
-unobservable while every statement autocommits — it arrives with explicit `BEGIN`/`COMMIT`).
+scan lands) and `frames` (the in-memory backend ignores it).
 
 ## Lowering engine sizes for multi-chunk coverage
 

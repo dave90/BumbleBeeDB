@@ -37,8 +37,10 @@ class PhysicalInsert : public PhysicalOperator {
   // ---- sink role (consume the rows to insert) --------------------------------
   auto IsSink() const -> bool override { return true; }
   auto GetGlobalSinkState(ClientContext &context) const -> std::unique_ptr<GlobalSinkState> override;
+  auto GetLocalSinkState(ExecutionContext &context) const -> std::unique_ptr<LocalSinkState> override;
   auto Sink(ExecutionContext &context, DataChunk &input, GlobalSinkState &gstate, LocalSinkState &lstate) const
       -> SinkResultType override;
+  void Combine(ExecutionContext &context, GlobalSinkState &gstate, LocalSinkState &lstate) const override;
 
   // ---- source role (emit the affected-row count) -----------------------------
   auto IsSource() const -> bool override { return true; }

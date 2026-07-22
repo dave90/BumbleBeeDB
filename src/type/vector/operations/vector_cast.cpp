@@ -346,6 +346,13 @@ void VectorOperations::Cast(Vector &source, Vector &target, idx_t source_count) 
 auto VectorOperations::TryCast(Vector &source, Vector &target, idx_t source_count, std::string *error_message) -> bool {
   BUMBLEBEE_ASSERT(source.GetLogicalType() != target.GetLogicalType(), "TryCast: the types are already the same");
 
+  // UNKNOWN is the untyped NULL literal: its vectors carry only NULLs, so casting to any type is a
+  // constant NULL broadcast of the target (Reference keeps the target's own type for a null value).
+  if (source.GetLogicalTypeId() == LogicalTypeId::UNKNOWN) {
+    target.Reference(Value::Null(target.GetLogicalType()));
+    return true;
+  }
+
   switch (source.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       return NumericCastSwitch<int8_t>(source, target, source_count, error_message);

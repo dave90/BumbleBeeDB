@@ -50,6 +50,13 @@ using steady_clock_t = std::chrono::steady_clock;
 using time_point_t = steady_clock_t::time_point;
 using duration_t = steady_clock_t::duration;
 
+/**
+ * How long a transaction may stay open before `TransactionManager::GarbageCollection()` aborts it.
+ * Enforcement happens only when GC runs (the shell's `\gc`, or whoever schedules GC); the shell's
+ * `--txn-timeout <ms>` overrides this for tests.
+ */
+static constexpr duration_t DEFAULT_TXN_TIMEOUT = std::chrono::hours(2);
+
 /** Identifier of a transaction. */
 using txn_id_t = int64_t;
 /** Sentinel for "no transaction". */

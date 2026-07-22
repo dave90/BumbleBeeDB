@@ -1,5 +1,12 @@
 # Plan: expanded e2e transaction tests
 
+> **Status: IMPLEMENTED** (all three phases + docs). Full matrix green: 672 unit tests, e2e on the
+> normal and small-vector builds, concurrency suite under TSan. The engine bugs found along the way
+> were subsequently FIXED: self-referencing INSERT...SELECT (Halloween problem — insert sink now
+> defers writes to Combine like Update/Delete), untyped NULL literals (UNKNOWN type, casts as a NULL
+> broadcast) + IS [NOT] NULL, and int64-range integer literals. Pinned in
+> dml/insert_select_self.slt and scan_filter/null_predicates.slt.
+
 Current coverage: `test/e2e/slt/transactions/` has two files — `commit_rollback.slt` (basic
 BEGIN/COMMIT/ROLLBACK, own-write visibility for INSERT/UPDATE/DELETE, START TRANSACTION) and
 `transaction_errors.slt` (stray COMMIT/ROLLBACK, nested BEGIN, statement failure aborting the txn,

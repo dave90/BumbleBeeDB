@@ -23,6 +23,7 @@
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/comparison_expression.h"
 #include "execution/expressions/constant_value_expression.h"
+#include "execution/expressions/is_null_expression.h"
 #include "execution/expressions/logic_expression.h"
 #include "execution/expressions/string_expression.h"
 #include "type/value.h"
@@ -194,6 +195,22 @@ auto ExpressionExecutor::Evaluate(const AbstractExpression &expr, DataChunk &inp
   if (const auto *cast = dynamic_cast<const CastExpression *>(&expr)) {
     Vector child = Evaluate(*cast->children_[0], input, count);
     return CastIfNeeded(std::move(child), cast->GetReturnType().GetType(), count);
+  }
+
+  // IS [NOT] NULL: a boolean read straight off the child's validity mask — the one predicate that
+  // can select NULL rows (a comparison against NULL yields NULL and matches nothing).
+  if (const auto *is_null = dynamic_cast<const IsNullExpression *>(&expr)) {
+    Vector child = Evaluate(*is_null->children_[0], input, count);
+    VectorData vdata;
+    child.Orrify(count, vdata);
+    Vector result{LogicalType(LogicalTypeId::BOOLEAN)};
+    auto *out = FlatVector::GetData<uint8_t>(result);
+    for (idx_t i = 0; i < count; i++) {
+      const auto row = vdata.sel_->GetIndex(i);
+      const bool row_is_null = !vdata.validity_->RowIsValid(row);
+      out[i] = static_cast<uint8_t>(row_is_null != is_null->negated_ ? 1 : 0);
+    }
+    return result;
   }
 
   // Comparison: evaluate both sides at a common type, produce a boolean (0/1) vector.

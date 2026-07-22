@@ -66,7 +66,13 @@ class PhysicalValues : public PhysicalOperator {
         ExpressionExecutor exec(*row[c]);
         Vector cell(output_schema_->GetColumn(c).GetType());
         exec.ExecuteExpression(dummy, cell);
-        output.SetValue(c, r, cell.GetValue(0));
+        // The column type is the common supertype across ALL rows, so this row's cell may be
+        // narrower (an INT literal in a BIGINT-inferred column) or an untyped NULL — cast the
+        // value up to the column type before writing it. A NULL needs no cast: SetValue only
+        // clears the validity bit.
+        auto v = cell.GetValue(0);
+        const auto &target_type = output_schema_->GetColumn(c).GetType();
+        output.SetValue(c, r, v.IsNull() || v.GetType() == target_type ? v : v.CastAs(target_type));
       }
     }
     output.SetCardinality(n);

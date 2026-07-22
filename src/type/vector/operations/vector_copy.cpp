@@ -153,6 +153,9 @@ void VectorOperations::Copy(const Vector &source, Vector &target, const Selectio
 
   switch (source.GetType()) {
     case PhysicalType::TINYINT:
+    // UNKNOWN (the untyped NULL literal) is an all-NULL vector over a 1-byte fill: copying its
+    // bytes like a TINYINT moves the fill, and the validity copy below carries the actual NULLs.
+    case PhysicalType::UNKNOWN:
       TemplatedCopyTargetSelSwitch<int8_t>(source, sel, target, target_sel, source_offset, target_offset, copy_count);
       break;
     case PhysicalType::SMALLINT:

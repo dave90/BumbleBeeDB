@@ -1,0 +1,200 @@
+# Transactions across data types: MVCC rollback/commit must restore or publish VARCHAR (including
+# heap-backed strings longer than the 11-byte inline threshold), BIGINT, DOUBLE, and NULL
+# transitions exactly. The interesting machinery is the undo path re-homing string payloads:
+# a rolled-back UPDATE must resurrect the *previous* string, not a dangling view.
+# (BIGINT-extreme literals are pinned in scan_filter/null_predicates.slt.)
+
+statement ok
+CREATE TABLE s(id INT PRIMARY KEY, name VARCHAR(64), big BIGINT, x DOUBLE);
+
+# --- ROLLBACK discards inserts of every type (long strings force StringHeap payloads) --------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO s VALUES (1, 'short', 2147483647, 1.5),
+                     (2, 'a-string-well-beyond-the-eleven-byte-inline-threshold', -2147483647, -2.5);
+
+query rowsort
+SELECT id, name, big, x FROM s;
+----
+1 'short' 2147483647 1.5
+2 'a-string-well-beyond-the-eleven-byte-inline-threshold' -2147483647 -2.5
+
+statement ok
+ROLLBACK;
+
+query
+SELECT COUNT(*) FROM s;
+----
+0
+
+# --- COMMIT publishes the same rows ----------------------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO s VALUES (1, 'short', 2147483647, 1.5),
+                     (2, 'a-string-well-beyond-the-eleven-byte-inline-threshold', -2147483647, -2.5);
+
+statement ok
+COMMIT;
+
+query rowsort
+SELECT id, name, big, x FROM s;
+----
+1 'short' 2147483647 1.5
+2 'a-string-well-beyond-the-eleven-byte-inline-threshold' -2147483647 -2.5
+
+# --- A rolled-back UPDATE restores the previous string, inline -> heap and heap -> inline ----------
+# Growing 'short' (inlined) to a long heap string and shrinking the long one to 'tiny' exercises both
+# directions of string re-homing in the version chain; ROLLBACK must bring back the originals.
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE s SET name = 'grown-way-past-the-inline-limit-of-eleven-bytes' WHERE id = 1;
+
+statement ok
+UPDATE s SET name = 'tiny' WHERE id = 2;
+
+query rowsort
+SELECT id, name FROM s;
+----
+1 'grown-way-past-the-inline-limit-of-eleven-bytes'
+2 'tiny'
+
+statement ok
+ROLLBACK;
+
+query rowsort
+SELECT id, name FROM s;
+----
+1 'short'
+2 'a-string-well-beyond-the-eleven-byte-inline-threshold'
+
+# --- A committed UPDATE publishes the new strings --------------------------------------------------
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE s SET name = 'grown-way-past-the-inline-limit-of-eleven-bytes' WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query
+SELECT name FROM s WHERE id = 1;
+----
+'grown-way-past-the-inline-limit-of-eleven-bytes'
+
+# --- A rolled-back DELETE resurrects rows with their string/BIGINT/DOUBLE payloads intact ----------
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM s;
+
+query
+SELECT COUNT(*) FROM s;
+----
+0
+
+statement ok
+ROLLBACK;
+
+query rowsort
+SELECT id, name, big, x FROM s;
+----
+1 'grown-way-past-the-inline-limit-of-eleven-bytes' 2147483647 1.5
+2 'a-string-well-beyond-the-eleven-byte-inline-threshold' -2147483647 -2.5
+
+# --- NULL transitions inside a transaction (INT column) --------------------------------------------
+# value -> NULL and NULL -> value, first rolled back (originals restored), then committed.
+
+statement ok
+CREATE TABLE n(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO n VALUES (1, 10), (2, NULL);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE n SET v = NULL WHERE id = 1;
+
+statement ok
+UPDATE n SET v = 20 WHERE id = 2;
+
+query rowsort
+SELECT id, v FROM n;
+----
+1 NULL
+2 20
+
+statement ok
+ROLLBACK;
+
+query rowsort
+SELECT id, v FROM n;
+----
+1 10
+2 NULL
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE n SET v = NULL WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query rowsort
+SELECT id, v FROM n;
+----
+1 NULL
+2 NULL
+
+# --- The untyped NULL literal assigns to a VARCHAR column, transactionally ------------------------
+# Nulling out a heap-backed string inside a transaction and rolling back must resurrect the string;
+# committing must publish the NULL.
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE s SET name = NULL WHERE id = 1;
+
+query
+SELECT id FROM s WHERE name IS NULL;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query
+SELECT name FROM s WHERE id = 1;
+----
+'grown-way-past-the-inline-limit-of-eleven-bytes'
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE s SET name = NULL WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query
+SELECT COUNT(*) FROM s WHERE name IS NULL;
+----
+1

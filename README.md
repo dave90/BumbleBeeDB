@@ -67,6 +67,18 @@ Command-line options:
 | `--db <path>` | Use `<path>` as the database file instead of `bb.db`. |
 | `--memory`, `-m` | Run a purely in-memory instance that persists nothing. |
 | `-c "<sql>"` | Run a single statement, print the result, and exit (scriptable). |
+| `--txn-timeout <ms>` | How long a transaction may stay open before `\gc` aborts it (default 2 hours). Runtime-configurable so tests can shrink it to milliseconds. |
+
+Useful meta-commands (`\help` lists them all):
+
+- `\session <name>` — switch to a named session (created on first use). Each
+  session can hold its own open transaction, so concurrent transactions can be
+  exercised from one shell: `BEGIN` in `s1`, switch to `s2`, and observe MVCC
+  snapshot isolation and write-write conflicts between them.
+- `\gc` — run transaction garbage collection: reclaims old row versions and
+  aborts any transaction open longer than the timeout. GC is the *only* timeout
+  driver today (nothing runs it in the background), which keeps timeout
+  behavior deterministic and testable.
 
 Examples:
 

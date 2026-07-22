@@ -50,13 +50,21 @@ struct PageVersionInfo {
  */
 class TransactionManager {
  public:
+  /** What one `GarbageCollection()` pass did: timeout aborts and reclaimed (destroyed) txn objects. */
+  struct GcStats {
+    /** RUNNING/TAINTED transactions older than the timeout that this pass aborted. */
+    size_t timed_out_{0};
+    /** Finished transactions removed from the txn map (their undo logs freed) by this pass. */
+    size_t reclaimed_{0};
+  };
+
   /**
    * @param catalog      Resolves table oids to heaps for commit-stamp / rollback (may be null in tests).
    * @param txn_timeout  How long a transaction may run before `GarbageCollection()` aborts it. The GC
    *                     pass is the timeout driver: whoever schedules GC every N minutes also enforces
    *                     this. Defaults to 2 hours.
    */
-  explicit TransactionManager(Catalog *catalog = nullptr, duration_t txn_timeout = std::chrono::hours(2))
+  explicit TransactionManager(Catalog *catalog = nullptr, duration_t txn_timeout = DEFAULT_TXN_TIMEOUT)
       : catalog_(catalog), txn_timeout_(txn_timeout) {}
 
   /** @brief Start a transaction; its read snapshot is the latest committed timestamp. */
@@ -83,8 +91,27 @@ class TransactionManager {
    *
    * This is the timeout driver: scheduling GC periodically (every N minutes) is what bounds a
    * transaction's lifetime — a timed-out txn is aborted here, then reclaimed in the same pass.
+   *
+   * @return What the pass did (timeout aborts, reclaimed txns) — the shell's `\gc` reports it.
    */
-  void GarbageCollection();
+  auto GarbageCollection() -> GcStats;
+
+  /**
+   * @brief Look up a transaction's state by id, without exposing the object itself.
+   *
+   * GC *destroys* reclaimed transactions, so a caller holding a raw `Transaction *` across a GC pass
+   * must not dereference it; this is the safe way to learn what became of a transaction. A collected
+   * txn returns nullopt — since RUNNING/TAINTED txns are never collected, nullopt after GC means the
+   * transaction finished (a timed-out one was aborted, then reclaimed).
+   */
+  auto GetTransactionState(txn_id_t txn_id) -> std::optional<TransactionState> {
+    std::shared_lock lock(txn_map_mutex_);
+    auto it = txn_map_.find(txn_id);
+    if (it == txn_map_.end()) {
+      return std::nullopt;
+    }
+    return it->second->GetTransactionState();
+  }
 
   /**
    * @brief Serializable commit-time backward validation.

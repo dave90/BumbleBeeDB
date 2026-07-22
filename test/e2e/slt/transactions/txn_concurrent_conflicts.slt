@@ -1,0 +1,153 @@
+# Write-write conflicts between concurrent transactions: first committer wins. A transaction that
+# tries to write a row already (re)written by a concurrently-committed transaction fails at the
+# write (ExecutionException), which aborts it wholesale — including its other, unconflicted writes.
+# Sessions (connection labels) hold the concurrent transactions; statements interleave
+# deterministically in one process.
+
+statement ok
+CREATE TABLE t(id INT PRIMARY KEY, v INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+
+# --- UPDATE vs UPDATE on the same row: the second writer loses -------------------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s2
+BEGIN;
+
+# s2 writes another row first, to prove the conflict rolls this back too.
+statement ok s2
+UPDATE t SET v = 222 WHERE id = 2;
+
+statement ok s1
+UPDATE t SET v = 100 WHERE id = 1;
+
+statement ok s1
+COMMIT;
+
+# s2 now touches the row s1 committed: write-write conflict, s2 is aborted on the spot.
+statement error s2
+UPDATE t SET v = 111 WHERE id = 1;
+
+# The transaction is already gone; COMMIT finds nothing to commit.
+statement error s2
+COMMIT;
+
+# s1's write survives; BOTH of s2's writes (the conflicting one and the id=2 one) are rolled back.
+query rowsort
+SELECT id, v FROM t;
+----
+1 100
+2 20
+3 30
+
+# --- DELETE vs UPDATE on the same row --------------------------------------------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s2
+BEGIN;
+
+statement ok s1
+DELETE FROM t WHERE id = 3;
+
+statement ok s1
+COMMIT;
+
+# s2's snapshot still sees id=3, but updating it hits the concurrently-committed delete.
+statement error s2
+UPDATE t SET v = 333 WHERE id = 3;
+
+statement error s2
+COMMIT;
+
+query rowsort
+SELECT id, v FROM t;
+----
+1 100
+2 20
+
+# --- DELETE vs DELETE on the same row --------------------------------------------------------------
+
+statement ok
+INSERT INTO t VALUES (3, 30);
+
+statement ok s1
+BEGIN;
+
+statement ok s2
+BEGIN;
+
+statement ok s2
+DELETE FROM t WHERE id = 3;
+
+statement ok s2
+COMMIT;
+
+statement error s1
+DELETE FROM t WHERE id = 3;
+
+statement error s1
+COMMIT;
+
+query rowsort
+SELECT id, v FROM t;
+----
+1 100
+2 20
+
+# --- Disjoint rows: two concurrent writers both commit (no false conflicts) ------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s2
+BEGIN;
+
+statement ok s1
+UPDATE t SET v = 1000 WHERE id = 1;
+
+statement ok s2
+UPDATE t SET v = 2000 WHERE id = 2;
+
+statement ok s1
+COMMIT;
+
+statement ok s2
+COMMIT;
+
+query rowsort
+SELECT id, v FROM t;
+----
+1 1000
+2 2000
+
+# --- Concurrent INSERTs of the same primary key: the first commit wins -----------------------------
+
+statement ok s1
+BEGIN;
+
+statement ok s2
+BEGIN;
+
+statement ok s1
+INSERT INTO t VALUES (7, 70);
+
+statement ok s1
+COMMIT;
+
+# s2 inserts the same PK; the uniqueness index rejects it and the transaction aborts.
+statement error s2
+INSERT INTO t VALUES (7, 77);
+
+statement error s2
+COMMIT;
+
+query
+SELECT v FROM t WHERE id = 7;
+----
+70

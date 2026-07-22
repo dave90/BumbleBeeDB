@@ -325,6 +325,9 @@ void Vector::Normalify(idx_t count) {
   data_ = data_mngr_->GetData();
   vtype_ = VectorType::FLAT_VECTOR;
   switch (type_.GetPhysicalType()) {
+    // UNKNOWN (the untyped NULL literal) strides over a 1-byte fill: flatten it like a TINYINT;
+    // the constant's null bit is replicated below, which is where the actual NULLs live.
+    case PhysicalType::UNKNOWN:
     case PhysicalType::TINYINT:
       TemplatedFlattenConstantVector<int8_t>(data_, old_data, count);
       break;
@@ -675,6 +678,8 @@ void Vector::SetValue(idx_t index, const Value &val) {
 void Vector::WriteNullFill(idx_t index) {
   // A defensive physical fill for a NULL slot. Never used to detect nullness.
   switch (type_.GetPhysicalType()) {
+    // UNKNOWN (the untyped NULL literal) strides over a 1-byte fill: same treatment as TINYINT.
+    case PhysicalType::UNKNOWN:
     case PhysicalType::TINYINT:
       reinterpret_cast<int8_t *>(data_)[index] = NullValue<int8_t>();
       break;

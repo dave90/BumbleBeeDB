@@ -67,12 +67,14 @@ auto IsNumericType(const LogicalType &t) -> bool {
 /**
  * @brief Whether a value of type `from` may be stored into a column of type `to`.
  *
- * Allowed: the same type, or a lossless numeric widening (INT -> BIGINT, INT -> DOUBLE, ...). Narrowing
- * and cross-family assignments need an explicit CAST and are rejected. `CommonType(from, to) == to` means
- * `to` is the wider supertype.
+ * Allowed: the same type, an untyped NULL (UNKNOWN — the cast is a NULL broadcast of the target, so
+ * it fits any column), or a lossless numeric widening (INT -> BIGINT, INT -> DOUBLE, ...). Narrowing
+ * and cross-family assignments need an explicit CAST and are rejected. `CommonType(from, to) == to`
+ * means `to` is the wider supertype.
  */
 auto CanAssign(const LogicalType &from, const LogicalType &to) -> bool {
-  return from == to || (IsNumericType(from) && IsNumericType(to) && LogicalType::CommonType(from, to) == to);
+  return from == to || from.GetTypeId() == LogicalTypeId::UNKNOWN ||
+         (IsNumericType(from) && IsNumericType(to) && LogicalType::CommonType(from, to) == to);
 }
 
 }  // namespace

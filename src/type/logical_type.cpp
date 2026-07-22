@@ -157,6 +157,11 @@ auto LogicalType::SizeOf(PhysicalType type) -> idx_t {
     // the child, which is where an ARRAY's rows actually live.
     case PhysicalType::ARRAY:
       return 0;
+    // An UNKNOWN vector is the untyped NULL literal: every row is NULL, so only the validity
+    // mask carries information. One byte per row is a minimal defensive fill, which is what
+    // lets `SELECT NULL` (and a NULL cell in VALUES) materialize before a cast resolves it.
+    case PhysicalType::UNKNOWN:
+      return 1;
     default:
       throw NotImplementedException(fmt::format("{} has no inline size", NameOf(type)));
   }
@@ -168,9 +173,9 @@ auto LogicalType::IsConstantSize(PhysicalType type) -> bool {
     case PhysicalType::STRUCT:
     case PhysicalType::LIST:
     case PhysicalType::ARRAY:
-    case PhysicalType::UNKNOWN:
       return false;
     default:
+      // Includes UNKNOWN: an all-NULL vector strides over its 1-byte defensive fill.
       return true;
   }
 }

@@ -92,18 +92,19 @@ void WriteResultTable(const PhysicalOperator &root, GlobalSinkState *sink_state,
 
 }  // namespace
 
-BumbleBeeInstance::BumbleBeeInstance()
+BumbleBeeInstance::BumbleBeeInstance(duration_t txn_timeout)
     : mem_disk_(std::make_unique<MemoryDiskManager>(kInMemoryDiskPages)),
       owned_bpm_(std::make_unique<BufferPoolManager>(kInMemoryFrames, mem_disk_.get())),
       owned_catalog_(std::make_unique<Catalog>(owned_bpm_.get())),
-      owned_txn_mgr_(std::make_unique<TransactionManager>(owned_catalog_.get())) {
+      owned_txn_mgr_(std::make_unique<TransactionManager>(owned_catalog_.get(), txn_timeout)) {
   catalog_ = owned_catalog_.get();
   bpm_ = owned_bpm_.get();
   txn_mgr_ = owned_txn_mgr_.get();
 }
 
-BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames)
-    : db_(std::make_unique<Database>(db_file, num_frames)) {
+BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames,
+                                     duration_t txn_timeout)
+    : db_(std::make_unique<Database>(db_file, num_frames, txn_timeout)) {
   // The catalog, buffer pool and transaction manager all live inside the Database (which owns the disk);
   // ~Database (via the db_ member) flushes and persists on shutdown.
   catalog_ = &db_->GetCatalog();
@@ -112,10 +113,12 @@ BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_
 }
 
 BumbleBeeInstance::~BumbleBeeInstance() {
-  // Roll back an explicit transaction left open at shutdown so its uncommitted writes never persist.
-  if (active_txn_ != nullptr) {
-    txn_mgr_->Abort(active_txn_);
-    active_txn_ = nullptr;
+  // Roll back every session's explicit transaction left open at shutdown so no uncommitted write persists.
+  for (auto &[name, txn] : session_txns_) {
+    if (txn != nullptr) {
+      txn_mgr_->Abort(txn);
+      txn = nullptr;
+    }
   }
 }
 
@@ -215,6 +218,33 @@ void BumbleBeeInstance::CmdClear(ResultWriter &writer) {
   WriteOneCell(fmt::format("Cleared the database: dropped {} table(s).", dropped), writer);
 }
 
+void BumbleBeeInstance::CmdGarbageCollect(ResultWriter &writer) {
+  // Snapshot the id of every session's open transaction BEFORE running GC: the sweep *destroys*
+  // reclaimed transactions, so afterwards a stored pointer whose txn timed out must not be
+  // dereferenced — the sessions are reconciled through the manager by id instead.
+  std::vector<std::pair<std::string, txn_id_t>> open;
+  for (const auto &[name, txn] : session_txns_) {
+    if (txn != nullptr) {
+      open.emplace_back(name, txn->GetTransactionId());
+    }
+  }
+
+  const auto stats = txn_mgr_->GarbageCollection();
+
+  // A session whose transaction is gone from the manager (or left ABORTED) was timed out by this
+  // pass; drop the session back to autocommit so its next statement does not touch a dead txn.
+  for (const auto &[name, id] : open) {
+    const auto state = txn_mgr_->GetTransactionState(id);
+    if (!state.has_value() || *state == TransactionState::ABORTED) {
+      session_txns_[name] = nullptr;
+    }
+  }
+
+  // Only the timeout-abort count is reported: it is what the caller (and the timeout tests) can
+  // predict, while the reclaimed count depends on the whole history of finished transactions.
+  WriteOneCell(fmt::format("GC: aborted {} timed-out transaction(s)", stats.timed_out_), writer);
+}
+
 void BumbleBeeInstance::CmdDisplayHelp(ResultWriter &writer) {
   std::string help = R"(Welcome to the BumbleBeeDB shell!
 
@@ -223,6 +253,10 @@ Meta-commands:
   \d <table>       describe a table's columns and indexes
   \clear           drop every table (wipe the database)
   \pipelines <sql> show the pipeline plan for a query
+  \session <name>  switch to the named session (created on first use); each
+                   session can hold its own open transaction
+  \gc              run transaction garbage collection: reclaims old versions and
+                   aborts transactions open longer than the timeout (--txn-timeout)
   \help            show this message again
 
 BumbleBeeDB runs SQL end to end: CREATE TABLE / DROP TABLE / INSERT / SELECT
@@ -279,28 +313,32 @@ void BumbleBeeInstance::HandleDropStatement(const DropStatement &stmt, ResultWri
 }
 
 void BumbleBeeInstance::HandleTransactionStatement(const TransactionStatement &stmt, ResultWriter &writer) {
+  auto &active_txn = ActiveTxn();
   switch (stmt.txn_type_) {
     case TransactionType::BEGIN:
       // Nested BEGIN is an error — there are no savepoints, so a second BEGIN would silently leak the
       // first transaction.
-      if (active_txn_ != nullptr) {
+      if (active_txn != nullptr) {
         throw Exception("cannot BEGIN: a transaction is already in progress");
       }
-      active_txn_ = txn_mgr_->Begin();
+      active_txn = txn_mgr_->Begin();
       break;
     case TransactionType::COMMIT:
-      if (active_txn_ == nullptr) {
+      if (active_txn == nullptr) {
         throw Exception("cannot COMMIT: no transaction is in progress");
       }
-      txn_mgr_->Commit(active_txn_);
-      active_txn_ = nullptr;
+      if (!txn_mgr_->Commit(active_txn)) {
+        active_txn = nullptr;
+        throw ExecutionException("cannot COMMIT: serializable validation failed, transaction aborted");
+      }
+      active_txn = nullptr;
       break;
     case TransactionType::ROLLBACK:
-      if (active_txn_ == nullptr) {
+      if (active_txn == nullptr) {
         throw Exception("cannot ROLLBACK: no transaction is in progress");
       }
-      txn_mgr_->Abort(active_txn_);
-      active_txn_ = nullptr;
+      txn_mgr_->Abort(active_txn);
+      active_txn = nullptr;
       break;
   }
   WriteOneCell(TransactionTypeToString(stmt.txn_type_), writer);
@@ -344,8 +382,8 @@ void BumbleBeeInstance::HandleExplainStatement(const ExplainStatement &stmt, Res
     ApplyConfig(client);
     // Run inside the explicit transaction if one is open (so EXPLAIN ANALYZE sees its writes and does not
     // commit it early); otherwise autocommit a fresh transaction for the analyze run.
-    const bool autocommit = active_txn_ == nullptr;
-    auto *txn = autocommit ? txn_mgr_->Begin() : active_txn_;
+    const bool autocommit = ActiveTxn() == nullptr;
+    auto *txn = autocommit ? txn_mgr_->Begin() : ActiveTxn();
     client.txn_ = txn;
     try {
       PhysicalPlanGenerator generator(client);
@@ -371,7 +409,7 @@ void BumbleBeeInstance::HandleExplainStatement(const ExplainStatement &stmt, Res
     } catch (...) {
       txn_mgr_->Abort(txn);
       if (!autocommit) {
-        active_txn_ = nullptr;  // a failed statement aborts the explicit transaction
+        ActiveTxn() = nullptr;  // a failed statement aborts the explicit transaction
       }
       throw;
     }
@@ -401,9 +439,9 @@ void BumbleBeeInstance::ExecuteStatement(const BoundStatement &statement, Result
   auto optimized_plan = optimizer.Optimize(planner.plan_);
 
   // Autocommit: without an explicit BEGIN, each statement runs in its own transaction. Inside an
-  // explicit transaction (active_txn_ set) the statement joins it — it is neither committed here nor
-  // retried under a fresh transaction; a failure aborts the whole transaction instead.
-  const bool autocommit = active_txn_ == nullptr;
+  // explicit transaction (the session's ActiveTxn() set) the statement joins it — it is neither committed
+  // here nor retried under a fresh transaction; a failure aborts the whole transaction instead.
+  const bool autocommit = ActiveTxn() == nullptr;
 
   // Detect → re-plan → retry: an in-memory breaker that overflows the budget throws MemoryLimitException
   // naming its logical node; in autocommit mode we abort, force just that node external, and re-run under
@@ -414,7 +452,7 @@ void BumbleBeeInstance::ExecuteStatement(const BoundStatement &statement, Result
     // A fresh ClientContext gives each attempt a fresh memory budget.
     ClientContext client(*catalog_, *txn_mgr_, bpm_);
     ApplyConfig(client);
-    auto *txn = autocommit ? txn_mgr_->Begin() : active_txn_;
+    auto *txn = autocommit ? txn_mgr_->Begin() : ActiveTxn();
     client.txn_ = txn;
     try {
       PhysicalPlanGenerator generator(client);
@@ -440,13 +478,13 @@ void BumbleBeeInstance::ExecuteStatement(const BoundStatement &statement, Result
       }
       txn_mgr_->Abort(txn);
       if (!autocommit) {
-        active_txn_ = nullptr;
+        ActiveTxn() = nullptr;
       }
       throw;
     } catch (...) {
       txn_mgr_->Abort(txn);  // roll back partial writes (a conflict or other error) before surfacing
       if (!autocommit) {
-        active_txn_ = nullptr;  // a failed statement aborts the explicit transaction
+        ActiveTxn() = nullptr;  // a failed statement aborts the explicit transaction
       }
       throw;
     }
@@ -482,6 +520,26 @@ auto BumbleBeeInstance::ExecuteSql(const std::string &sql, ResultWriter &writer)
     static const std::string kPipelines = "\\pipelines ";
     if (sql.rfind(kPipelines, 0) == 0) {
       return ExecuteSql("EXPLAIN (pipelines) " + sql.substr(kPipelines.size()), writer);
+    }
+    // `\session <name>` switches which named session subsequent statements run in (created on first
+    // use). Deliberately SILENT — no output — so the e2e harness can prefix any record with a session
+    // switch without polluting the record's expected rows.
+    static const std::string kSession = "\\session ";
+    if (sql.rfind(kSession, 0) == 0) {
+      auto name = sql.substr(kSession.size());
+      StringUtil::LTrim(&name);
+      StringUtil::RTrim(&name);
+      if (name.empty()) {
+        throw Exception("\\session requires a session name");
+      }
+      current_session_ = name;
+      return true;
+    }
+    // `\gc` drives TransactionManager::GarbageCollection() — the transaction-timeout enforcer — on
+    // demand. Nothing runs GC automatically yet, so this is how a timed-out transaction gets aborted.
+    if (sql == "\\gc") {
+      CmdGarbageCollect(writer);
+      return true;
     }
     throw Exception(fmt::format("unsupported meta-command: {}", sql));
   }

@@ -8,12 +8,7 @@ CREATE TABLE t(a INT, b INT, s VARCHAR(8));
 statement ok
 INSERT INTO t VALUES (1, 2, 'x');
 
-# IS NULL / IS NOT NULL — not implemented (no null-test predicate).
-statement error
-SELECT a FROM t WHERE b IS NULL;
-
-statement error
-SELECT a FROM t WHERE b IS NOT NULL;
+# IS NULL / IS NOT NULL landed — positive coverage lives in scan_filter/null_predicates.slt.
 
 # IN / BETWEEN / LIKE — rejected in the binder.
 statement error

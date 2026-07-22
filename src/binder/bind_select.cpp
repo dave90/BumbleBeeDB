@@ -444,14 +444,27 @@ auto Binder::BindConstant(duckdb_libpgquery::PGAConst *node) -> std::unique_ptr<
       return std::make_unique<BoundConstant>(Value{static_cast<int32_t>(val.val.ival)});
     }
     case duckdb_libpgquery::T_PGFloat: {
-      return std::make_unique<BoundConstant>(Value{std::stod(std::string(val.val.str))});
+      // libpg_query hands any numeric literal that does not fit an int32 over as a T_PGFloat *string* —
+      // including pure integers like 3000000000. An integer-looking literal that fits int64 becomes a
+      // BIGINT; everything else (decimal point, exponent, or beyond int64) is a DOUBLE.
+      const std::string text{val.val.str};
+      if (text.find_first_of(".eE") == std::string::npos) {
+        try {
+          return std::make_unique<BoundConstant>(Value{static_cast<int64_t>(std::stoll(text))});
+        } catch (const std::out_of_range &) {
+          // Wider than int64: fall through to DOUBLE.
+        }
+      }
+      return std::make_unique<BoundConstant>(Value{std::stod(text)});
     }
     case duckdb_libpgquery::T_PGString: {
       return std::make_unique<BoundConstant>(Value{std::string(val.val.str)});
     }
     case duckdb_libpgquery::T_PGNull: {
-      // An untyped NULL. The planner narrows it once it knows what it is compared against.
-      return std::make_unique<BoundConstant>(Value::Null(LogicalTypeId::INTEGER));
+      // An untyped NULL (LogicalTypeId::UNKNOWN). It stays untyped until something gives it a type:
+      // CommonType lets any other type absorb it, and casting it is a NULL broadcast of the target,
+      // so it can be inserted into / compared against a column of any type.
+      return std::make_unique<BoundConstant>(Value::Null());
     }
     default:
       break;
@@ -783,6 +796,13 @@ auto Binder::BindExpression(duckdb_libpgquery::PGNode *node) -> std::unique_ptr<
       return BindAExpr(reinterpret_cast<duckdb_libpgquery::PGAExpr *>(node));
     case duckdb_libpgquery::T_PGBoolExpr:
       return BindBoolExpr(reinterpret_cast<duckdb_libpgquery::PGBoolExpr *>(node));
+    case duckdb_libpgquery::T_PGNullTest: {
+      // `x IS NULL` / `x IS NOT NULL`: a unary predicate over the argument's validity.
+      auto *null_test = reinterpret_cast<duckdb_libpgquery::PGNullTest *>(node);
+      auto arg = BindExpression(reinterpret_cast<duckdb_libpgquery::PGNode *>(null_test->arg));
+      const bool negated = null_test->nulltesttype == duckdb_libpgquery::IS_NOT_NULL;
+      return std::make_unique<BoundUnaryOp>(negated ? "is_not_null" : "is_null", std::move(arg));
+    }
     default:
       break;
   }

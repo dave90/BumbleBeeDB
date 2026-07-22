@@ -13,7 +13,9 @@
 #include "bumblebee_instance.h"
 
 #include <algorithm>
+#include <chrono>  // NOLINT
 #include <sstream>
+#include <thread>  // NOLINT
 
 #include "common/exception.h"
 #include "gtest/gtest.h"
@@ -200,6 +202,75 @@ TEST(InstanceTest, StringVectorWriterIsUnlimitedByDefault) {
   NoopWriter noop;
   EXPECT_EQ(collector.MaxDisplayRows(), 0U);
   EXPECT_EQ(noop.MaxDisplayRows(), 0U);
+}
+
+TEST(InstanceTest, SessionsHoldIndependentTransactions) {
+  // `\session <name>` switches which named session subsequent statements run in; each session can
+  // hold its own open transaction, so MVCC visibility applies between them within one instance.
+  BumbleBeeInstance instance;
+  RunSql(instance, "CREATE TABLE t(v INT);");
+
+  RunSql(instance, "\\session s1");
+  RunSql(instance, "BEGIN;");
+  RunSql(instance, "INSERT INTO t VALUES (1);");
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('1'), std::string::npos)
+      << "s1 sees its own uncommitted insert";
+
+  RunSql(instance, "\\session s2");
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('0'), std::string::npos)
+      << "s2 must not see s1's uncommitted insert";
+  // s2 was left in autocommit by the switch, so it can open its own transaction.
+  RunSql(instance, "BEGIN;");
+
+  RunSql(instance, "\\session s1");
+  RunSql(instance, "COMMIT;");
+
+  RunSql(instance, "\\session s2");
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('0'), std::string::npos)
+      << "s2's snapshot predates s1's commit";
+  RunSql(instance, "COMMIT;");
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('1'), std::string::npos)
+      << "a fresh s2 statement sees the committed row";
+
+  // `\session` is silent (no output), so the e2e harness can inject switches freely.
+  EXPECT_EQ(RunSql(instance, "\\session s3"), "");
+}
+
+TEST(InstanceTest, GcAbortsTimedOutTransactionAndSessionRecovers) {
+  // A millisecond timeout (runtime ctor parameter — no special build needed) makes the next `\gc`
+  // pass abort the open transaction; its writes are rolled back and the session drops back to
+  // autocommit, so COMMIT then has nothing to commit and later transactions work normally.
+  BumbleBeeInstance instance(std::chrono::milliseconds(20));
+  RunSql(instance, "CREATE TABLE t(v INT);");
+  RunSql(instance, "BEGIN;");
+  RunSql(instance, "INSERT INTO t VALUES (1);");
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  auto gc_out = RunSql(instance, "\\gc");
+  EXPECT_NE(gc_out.find("aborted 1 timed-out"), std::string::npos) << gc_out;
+
+  EXPECT_THROW(RunSql(instance, "COMMIT;"), Exception) << "the timed-out transaction is gone";
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('0'), std::string::npos)
+      << "the aborted transaction's insert was rolled back";
+
+  // The same session opens a fresh transaction afterwards, unaffected by the reaped one.
+  RunSql(instance, "BEGIN;");
+  RunSql(instance, "INSERT INTO t VALUES (2);");
+  RunSql(instance, "COMMIT;");
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('1'), std::string::npos);
+}
+
+TEST(InstanceTest, GcLeavesYoungTransactionsAlone) {
+  // With the default (2h) timeout nothing expires: \gc reports zero aborts and an open transaction
+  // keeps working across the pass.
+  BumbleBeeInstance instance;
+  RunSql(instance, "CREATE TABLE t(v INT);");
+  RunSql(instance, "BEGIN;");
+  RunSql(instance, "INSERT INTO t VALUES (1);");
+  auto gc_out = RunSql(instance, "\\gc");
+  EXPECT_NE(gc_out.find("aborted 0 timed-out"), std::string::npos) << gc_out;
+  RunSql(instance, "COMMIT;");
+  EXPECT_NE(RunSql(instance, "SELECT COUNT(*) FROM t;").find('1'), std::string::npos);
 }
 
 }  // namespace bumblebee

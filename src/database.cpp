@@ -26,7 +26,8 @@
 
 namespace bumblebee {
 
-Database::Database(const std::filesystem::path &db_file, size_t num_frames) : num_frames_(num_frames) {
+Database::Database(const std::filesystem::path &db_file, size_t num_frames, duration_t txn_timeout)
+    : num_frames_(num_frames) {
   dm_ = std::make_unique<SingleFileDiskManager>(db_file);
 
   std::vector<char> record;
@@ -44,9 +45,9 @@ Database::Database(const std::filesystem::path &db_file, size_t num_frames) : nu
     catalog_ = std::make_unique<Catalog>(bpm_.get());
   }
 
-  // The transaction manager is per-database and resolves oids through this catalog. Its default 2-hour
-  // timeout is enforced whenever GarbageCollection() is driven.
-  txn_manager_ = std::make_unique<TransactionManager>(catalog_.get());
+  // The transaction manager is per-database and resolves oids through this catalog. Its timeout
+  // (default 2 hours) is enforced whenever GarbageCollection() is driven.
+  txn_manager_ = std::make_unique<TransactionManager>(catalog_.get(), txn_timeout);
   // Restore the commit-ts high-water mark so readers see rows committed in earlier sessions. Without
   // this, the counter restarts at 0 and every persisted row (ts >= 1) is invisible to a fresh snapshot.
   txn_manager_->SetLastCommitTs(recovered_commit_ts_);
