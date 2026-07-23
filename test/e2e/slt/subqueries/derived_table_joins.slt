@@ -1,0 +1,81 @@
+# Derived tables inside joins: derived JOIN base, two derived tables joined together, a
+# self-join expressed as two derived tables over the same base, and a LEFT JOIN whose right
+# side is an aggregating derived table (unmatched groups produce NULLs).
+
+statement ok
+CREATE TABLE emp(id INT, name VARCHAR, dept INT, salary INT);
+
+statement ok
+INSERT INTO emp VALUES
+  (1,'alice',10,100),(2,'bob',10,120),(3,'carol',20,90),(4,'dave',20,150),
+  (5,'eve',30,80),(6,'frank',10,60),(7,'grace',20,200),(8,NULL,30,70);
+
+statement ok
+CREATE TABLE dept(dept INT, dname VARCHAR);
+
+statement ok
+INSERT INTO dept VALUES (10,'eng'),(20,'sales'),(30,'ops'),(40,'legal');
+
+# Derived table (filtered emp) joined to a base table.
+query rowsort
+SELECT s.name, dept.dname
+FROM (SELECT name, dept FROM emp WHERE salary >= 100) AS s
+JOIN dept ON s.dept = dept.dept;
+----
+'alice' 'eng'
+'bob' 'eng'
+'dave' 'sales'
+'grace' 'sales'
+
+# Two independent derived tables joined on their exported columns.
+query
+SELECT COUNT(*)
+FROM (SELECT id, dept FROM emp WHERE salary < 100) AS p
+JOIN (SELECT dept, dname FROM dept) AS q ON p.dept = q.dept;
+----
+4
+
+# A base table joined to an aggregating derived table, ordered by the base column.
+query
+SELECT d.dname, s.total
+FROM dept AS d
+JOIN (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept) AS s ON d.dept = s.dept
+ORDER BY d.dname;
+----
+'eng' 280
+'ops' 150
+'sales' 440
+
+# Self-join expressed as two derived tables over the same base: pair employees within dept 10.
+query rowsort
+SELECT a.name, b.name
+FROM (SELECT name, dept FROM emp WHERE dept = 10) AS a
+JOIN (SELECT name, dept FROM emp WHERE dept = 10) AS b ON a.dept = b.dept
+WHERE a.name < b.name;
+----
+'alice' 'bob'
+'alice' 'frank'
+'bob' 'frank'
+
+# LEFT JOIN with an aggregating derived table on the right; 'legal' has no employees -> NULL.
+query rowsort
+SELECT d.dname, e.total
+FROM dept AS d
+LEFT JOIN (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept) AS e ON d.dept = e.dept;
+----
+'eng' 280
+'legal' NULL
+'ops' 150
+'sales' 440
+
+# LEFT JOIN counting employees per department, including the empty one, ordered by name.
+query
+SELECT d.dname, e.cnt
+FROM dept AS d
+LEFT JOIN (SELECT dept, COUNT(*) AS cnt FROM emp GROUP BY dept) AS e ON d.dept = e.dept
+ORDER BY d.dname;
+----
+'eng' 3
+'legal' NULL
+'ops' 2
+'sales' 3

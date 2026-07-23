@@ -12,6 +12,7 @@
 
 #include "execution/operator/aggregate/physical_hash_aggregate.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>  // NOLINT
@@ -19,94 +20,175 @@
 #include <vector>
 
 #include "common/helper.h"
-#include "execution/aggregate/aggregate_state.h"
+#include "execution/aggregate/aggregate_update_kernels.h"
 #include "execution/expression_executor.h"
 #include "execution/prl_hash_table.h"
 #include "parallel/pipeline.h"
 #include "parallel/pipeline_builder.h"
 #include "type/value.h"
+#include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
 
 namespace {
 
 /**
- * The group table's layout is the group-by columns followed by one hidden BIGINT ordinal column. The
- * ordinal is each group's creation index: it addresses the accumulator set of the group from a row
- * address, and because groups are created in insertion order it equals the group's Scan position.
+ * How many hash partitions the merge boundary uses. Combine scatters each task's local groups into
+ * these buffers (one small mutex each — contention is 1/kMergePartitions of a single global lock),
+ * and each source task then builds and emits one whole partition independently: the merge of a
+ * high-cardinality GROUP BY parallelizes instead of serializing behind one mutex. A power of two.
  */
-auto GroupTableTypes(const std::vector<LogicalType> &group_types) -> std::vector<LogicalType> {
+constexpr idx_t kMergePartitions = 32;
+
+/** The partition of a group hash. The TOP bits: the table directory indexes with the low bits, so
+ * partition and bucket choice stay independent. */
+auto PartitionOf(hash_t hash) -> idx_t { return static_cast<idx_t>(hash >> 59) & (kMergePartitions - 1); }
+
+/**
+ * The group-table layout: the group-by columns (the key), then per aggregate a BIGINT count and a
+ * DOUBLE value slot — the accumulator state lives INSIDE the row, next to its key. One row = one
+ * group = one contiguous cache line-ish blob; no per-group heap allocations to chase. COUNT uses
+ * only the count; SUM accumulates in the value; MIN/MAX keep the extreme in the value, where
+ * "state initialized" is simply count > 0 (every non-NULL update bumps the count).
+ */
+auto GroupTableTypes(const std::vector<LogicalType> &group_types, idx_t num_aggs) -> std::vector<LogicalType> {
   auto types = group_types;
-  types.emplace_back(LogicalTypeId::BIGINT);
+  for (idx_t a = 0; a < num_aggs; a++) {
+    types.emplace_back(LogicalTypeId::BIGINT);
+    types.emplace_back(LogicalTypeId::DOUBLE);
+  }
   return types;
 }
 
-/** @brief One accumulator per aggregate, for one group. */
-auto MakeAccums(const std::vector<AggregationType> &agg_types) -> std::vector<AggregateAccumulator> {
-  std::vector<AggregateAccumulator> accums;
-  accums.reserve(agg_types.size());
-  for (auto type : agg_types) {
-    accums.emplace_back(type);
-  }
-  return accums;
-}
-
 /**
- * @brief The shared table state of one aggregation side (a task-local one, or the global one).
- *
- * `ht` dedups on the group columns (NULL groups compare equal — SQL GROUP BY semantics); `accums[g]`
- * is group g's accumulator set, indexed by the hidden ordinal column.
+ * @brief One aggregation table: the group rows with embedded state, plus the layout offsets of each
+ * aggregate's count/value slot. Used both for a sink task's local table and for a source task's
+ * per-partition final table.
  */
 struct GroupedAggState {
-  explicit GroupedAggState(const std::vector<LogicalType> &group_types)
-      : ht_(GroupTableTypes(group_types), group_types.size(), /*null_equal_keys=*/true),
-        ordinal_offset_(ht_.GetLayout().GetOffsets().back()) {}
-
-  PRLHashTable ht_;
-  idx_t ordinal_offset_;
-  std::vector<std::vector<AggregateAccumulator>> accums_;
-
-  /**
-   * @brief Find-or-create the groups of `group_chunk` and return the addresses vector.
-   *
-   * New groups get their ordinal stamped into the row and a fresh accumulator set appended.
-   */
-  void AddGroups(DataChunk &group_chunk, const std::vector<AggregationType> &agg_types, Vector &addresses) {
-    const idx_t count = group_chunk.GetSize();
-
-    // The table chunk = the group columns plus the (uninitialized) ordinal column; the ordinal is
-    // stamped after the scatter, once a row is known to be a new group.
-    DataChunk table_chunk;
-    table_chunk.Initialize(ht_.GetTypes());
-    for (idx_t g = 0; g + 1 < ht_.GetTypes().size(); g++) {
-      table_chunk.data_[g].Reference(group_chunk.data_[g]);
-    }
-    table_chunk.SetCardinality(count);
-
-    Vector hashes{LogicalType{LogicalTypeId::UBIGINT}, count};
-    group_chunk.Hash(hashes);
-
-    SelectionVector new_sel(count);
-    idx_t new_count = 0;
-    ht_.FindOrCreateGroups(hashes, table_chunk, addresses, &new_sel, &new_count);
-
-    auto addr_data = FlatVector::GetData<data_ptr_t>(addresses);
-    for (idx_t k = 0; k < new_count; k++) {
-      const idx_t idx = new_sel.GetIndex(k);
-      Store<int64_t>(static_cast<int64_t>(accums_.size()), addr_data[idx] + ordinal_offset_);
-      accums_.push_back(MakeAccums(agg_types));
+  GroupedAggState(const std::vector<LogicalType> &group_types, const std::vector<AggregationType> &agg_types)
+      : ht_(GroupTableTypes(group_types, agg_types.size()), group_types.size(), /*null_equal_keys=*/true),
+        num_groups_(group_types.size()),
+        agg_types_(agg_types) {
+    const auto &offsets = ht_.GetLayout().GetOffsets();
+    cnt_offs_.reserve(agg_types.size());
+    val_offs_.reserve(agg_types.size());
+    for (idx_t a = 0; a < agg_types.size(); a++) {
+      cnt_offs_.push_back(offsets[num_groups_ + 2 * a]);
+      val_offs_.push_back(offsets[num_groups_ + 2 * a + 1]);
     }
   }
 
-  /** @return The ordinal (accumulator index) stored in the group row at `addr`. */
-  auto OrdinalAt(data_ptr_t addr) const -> idx_t { return static_cast<idx_t>(Load<int64_t>(addr + ordinal_offset_)); }
+  PRLHashTable ht_;
+  idx_t num_groups_;
+  std::vector<AggregationType> agg_types_;
+  std::vector<idx_t> cnt_offs_;
+  std::vector<idx_t> val_offs_;
+
+  /**
+   * @brief Sink path: find-or-create the groups of `group_chunk`; new groups start with zeroed state
+   * (the zero constants ride the scatter). Returns the group-row address of every input row.
+   */
+  void AddGroups(DataChunk &group_chunk, Vector &hashes, Vector &addresses) {
+    const idx_t count = group_chunk.GetSize();
+    DataChunk table_chunk;
+    table_chunk.Initialize(ht_.GetTypes());
+    for (idx_t g = 0; g < num_groups_; g++) {
+      table_chunk.data_[g].Reference(group_chunk.data_[g]);
+    }
+    Vector zero_cnt{Value(static_cast<int64_t>(0))};
+    Vector zero_val{Value(static_cast<double>(0))};
+    for (idx_t a = 0; a < agg_types_.size(); a++) {
+      table_chunk.data_[num_groups_ + 2 * a].Reference(zero_cnt);
+      table_chunk.data_[num_groups_ + 2 * a + 1].Reference(zero_val);
+    }
+    table_chunk.SetCardinality(count);
+    ht_.FindOrCreateGroups(hashes, table_chunk, addresses);
+  }
+
+  /**
+   * @brief Merge path: fold a full-layout chunk (group columns + carried state columns) in.
+   *
+   * A row whose group is NEW carries its state into the table via the scatter itself; a row whose
+   * group already exists merges state-into-state (counts add; SUM adds values; MIN/MAX keep the
+   * extreme, where a zero source count means "no state to merge").
+   */
+  void MergeChunk(DataChunk &full_chunk) {
+    const idx_t count = full_chunk.GetSize();
+    if (count == 0) {
+      return;
+    }
+    // Hash the group-key prefix only.
+    DataChunk group_view;
+    group_view.Initialize(std::vector<LogicalType>(ht_.GetTypes().begin(), ht_.GetTypes().begin() + num_groups_));
+    for (idx_t g = 0; g < num_groups_; g++) {
+      group_view.data_[g].Reference(full_chunk.data_[g]);
+    }
+    group_view.SetCardinality(count);
+    Vector hashes{LogicalType{LogicalTypeId::UBIGINT}, count};
+    group_view.Hash(hashes);
+
+    Vector addresses{LogicalType{LogicalTypeId::UBIGINT}, count};
+    SelectionVector new_sel(count);
+    idx_t new_count = 0;
+    ht_.FindOrCreateGroups(hashes, full_chunk, addresses, &new_sel, &new_count);
+
+    std::array<bool, STANDARD_VECTOR_SIZE> is_new{};
+    for (idx_t k = 0; k < new_count; k++) {
+      is_new[new_sel.GetIndex(k)] = true;
+    }
+
+    auto *addrs = FlatVector::GetData<data_ptr_t>(addresses);
+    for (idx_t a = 0; a < agg_types_.size(); a++) {
+      full_chunk.data_[num_groups_ + 2 * a].Normalify(count);
+      full_chunk.data_[num_groups_ + 2 * a + 1].Normalify(count);
+      const auto *src_cnt = FlatVector::GetData<int64_t>(full_chunk.data_[num_groups_ + 2 * a]);
+      const auto *src_val = FlatVector::GetData<double>(full_chunk.data_[num_groups_ + 2 * a + 1]);
+      const auto cnt_off = cnt_offs_[a];
+      const auto val_off = val_offs_[a];
+      const auto type = agg_types_[a];
+      for (idx_t i = 0; i < count; i++) {
+        if (is_new[i] || src_cnt[i] == 0) {
+          continue;  // a new group's state rode the scatter; an empty source state merges to nothing
+        }
+        auto *addr = addrs[i];
+        const auto dst_cnt = Load<int64_t>(addr + cnt_off);
+        if (type == AggregationType::SumAggregate) {
+          Store<double>(Load<double>(addr + val_off) + src_val[i], addr + val_off);
+        } else if (type == AggregationType::MinAggregate || type == AggregationType::MaxAggregate) {
+          if (dst_cnt == 0) {
+            Store<double>(src_val[i], addr + val_off);
+          } else {
+            const auto cur = Load<double>(addr + val_off);
+            const bool take_src =
+                type == AggregationType::MinAggregate ? src_val[i] < cur : src_val[i] > cur;
+            if (take_src) {
+              Store<double>(src_val[i], addr + val_off);
+            }
+          }
+        }
+        Store<int64_t>(dst_cnt + src_cnt[i], addr + cnt_off);
+      }
+    }
+  }
 };
 
 }  // namespace
 
 struct HashAggGlobalSinkState : GlobalSinkState {
-  std::mutex mu_;
-  std::unique_ptr<GroupedAggState> state_;  // created by the first Combine (needs the group types)
+  /**
+   * One merge partition: the full-layout rows (groups + carried state) every task's Combine
+   * scattered here. Its mutex only guards the buffer push — the expensive work (building the
+   * final table) happens later, in parallel, one partition per source task.
+   */
+  struct MergePartition {
+    std::mutex mu_;
+    std::vector<std::unique_ptr<DataChunk>> rows_;
+  };
+
+  std::vector<LogicalType> group_types_;
+  std::vector<LogicalType> table_types_;
+  std::array<MergePartition, kMergePartitions> partitions_;
 };
 
 struct HashAggLocalSinkState : LocalSinkState {
@@ -115,16 +197,32 @@ struct HashAggLocalSinkState : LocalSinkState {
   std::vector<LogicalType> group_types_;
   std::vector<LogicalType> arg_types_;
   std::unique_ptr<GroupedAggState> state_;
+  /** Reused per Sink call: Execute() re-references their columns, so no per-chunk allocation. */
+  DataChunk group_chunk_;
+  DataChunk args_;
 };
 
 struct HashAggGlobalSourceState : GlobalSourceState {
   GlobalSinkState *sink_{nullptr};
-  std::atomic<idx_t> cursor_{0};
-  auto MaxThreads() -> idx_t override { return 1; }
+  /** The next merge partition to hand out; each source task builds and drains whole partitions. */
+  std::atomic<idx_t> next_partition_{0};
+  auto MaxThreads() -> idx_t override { return kMergePartitions; }
+};
+
+struct HashAggLocalSourceState : LocalSourceState {
+  /** The partition table this task is currently emitting, and the scan cursor into it. */
+  std::unique_ptr<GroupedAggState> table_;
+  idx_t scan_offset_{0};
 };
 
 auto PhysicalHashAggregate::GetGlobalSinkState(ClientContext & /*context*/) const -> std::unique_ptr<GlobalSinkState> {
-  return std::make_unique<HashAggGlobalSinkState>();
+  auto gs = std::make_unique<HashAggGlobalSinkState>();
+  gs->group_types_.reserve(group_bys_.size());
+  for (const auto &g : group_bys_) {
+    gs->group_types_.push_back(g->GetReturnType().GetType());
+  }
+  gs->table_types_ = GroupTableTypes(gs->group_types_, agg_types_.size());
+  return gs;
 }
 
 auto PhysicalHashAggregate::GetLocalSinkState(ExecutionContext & /*context*/) const -> std::unique_ptr<LocalSinkState> {
@@ -139,7 +237,9 @@ auto PhysicalHashAggregate::GetLocalSinkState(ExecutionContext & /*context*/) co
     ls->agg_exec_->AddExpression(*a);
     ls->arg_types_.push_back(a->GetReturnType().GetType());
   }
-  ls->state_ = std::make_unique<GroupedAggState>(ls->group_types_);
+  ls->state_ = std::make_unique<GroupedAggState>(ls->group_types_, agg_types_);
+  ls->group_chunk_.Initialize(ls->group_types_);
+  ls->args_.Initialize(ls->arg_types_);
   return ls;
 }
 
@@ -148,78 +248,104 @@ auto PhysicalHashAggregate::Sink(ExecutionContext & /*context*/, DataChunk &inpu
   auto &ls = static_cast<HashAggLocalSinkState &>(lstate);
   const idx_t count = input.GetSize();
 
-  DataChunk group_chunk;
-  group_chunk.Initialize(ls.group_types_);
-  ls.group_exec_->Execute(input, group_chunk);
+  ls.group_exec_->Execute(input, ls.group_chunk_);
+  ls.agg_exec_->Execute(input, ls.args_);
 
-  DataChunk args;
-  args.Initialize(ls.arg_types_);
-  ls.agg_exec_->Execute(input, args);
-
+  Vector hashes{LogicalType{LogicalTypeId::UBIGINT}, count};
+  ls.group_chunk_.Hash(hashes);
   Vector addresses{LogicalType{LogicalTypeId::UBIGINT}, count};
-  ls.state_->AddGroups(group_chunk, agg_types_, addresses);
+  ls.state_->AddGroups(ls.group_chunk_, hashes, addresses);
 
-  // Fold every row into its group's accumulators (the update itself is value-at-a-time for now; the
-  // group lookup above is the vectorized part).
-  auto addr_data = FlatVector::GetData<data_ptr_t>(addresses);
-  auto &accums = ls.state_->accums_;
-  for (idx_t i = 0; i < count; i++) {
-    auto &group_accums = accums[ls.state_->OrdinalAt(addr_data[i])];
-    for (idx_t a = 0; a < agg_types_.size(); a++) {
-      group_accums[a].Update(args.GetValue(a, i));
-    }
+  // Fold each aggregate's whole argument vector into the row-embedded states: one typed columnar
+  // kernel per aggregate, no per-row Value boxing.
+  auto *addrs = FlatVector::GetData<data_ptr_t>(addresses);
+  for (idx_t a = 0; a < agg_types_.size(); a++) {
+    UpdateOneAggregate(agg_types_[a], ls.args_.data_[a], addrs, count, ls.state_->cnt_offs_[a],
+                       ls.state_->val_offs_[a]);
   }
   return SinkResultType::NEED_MORE_INPUT;
 }
+
+namespace {
+
+/** @brief Append `sel[0..n)` of `src` (full layout) to a partition's row buffers, packing chunks full. */
+void PartitionAppend(HashAggGlobalSinkState::MergePartition &part, const std::vector<LogicalType> &types,
+                     DataChunk &src, const SelectionVector &sel, idx_t n) {
+  idx_t done = 0;
+  while (done < n) {
+    if (part.rows_.empty() || part.rows_.back()->GetSize() >= STANDARD_VECTOR_SIZE) {
+      auto chunk = std::make_unique<DataChunk>();
+      chunk->Initialize(types);
+      chunk->SetCardinality(0);
+      part.rows_.push_back(std::move(chunk));
+    }
+    auto &dst = *part.rows_.back();
+    const idx_t fill = dst.GetSize();
+    const idx_t take = std::min<idx_t>(n - done, STANDARD_VECTOR_SIZE - fill);
+    for (idx_t c = 0; c < types.size(); c++) {
+      // Selection copy with a target offset; string payloads are re-homed into the buffer's heaps.
+      VectorOperations::Copy(src.data_[c], dst.data_[c], sel, done + take, done, fill);
+    }
+    dst.SetCardinality(fill + take);
+    done += take;
+  }
+}
+
+}  // namespace
 
 void PhysicalHashAggregate::Combine(ExecutionContext & /*context*/, GlobalSinkState &gstate,
                                     LocalSinkState &lstate) const {
   auto &gs = static_cast<HashAggGlobalSinkState &>(gstate);
   auto &ls = static_cast<HashAggLocalSinkState &>(lstate);
-  std::lock_guard lock(gs.mu_);
-  if (gs.state_ == nullptr) {
-    // First task in: hand the whole local state over, no per-group merge needed.
-    gs.state_ = std::move(ls.state_);
-    return;
-  }
 
-  // Scan the local groups back out (group columns only — the local ordinal is the scan position) and
-  // find-or-create them in the global table, then merge the accumulator sets.
+  // Scatter this task's groups (with their carried state) into the hash partitions. Only the buffer
+  // push is under a (per-partition) lock; no group is re-hashed into a global table here.
   DataChunk scan_chunk;
-  scan_chunk.Initialize(ls.group_types_);
+  scan_chunk.Initialize(gs.table_types_);
+  DataChunk group_view;
+  group_view.Initialize(ls.group_types_);
+  std::array<std::unique_ptr<SelectionVector>, kMergePartitions> sels;
+  std::array<idx_t, kMergePartitions> counts{};
+
   idx_t offset = 0;
   while (true) {
     const idx_t n = ls.state_->ht_.Scan(offset, scan_chunk);
     if (n == 0) {
       break;
     }
-    Vector addresses{LogicalType{LogicalTypeId::UBIGINT}, n};
-    gs.state_->AddGroups(scan_chunk, agg_types_, addresses);
-    auto addr_data = FlatVector::GetData<data_ptr_t>(addresses);
-    for (idx_t j = 0; j < n; j++) {
-      auto &global_accums = gs.state_->accums_[gs.state_->OrdinalAt(addr_data[j])];
-      auto &local_accums = ls.state_->accums_[offset + j];
-      for (idx_t a = 0; a < agg_types_.size(); a++) {
-        global_accums[a].Merge(local_accums[a]);
+    for (idx_t g = 0; g < ls.group_types_.size(); g++) {
+      group_view.data_[g].Reference(scan_chunk.data_[g]);
+    }
+    group_view.SetCardinality(n);
+    Vector hashes{LogicalType{LogicalTypeId::UBIGINT}, n};
+    group_view.Hash(hashes);
+    const auto *hash_data = FlatVector::GetData<hash_t>(hashes);
+
+    counts.fill(0);
+    for (idx_t i = 0; i < n; i++) {
+      const idx_t p = PartitionOf(hash_data[i]);
+      if (sels[p] == nullptr) {
+        sels[p] = std::make_unique<SelectionVector>(STANDARD_VECTOR_SIZE);
       }
+      sels[p]->SetIndex(counts[p]++, i);
+    }
+    for (idx_t p = 0; p < kMergePartitions; p++) {
+      if (counts[p] == 0) {
+        continue;
+      }
+      auto &part = gs.partitions_[p];
+      std::lock_guard lock(part.mu_);
+      PartitionAppend(part, gs.table_types_, scan_chunk, *sels[p], counts[p]);
     }
     offset += n;
     scan_chunk.Reset();
   }
 }
 
-auto PhysicalHashAggregate::Finalize(ClientContext & /*context*/, GlobalSinkState &gstate, idx_t /*stage*/,
+auto PhysicalHashAggregate::Finalize(ClientContext & /*context*/, GlobalSinkState & /*gstate*/, idx_t /*stage*/,
                                      idx_t /*task_idx*/, idx_t /*task_count*/) const -> SinkFinalizeType {
-  auto &gs = static_cast<HashAggGlobalSinkState &>(gstate);
-  if (gs.state_ == nullptr) {
-    // No task sank anything (an empty child): an empty table so the source emits nothing.
-    std::vector<LogicalType> group_types;
-    group_types.reserve(group_bys_.size());
-    for (const auto &g : group_bys_) {
-      group_types.push_back(g->GetReturnType().GetType());
-    }
-    gs.state_ = std::make_unique<GroupedAggState>(group_types);
-  }
+  // Nothing to do: the partitions were buffered by Combine, and the SOURCE builds them in parallel
+  // (Finalize runs single-task, so building here would serialize the merge again).
   return SinkFinalizeType::READY;
 }
 
@@ -230,38 +356,107 @@ auto PhysicalHashAggregate::GetGlobalSourceState(ClientContext & /*context*/, Gl
   return src;
 }
 
-auto PhysicalHashAggregate::GetData(ExecutionContext & /*context*/, DataChunk &output, GlobalSourceState &gstate,
-                                    LocalSourceState & /*lstate*/) const -> SourceResultType {
-  auto &src = static_cast<HashAggGlobalSourceState &>(gstate);
-  auto &sink = *static_cast<HashAggGlobalSinkState *>(src.sink_);
-  auto &state = *sink.state_;
-  const idx_t total = state.ht_.Count();
-  const idx_t start = src.cursor_.fetch_add(STANDARD_VECTOR_SIZE, std::memory_order_relaxed);
-  if (start >= total) {
-    return SourceResultType::FINISHED;
-  }
+auto PhysicalHashAggregate::GetLocalSourceState(ExecutionContext & /*context*/, GlobalSourceState & /*gstate*/) const
+    -> std::unique_ptr<LocalSourceState> {
+  return std::make_unique<HashAggLocalSourceState>();
+}
 
-  // Scan this batch's group columns into an owned chunk and hand its vectors to the output by
-  // reference (the shared data manager keeps them alive). Group g of the scan is ordinal start + j by
-  // construction, so the accumulators line up with the scan order.
-  const idx_t num_groups = group_bys_.size();
-  const auto out_types = output.GetTypes();
-  DataChunk group_chunk;
-  group_chunk.Initialize(std::vector<LogicalType>(out_types.begin(), out_types.begin() + num_groups));
-  const idx_t n = state.ht_.Scan(start, group_chunk, /*copy_strings=*/true);
-  for (idx_t g = 0; g < num_groups; g++) {
-    output.data_[g].Reference(group_chunk.data_[g]);
-  }
+namespace {
 
-  for (idx_t j = 0; j < n; j++) {
-    const auto &group_accums = state.accums_[start + j];
-    for (idx_t a = 0; a < agg_types_.size(); a++) {
-      output.SetValue(num_groups + a, j,
-                      group_accums[a].Finalize(output_schema_->GetColumn(num_groups + a).GetType()));
+/**
+ * @brief Build one partition's final table from its buffered rows, then FREE the buffers.
+ *
+ * Every buffered row either creates its group (its state rides the scatter) or merges into it.
+ * Partitions are disjoint by hash, so each is built fully independently — this call, one per
+ * source task, is exactly the merge work that runs in parallel. The row buffers are released
+ * eagerly: once merged they are dead weight, and a large aggregation should not hold both the
+ * buffers and the tables to peak.
+ */
+auto BuildPartitionTable(HashAggGlobalSinkState::MergePartition &part, const std::vector<LogicalType> &group_types,
+                         const std::vector<AggregationType> &agg_types) -> std::unique_ptr<GroupedAggState> {
+  auto table = std::make_unique<GroupedAggState>(group_types, agg_types);
+  for (auto &chunk : part.rows_) {
+    table->MergeChunk(*chunk);
+  }
+  part.rows_.clear();
+  part.rows_.shrink_to_fit();
+  return table;
+}
+
+/**
+ * @brief Finalize ONE aggregate's output column from its (count, value) state columns.
+ *
+ * COUNT emits the count; SUM/MIN/MAX emit the value with "zero non-NULL inputs" turned into NULL.
+ * The state column is referenced zero-copy when its physical type already matches the output
+ * column, cast in one vectorized pass otherwise.
+ */
+void FinalizeAggregateColumn(AggregationType type, Vector &cnt_vec, Vector &val_vec, Vector &out,
+                             const LogicalType &out_type, idx_t n) {
+  const bool is_count =
+      type == AggregationType::CountStarAggregate || type == AggregationType::CountAggregate;
+  Vector &result_src = is_count ? cnt_vec : val_vec;
+  if (result_src.GetLogicalType().GetPhysicalType() == out_type.GetPhysicalType()) {
+    out.Reference(result_src);
+  } else {
+    VectorOperations::Cast(result_src, out, n);
+  }
+  if (is_count) {
+    return;  // a count is never NULL
+  }
+  const auto *cnt = FlatVector::GetData<int64_t>(cnt_vec);
+  auto &validity = FlatVector::Validity(out);
+  for (idx_t i = 0; i < n; i++) {
+    if (cnt[i] == 0) {
+      validity.SetInvalid(i);
     }
   }
-  output.SetCardinality(n);
-  return (start + n >= total) ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+}
+
+}  // namespace
+
+auto PhysicalHashAggregate::GetData(ExecutionContext & /*context*/, DataChunk &output, GlobalSourceState &gstate,
+                                    LocalSourceState &lstate) const -> SourceResultType {
+  auto &src = static_cast<HashAggGlobalSourceState &>(gstate);
+  auto &ls = static_cast<HashAggLocalSourceState &>(lstate);
+  auto &sink = *static_cast<HashAggGlobalSinkState *>(src.sink_);
+  const idx_t num_groups = group_bys_.size();
+
+  while (true) {
+    // No partition in hand: claim the next non-empty one and build its table.
+    if (ls.table_ == nullptr) {
+      const idx_t p = src.next_partition_.fetch_add(1, std::memory_order_relaxed);
+      if (p >= kMergePartitions) {
+        return SourceResultType::FINISHED;
+      }
+      auto &part = sink.partitions_[p];
+      if (part.rows_.empty()) {
+        continue;
+      }
+      ls.table_ = BuildPartitionTable(part, sink.group_types_, agg_types_);
+      ls.scan_offset_ = 0;
+    }
+
+    // Emit the next chunk of the partition in hand; a drained partition goes back for the next one.
+    DataChunk scan_chunk;
+    scan_chunk.Initialize(sink.table_types_);
+    const idx_t n = ls.table_->ht_.Scan(ls.scan_offset_, scan_chunk, /*copy_strings=*/true);
+    if (n == 0) {
+      ls.table_.reset();
+      continue;
+    }
+    ls.scan_offset_ += n;
+
+    for (idx_t g = 0; g < num_groups; g++) {
+      output.data_[g].Reference(scan_chunk.data_[g]);
+    }
+    for (idx_t a = 0; a < agg_types_.size(); a++) {
+      FinalizeAggregateColumn(agg_types_[a], scan_chunk.data_[num_groups + 2 * a],
+                              scan_chunk.data_[num_groups + 2 * a + 1], output.data_[num_groups + a],
+                              output_schema_->GetColumn(num_groups + a).GetType(), n);
+    }
+    output.SetCardinality(n);
+    return SourceResultType::HAVE_MORE_OUTPUT;
+  }
 }
 
 void PhysicalHashAggregate::BuildPipelines(Pipeline &current, PipelineBuilder &builder) const {

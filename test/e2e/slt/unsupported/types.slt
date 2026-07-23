@@ -1,0 +1,55 @@
+# Negative coverage: the column-type ceiling. Columns of these types can be declared, but there is
+# no way to get a value into them — there are no typed literals for them and no CAST — so any INSERT
+# is rejected. The reachable, end-to-end-usable types are INT, BIGINT, DOUBLE, VARCHAR and NULL
+# (positive multi-type coverage lives across the slt/ subgroups). These pin the boundary.
+
+# TINYINT / SMALLINT: an integer literal binds as BIGINT and does not narrow into them.
+statement ok
+CREATE TABLE t1(a TINYINT);
+
+statement error
+INSERT INTO t1 VALUES (1);
+
+statement ok
+CREATE TABLE t2(a SMALLINT);
+
+statement error
+INSERT INTO t2 VALUES (1);
+
+# FLOAT: a decimal literal binds as DOUBLE and does not narrow into FLOAT.
+statement ok
+CREATE TABLE t3(a FLOAT);
+
+statement error
+INSERT INTO t3 VALUES (1.5);
+
+# BOOLEAN: TRUE / FALSE are not supported literals (they parse to an unimplemented cast).
+statement ok
+CREATE TABLE t4(a BOOLEAN);
+
+statement error
+INSERT INTO t4 VALUES (TRUE);
+
+# DECIMAL: no decimal literal type.
+statement ok
+CREATE TABLE t5(a DECIMAL(10,2));
+
+statement error
+INSERT INTO t5 VALUES (1.5);
+
+# DATE: no date literal; a string does not coerce.
+statement ok
+CREATE TABLE t6(a DATE);
+
+statement error
+INSERT INTO t6 VALUES ('2020-01-01');
+
+# CAST is not implemented, so there is no way to bridge into a narrower type either.
+statement ok
+CREATE TABLE t7(a INT);
+
+statement ok
+INSERT INTO t7 VALUES (1);
+
+statement error
+SELECT CAST(a AS BIGINT) FROM t7;

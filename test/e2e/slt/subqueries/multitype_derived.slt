@@ -1,0 +1,45 @@
+# Derived tables and CTEs carrying mixed column types (INT, BIGINT, DOUBLE, VARCHAR, NULL):
+# a DOUBLE aggregate exported from a subquery, IS NOT NULL filtering inside a derived table, a
+# CTE aggregating a DOUBLE column, and an outer filter on a DOUBLE aggregate alias.
+
+statement ok
+CREATE TABLE product(pid INT, sku BIGINT, price DOUBLE, category VARCHAR);
+
+statement ok
+INSERT INTO product VALUES
+  (1,1001,9.75,'fruit'),(2,1002,4.25,'veg'),(3,1001,9.75,'fruit'),
+  (4,1003,2.25,'dairy'),(5,1002,15.00,'veg'),(6,1004,NULL,'dairy');
+
+# DOUBLE aggregate computed inside a derived table, projected and ordered outside.
+query
+SELECT s.category, s.s FROM (SELECT category, SUM(price) AS s FROM product GROUP BY category) AS s
+ORDER BY s.category;
+----
+'dairy' 2.25
+'fruit' 19.5
+'veg' 19.25
+
+# IS NOT NULL inside the derived table drops the NULL-price row; outer ORDER BY on the DOUBLE.
+query
+SELECT d.category, d.price FROM (SELECT category, price FROM product WHERE price IS NOT NULL) AS d
+ORDER BY d.price, d.category;
+----
+'dairy' 2.25
+'veg' 4.25
+'fruit' 9.75
+'fruit' 9.75
+'veg' 15
+
+# A CTE over a DOUBLE column feeding an outer aggregate.
+query
+WITH hi AS (SELECT sku, price FROM product WHERE price > 5.0)
+SELECT COUNT(*), SUM(price) FROM hi;
+----
+3 34.5
+
+# Outer WHERE filters on a DOUBLE aggregate alias exported by the derived table.
+query
+SELECT p.category, p.mx FROM (SELECT category, MAX(price) AS mx FROM product GROUP BY category) AS p
+WHERE p.mx > 10 ORDER BY p.category;
+----
+'veg' 15

@@ -187,14 +187,20 @@ void VectorOperations::Copy(const Vector &source, Vector &target, const Selectio
       break;
     case PhysicalType::STRING: {
       // The bytes belong to the source's heap: copy them into the target's, so that the
-      // target does not outlive the strings it points at.
+      // target does not outlive the strings it points at. A NULL source row (e.g. LEFT-join
+      // padding) carries an indeterminate handle, so it must NOT be dereferenced — write a
+      // defined empty string and let the validity copy below mark the slot NULL.
       const auto *ldata = FlatVector::GetData<string_t>(source);
       auto *tdata = FlatVector::GetData<string_t>(target);
       const SelectionVector *tsel = target_sel != nullptr ? target_sel : &FlatVector::INCREMENTAL_SELECTION_VECTOR;
+      const auto &svalidity = source.Validity();
+      const bool sall_valid = svalidity.AllValid();
       for (idx_t i = 0; i < copy_count; i++) {
         auto source_idx = sel.GetIndex(source_offset + i);
         auto target_idx = tsel->GetIndex(target_offset + i);
-        tdata[target_idx] = StringVector::AddString(target, ldata[source_idx]);
+        tdata[target_idx] = (sall_valid || svalidity.RowIsValid(source_idx))
+                                ? StringVector::AddString(target, ldata[source_idx])
+                                : string_t("", 0);
       }
       break;
     }
@@ -207,9 +213,16 @@ void VectorOperations::Copy(const Vector &source, Vector &target, const Selectio
       const auto *ldata = FlatVector::GetData<ListEntry>(source);
       auto *tdata = FlatVector::GetData<ListEntry>(target);
       const SelectionVector *tsel = target_sel != nullptr ? target_sel : &FlatVector::INCREMENTAL_SELECTION_VECTOR;
+      const auto &svalidity = source.Validity();
+      const bool sall_valid = svalidity.AllValid();
       for (idx_t i = 0; i < copy_count; i++) {
         auto source_idx = sel.GetIndex(source_offset + i);
         auto target_idx = tsel->GetIndex(target_offset + i);
+        if (!sall_valid && !svalidity.RowIsValid(source_idx)) {
+          // NULL row: its entry is indeterminate, so don't append its (garbage) element range.
+          tdata[target_idx] = ListEntry{0, 0};
+          continue;
+        }
         const auto entry = ldata[source_idx];
         const idx_t new_offset = ListVector::Append(target, ListVector::GetChild(source),
                                                     entry.offset_ + entry.length_, entry.offset_);

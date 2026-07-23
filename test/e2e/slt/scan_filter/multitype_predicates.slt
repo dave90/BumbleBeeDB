@@ -1,0 +1,66 @@
+# Filters over mixed column types: DOUBLE comparisons (including an INT literal compared against a
+# DOUBLE column), VARCHAR equality / inequality / ordering, BIGINT equality, IS NULL on a DOUBLE
+# column, and compound AND/OR predicates. Projections may compute DOUBLE arithmetic.
+
+statement ok
+CREATE TABLE product(pid INT, sku BIGINT, price DOUBLE, category VARCHAR);
+
+statement ok
+INSERT INTO product VALUES
+  (1,1001,9.75,'fruit'),(2,1002,4.25,'veg'),(3,1001,9.75,'fruit'),
+  (4,1003,2.25,'dairy'),(5,1002,15.00,'veg'),(6,1004,NULL,'dairy');
+
+# DOUBLE column compared against a DOUBLE literal.
+query
+SELECT pid, price FROM product WHERE price > 5.0 ORDER BY pid;
+----
+1 9.75
+3 9.75
+5 15
+
+# DOUBLE column compared against an INT literal (the literal widens to DOUBLE).
+query
+SELECT pid, price FROM product WHERE price > 5 ORDER BY pid;
+----
+1 9.75
+3 9.75
+5 15
+
+# VARCHAR ordering comparison (lexicographic).
+query
+SELECT pid, category FROM product WHERE category > 'dairy' ORDER BY category, pid;
+----
+1 'fruit'
+3 'fruit'
+2 'veg'
+5 'veg'
+
+# BIGINT equality plus a compound AND over two types.
+query
+SELECT pid, sku, price FROM product WHERE sku = 1002 AND price < 10 ORDER BY pid;
+----
+2 1002 4.25
+
+# IS NULL on the DOUBLE column, OR a BIGINT match.
+query
+SELECT pid, category FROM product WHERE price IS NULL OR sku = 1003 ORDER BY pid;
+----
+4 'dairy'
+6 'dairy'
+
+# NULL comparisons are never true: a range predicate drops the NULL-price row.
+query
+SELECT pid FROM product WHERE price >= 0 ORDER BY pid;
+----
+1
+2
+3
+4
+5
+
+# DOUBLE arithmetic in the projection, filtered on a VARCHAR predicate.
+query
+SELECT pid, price * 2 AS dbl, price + 0.25 AS bumped FROM product WHERE category = 'veg' ORDER BY pid;
+----
+2 8.5 4.5
+5 30 15.25

@@ -1,0 +1,69 @@
+# ORDER BY over mixed column types: DOUBLE (with NULL), BIGINT and VARCHAR sort keys, mixed
+# ASC/DESC, and TopN (ORDER BY ... LIMIT). NULLs sort last in ASC and first in DESC.
+
+statement ok
+CREATE TABLE product(pid INT, sku BIGINT, price DOUBLE, category VARCHAR);
+
+statement ok
+INSERT INTO product VALUES
+  (1,1001,9.75,'fruit'),(2,1002,4.25,'veg'),(3,1001,9.75,'fruit'),
+  (4,1003,2.25,'dairy'),(5,1002,15.00,'veg'),(6,1004,NULL,'dairy');
+
+# ORDER BY a DOUBLE column, NULL last (ASC).
+query
+SELECT pid, price FROM product ORDER BY price, pid;
+----
+4 2.25
+2 4.25
+1 9.75
+3 9.75
+5 15
+6 NULL
+
+# ORDER BY a DOUBLE column DESC, NULL first.
+query
+SELECT pid, price FROM product ORDER BY price DESC, pid;
+----
+6 NULL
+5 15
+1 9.75
+3 9.75
+2 4.25
+4 2.25
+
+# Multi-key: BIGINT DESC, then DOUBLE ASC, then INT.
+query
+SELECT pid, sku, price FROM product ORDER BY sku DESC, price, pid;
+----
+6 1004 NULL
+4 1003 2.25
+2 1002 4.25
+5 1002 15
+1 1001 9.75
+3 1001 9.75
+
+# Mixed key types VARCHAR then DOUBLE.
+query
+SELECT category, price, pid FROM product ORDER BY category, price, pid;
+----
+'dairy' 2.25 4
+'dairy' NULL 6
+'fruit' 9.75 1
+'fruit' 9.75 3
+'veg' 4.25 2
+'veg' 15 5
+
+# TopN on a DOUBLE key (ORDER BY ... LIMIT): the three cheapest, NULL excluded by the cutoff.
+query
+SELECT pid, price FROM product ORDER BY price, pid LIMIT 3;
+----
+4 2.25
+2 4.25
+1 9.75
+
+# TopN on a DOUBLE key DESC: NULL sorts first and thus lands in the top slice.
+query
+SELECT pid, price FROM product ORDER BY price DESC, pid LIMIT 2;
+----
+6 NULL
+5 15

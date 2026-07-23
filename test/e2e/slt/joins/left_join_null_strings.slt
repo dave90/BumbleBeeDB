@@ -1,0 +1,85 @@
+# LEFT JOIN whose right side carries VARCHAR columns: unmatched left rows null-extend those
+# string columns. Regression coverage for a bug where ordering by (or otherwise materializing)
+# a null-extended string column read an indeterminate string_t handle and crashed in the
+# string heap. NULLs sort last in ASC and first in DESC (the engine's fixed convention).
+
+statement ok
+CREATE TABLE cust(cid INT, cname VARCHAR);
+
+statement ok
+INSERT INTO cust VALUES (1,'alice'),(2,'bob'),(3,'carol'),(4,'dave');
+
+statement ok
+CREATE TABLE ord(oid INT, cid INT, item VARCHAR);
+
+statement ok
+INSERT INTO ord VALUES (100,1,'book'),(101,1,'pen'),(102,3,'lamp');
+
+# Baseline shape: bob and dave have no orders, so item is NULL.
+query rowsort
+SELECT c.cname, o.item FROM cust c LEFT JOIN ord o ON c.cid = o.cid;
+----
+'alice' 'book'
+'alice' 'pen'
+'bob' NULL
+'carol' 'lamp'
+'dave' NULL
+
+# ORDER BY the null-extended string column (ASC): NULLs sort last. c.cname breaks NULL ties.
+query
+SELECT c.cname, o.item FROM cust c LEFT JOIN ord o ON c.cid = o.cid ORDER BY o.item, c.cname;
+----
+'alice' 'book'
+'carol' 'lamp'
+'alice' 'pen'
+'bob' NULL
+'dave' NULL
+
+# ORDER BY the null-extended string column (DESC): NULLs sort first.
+query
+SELECT c.cname, o.item FROM cust c LEFT JOIN ord o ON c.cid = o.cid ORDER BY o.item DESC, c.cname;
+----
+'bob' NULL
+'dave' NULL
+'alice' 'pen'
+'carol' 'lamp'
+'alice' 'book'
+
+# ORDER BY nullable right string with a LIMIT (drives the TopN path over null-extended strings).
+query
+SELECT c.cname, o.item FROM cust c LEFT JOIN ord o ON c.cid = o.cid ORDER BY o.item, c.cname LIMIT 3;
+----
+'alice' 'book'
+'carol' 'lamp'
+'alice' 'pen'
+
+# Order the left string first, the nullable right string second.
+query
+SELECT c.cname, o.item FROM cust c LEFT JOIN ord o ON c.cid = o.cid ORDER BY c.cname, o.item;
+----
+'alice' 'book'
+'alice' 'pen'
+'bob' NULL
+'carol' 'lamp'
+'dave' NULL
+
+# Aggregate over a LEFT JOIN: COUNT of the right key is 0 for unmatched customers.
+query
+SELECT c.cname, COUNT(o.oid) AS n FROM cust c LEFT JOIN ord o ON c.cid = o.cid GROUP BY c.cname ORDER BY c.cname;
+----
+'alice' 2
+'bob' 0
+'carol' 1
+'dave' 0
+
+# Every left row is unmatched (empty right side): the whole string column is NULL and still
+# materializes/orders without touching an uninitialized handle.
+query
+SELECT c.cname, o.item
+FROM cust c LEFT JOIN (SELECT oid, cid, item FROM ord WHERE oid < 0) AS o ON c.cid = o.cid
+ORDER BY o.item, c.cname;
+----
+'alice' NULL
+'bob' NULL
+'carol' NULL
+'dave' NULL

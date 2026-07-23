@@ -1,0 +1,54 @@
+# INSERT / UPDATE / DELETE against a table mixing INT, BIGINT, DOUBLE and VARCHAR, including NULLs
+# in the DOUBLE column. UPDATE rewrites several typed columns at once; DELETE filters across types.
+
+statement ok
+CREATE TABLE item(id INT, sku BIGINT, price DOUBLE, name VARCHAR);
+
+statement ok
+INSERT INTO item VALUES
+  (1,5001,9.75,'apple'),(2,5002,4.25,'pear'),(3,5003,NULL,'plum'),(4,5004,15.00,'kiwi');
+
+query
+SELECT id, sku, price, name FROM item ORDER BY id;
+----
+1 5001 9.75 'apple'
+2 5002 4.25 'pear'
+3 5003 NULL 'plum'
+4 5004 15 'kiwi'
+
+# UPDATE multiple typed columns in one statement (DOUBLE + VARCHAR), reported affected-row count.
+query
+UPDATE item SET price = 3.5, name = 'plum-ripe' WHERE id = 3;
+----
+1
+
+query
+SELECT id, price, name FROM item WHERE id = 3;
+----
+3 3.5 'plum-ripe'
+
+# UPDATE driven by a DOUBLE predicate touching several rows.
+query
+UPDATE item SET price = price + 1.25 WHERE price < 10;
+----
+3
+
+query
+SELECT id, price FROM item ORDER BY id;
+----
+1 11
+2 5.5
+3 4.75
+4 15
+
+# DELETE across a compound predicate mixing BIGINT and DOUBLE.
+query
+DELETE FROM item WHERE sku = 5002 OR price > 12;
+----
+2
+
+query
+SELECT id, sku, price, name FROM item ORDER BY id;
+----
+1 5001 11 'apple'
+3 5003 4.75 'plum-ripe'

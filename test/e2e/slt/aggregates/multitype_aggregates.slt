@@ -1,0 +1,42 @@
+# Aggregates over a multi-column table mixing INT, BIGINT, DOUBLE and VARCHAR, with a NULL in the
+# DOUBLE column. SUM/MIN/MAX preserve the argument's numeric type (DOUBLE stays DOUBLE, BIGINT stays
+# BIGINT); COUNT is always integer; COUNT(col) skips NULLs while COUNT(*) does not.
+
+statement ok
+CREATE TABLE product(pid INT, sku BIGINT, price DOUBLE, category VARCHAR);
+
+statement ok
+INSERT INTO product VALUES
+  (1,1001,9.75,'fruit'),(2,1002,4.25,'veg'),(3,1001,9.75,'fruit'),
+  (4,1003,2.25,'dairy'),(5,1002,15.00,'veg'),(6,1004,NULL,'dairy');
+
+# DOUBLE aggregates alongside the two COUNT flavours. Row 6's NULL price is counted by COUNT(*)
+# but not COUNT(price), and is ignored by SUM/MIN/MAX.
+query
+SELECT COUNT(*), COUNT(price), SUM(price), MIN(price), MAX(price) FROM product;
+----
+6 5 41 2.25 15
+
+# BIGINT aggregates keep 64-bit width.
+query
+SELECT SUM(sku), MIN(sku), MAX(sku) FROM product;
+----
+6013 1001 1004
+
+# DOUBLE SUM restricted by a VARCHAR predicate.
+query
+SELECT SUM(price) FROM product WHERE category = 'dairy';
+----
+2.25
+
+# An empty filter yields one all-NULL aggregate row (SUM/MIN/MAX over zero rows are NULL, COUNT 0).
+query
+SELECT COUNT(*), SUM(price), MIN(price), MAX(price) FROM product WHERE category = 'meat';
+----
+0 NULL NULL NULL
+
+# A DOUBLE aggregate feeding an outer aggregate through a derived table (agg-of-agg keeps DOUBLE).
+query
+SELECT MAX(g.s) FROM (SELECT category, SUM(price) AS s FROM product GROUP BY category) AS g;
+----
+19.5

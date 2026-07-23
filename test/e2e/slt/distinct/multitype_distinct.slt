@@ -1,0 +1,46 @@
+# DISTINCT over mixed column types: a single DOUBLE column (with a NULL), a composite
+# (BIGINT, VARCHAR) key, and a full multi-type row. NULL is a single distinct value.
+
+statement ok
+CREATE TABLE product(pid INT, sku BIGINT, price DOUBLE, category VARCHAR);
+
+statement ok
+INSERT INTO product VALUES
+  (1,1001,9.75,'fruit'),(2,1002,4.25,'veg'),(3,1001,9.75,'fruit'),
+  (4,1003,2.25,'dairy'),(5,1002,15.00,'veg'),(6,1004,NULL,'dairy'),(7,1004,NULL,'dairy');
+
+# DISTINCT on a DOUBLE column collapses the duplicate 9.75 and the duplicate NULL.
+query
+SELECT DISTINCT price FROM product ORDER BY price;
+----
+2.25
+4.25
+9.75
+15
+NULL
+
+# DISTINCT on a composite (BIGINT, VARCHAR) key.
+query
+SELECT DISTINCT sku, category FROM product ORDER BY sku, category;
+----
+1001 'fruit'
+1002 'veg'
+1003 'dairy'
+1004 'dairy'
+
+# DISTINCT over a full multi-type projection: rows 6 and 7 are identical (sku, price NULL,
+# category) so they collapse to one.
+query
+SELECT DISTINCT sku, price, category FROM product ORDER BY sku, price;
+----
+1001 9.75 'fruit'
+1002 4.25 'veg'
+1002 15 'veg'
+1003 2.25 'dairy'
+1004 NULL 'dairy'
+
+# COUNT over a DISTINCT derived table.
+query
+SELECT COUNT(*) FROM (SELECT DISTINCT sku, category FROM product) AS d;
+----
+4

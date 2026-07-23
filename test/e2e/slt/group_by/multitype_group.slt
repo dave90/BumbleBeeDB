@@ -1,0 +1,45 @@
+# GROUP BY over mixed column types: a VARCHAR grouping key with DOUBLE aggregates, a multi-column
+# (VARCHAR, BIGINT) grouping key, and a HAVING filter on a DOUBLE aggregate. Regression coverage
+# for a bug where a DOUBLE aggregate followed by ORDER BY tripped a vector type check.
+
+statement ok
+CREATE TABLE product(pid INT, sku BIGINT, price DOUBLE, category VARCHAR);
+
+statement ok
+INSERT INTO product VALUES
+  (1,1001,9.75,'fruit'),(2,1002,4.25,'veg'),(3,1001,9.75,'fruit'),
+  (4,1003,2.25,'dairy'),(5,1002,15.00,'veg'),(6,1004,NULL,'dairy');
+
+# VARCHAR group key, DOUBLE aggregates, ordered by the (VARCHAR) group key.
+query
+SELECT category, COUNT(*) AS n, SUM(price) AS s, MIN(price) AS mn, MAX(price) AS mx
+FROM product GROUP BY category ORDER BY category;
+----
+'dairy' 2 2.25 2.25 2.25
+'fruit' 2 19.5 9.75 9.75
+'veg' 2 19.25 4.25 15
+
+# Composite (VARCHAR, BIGINT) grouping key.
+query
+SELECT category, sku, COUNT(*) AS n FROM product GROUP BY category, sku ORDER BY category, sku;
+----
+'dairy' 1003 1
+'dairy' 1004 1
+'fruit' 1001 2
+'veg' 1002 2
+
+# HAVING on a DOUBLE aggregate keeps only the high-value categories.
+query
+SELECT category, SUM(price) AS s FROM product GROUP BY category HAVING SUM(price) > 10 ORDER BY category;
+----
+'fruit' 19.5
+'veg' 19.25
+
+# GROUP BY the BIGINT column with a DOUBLE SUM (rowsort: hash grouping order is unspecified).
+query rowsort
+SELECT sku, SUM(price) AS s FROM product GROUP BY sku;
+----
+1001 19.5
+1002 19.25
+1003 2.25
+1004 NULL

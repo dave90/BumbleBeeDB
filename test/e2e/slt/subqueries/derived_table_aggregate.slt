@@ -1,0 +1,65 @@
+# Derived tables that carry aggregation: GROUP BY inside the subquery, aggregate-of-aggregate,
+# an outer WHERE that filters on an aggregate alias, and an outer GROUP BY over a derived table.
+
+statement ok
+CREATE TABLE emp(id INT, name VARCHAR, dept INT, salary INT);
+
+statement ok
+INSERT INTO emp VALUES
+  (1,'alice',10,100),(2,'bob',10,120),(3,'carol',20,90),(4,'dave',20,150),
+  (5,'eve',30,80),(6,'frank',10,60),(7,'grace',20,200),(8,NULL,30,70);
+
+# GROUP BY + SUM inside the derived table, projected out and ordered by the group key.
+query
+SELECT s.dept, s.total
+FROM (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept) AS s
+ORDER BY s.dept;
+----
+10 280
+20 440
+30 150
+
+# MIN / MAX per group inside the derived table.
+query
+SELECT s.dept, s.mn, s.mx
+FROM (SELECT dept, MIN(salary) AS mn, MAX(salary) AS mx FROM emp GROUP BY dept) AS s
+ORDER BY s.dept;
+----
+10 60 120
+20 90 200
+30 70 80
+
+# Aggregate over an aggregate: max of the per-department totals.
+query
+SELECT MAX(s.total)
+FROM (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept) AS s;
+----
+440
+
+# Outer WHERE filters on the aggregate alias exported by the derived table (a HAVING-style filter).
+query
+SELECT s.dept
+FROM (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept) AS s
+WHERE s.total > 200
+ORDER BY s.dept;
+----
+10
+20
+
+# Outer GROUP BY over a plain derived table.
+query
+SELECT s.dept, COUNT(*) AS cnt
+FROM (SELECT id, dept FROM emp WHERE salary >= 80) AS s
+GROUP BY s.dept
+ORDER BY s.dept;
+----
+10 2
+20 3
+30 1
+
+# A TopN inside the derived table, then an outer aggregate over just those rows.
+query
+SELECT COUNT(*), SUM(s.salary)
+FROM (SELECT salary FROM emp ORDER BY salary DESC LIMIT 3) AS s;
+----
+3 470

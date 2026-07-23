@@ -1,0 +1,63 @@
+# Derived tables (FROM subqueries): multi-level nesting, outer WHERE/ORDER BY over a
+# derived table, NULL ordering, and empty inner results.
+
+statement ok
+CREATE TABLE emp(id INT, name VARCHAR, dept INT, salary INT);
+
+statement ok
+INSERT INTO emp VALUES
+  (1,'alice',10,100),(2,'bob',10,120),(3,'carol',20,90),(4,'dave',20,150),
+  (5,'eve',30,80),(6,'frank',10,60),(7,'grace',20,200),(8,NULL,30,70);
+
+# Two-level nesting: an inner derived table feeds another derived table.
+query rowsort
+SELECT x.id
+FROM (SELECT id FROM (SELECT id, salary FROM emp WHERE salary >= 100) AS inr WHERE inr.salary <= 150) AS x;
+----
+1
+2
+4
+
+# Three-level nesting with a filter at each level; count the survivors.
+query
+SELECT COUNT(*)
+FROM (SELECT id
+      FROM (SELECT id, salary
+            FROM (SELECT id, dept, salary FROM emp WHERE dept <> 30) AS a
+            WHERE a.salary >= 90) AS b) AS c;
+----
+5
+
+# Outer WHERE and ORDER BY reference the derived table's exported columns (salary is both
+# filtered on and ordered by, so it stays in the outer SELECT list).
+query
+SELECT s.id, s.salary
+FROM (SELECT id, name, salary FROM emp) AS s
+WHERE s.salary >= 120
+ORDER BY s.salary DESC;
+----
+7 200
+4 150
+2 120
+
+# NULL name survives the projection and sorts last under ASC.
+query
+SELECT s.name
+FROM (SELECT name FROM emp WHERE dept = 30) AS s
+ORDER BY s.name;
+----
+'eve'
+NULL
+
+# An empty inner result yields an empty derived table (COUNT over it is 0).
+query
+SELECT COUNT(*)
+FROM (SELECT id FROM emp WHERE salary > 1000) AS s;
+----
+0
+
+# A derived table with no explicit alias (libpg_query auto-names it) still works.
+query
+SELECT COUNT(*) FROM (SELECT id FROM emp WHERE dept = 10);
+----
+3

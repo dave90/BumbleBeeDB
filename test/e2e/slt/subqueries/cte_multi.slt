@@ -1,0 +1,74 @@
+# Non-recursive CTEs (WITH): a CTE that aggregates, a CTE ordered/limited (TopN), a CTE with
+# DISTINCT, a CTE joined to a base table, and multiple CTEs joined together. Each CTE reads a
+# base table (chaining a CTE off another CTE is not supported -- see unsupported/subqueries.slt).
+
+statement ok
+CREATE TABLE emp(id INT, name VARCHAR, dept INT, salary INT);
+
+statement ok
+INSERT INTO emp VALUES
+  (1,'alice',10,100),(2,'bob',10,120),(3,'carol',20,90),(4,'dave',20,150),
+  (5,'eve',30,80),(6,'frank',10,60),(7,'grace',20,200),(8,NULL,30,70);
+
+statement ok
+CREATE TABLE dept(dept INT, dname VARCHAR);
+
+statement ok
+INSERT INTO dept VALUES (10,'eng'),(20,'sales'),(30,'ops'),(40,'legal');
+
+# A CTE that aggregates, consumed by an outer aggregate.
+query
+WITH big AS (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept)
+SELECT COUNT(*), SUM(big.total) FROM big;
+----
+3 870
+
+# A CTE with ORDER BY ... LIMIT (TopN) inside it.
+query
+WITH t3 AS (SELECT name, salary FROM emp ORDER BY salary DESC LIMIT 3)
+SELECT name FROM t3 ORDER BY name;
+----
+'bob'
+'dave'
+'grace'
+
+# A CTE with DISTINCT.
+query
+WITH u AS (SELECT DISTINCT dept FROM emp)
+SELECT COUNT(*) FROM u;
+----
+3
+
+# A CTE joined to a base table.
+query
+WITH s AS (SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept)
+SELECT d.dname, s.total
+FROM dept AS d JOIN s ON d.dept = s.dept
+ORDER BY d.dname;
+----
+'eng' 280
+'ops' 150
+'sales' 440
+
+# Two CTEs joined together, then grouped in the outer query.
+query
+WITH hi AS (SELECT id, dept FROM emp WHERE salary >= 120),
+     dn AS (SELECT dept, dname FROM dept)
+SELECT dn.dname, COUNT(*) AS c
+FROM hi JOIN dn ON hi.dept = dn.dept
+GROUP BY dn.dname
+ORDER BY dn.dname;
+----
+'eng' 1
+'sales' 2
+
+# A CTE feeding a LEFT JOIN so an unmatched department shows NULL.
+query rowsort
+WITH cnt AS (SELECT dept, COUNT(*) AS c FROM emp GROUP BY dept)
+SELECT d.dname, cnt.c
+FROM dept AS d LEFT JOIN cnt ON d.dept = cnt.dept;
+----
+'eng' 3
+'legal' NULL
+'ops' 2
+'sales' 3

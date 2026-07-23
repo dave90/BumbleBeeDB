@@ -24,11 +24,14 @@
 namespace bumblebee {
 
 /**
- * @brief A GROUP BY aggregate over a hash table keyed by the encoded group-by columns.
+ * @brief A GROUP BY aggregate over a hash table keyed by the group-by columns.
  *
- * Sink + source: the sink hashes each row into a per-group accumulator set; the source emits one row per
- * distinct group (the group-by columns, then the finalized aggregates). Single-threaded map for now; the
- * radix-partitioned lock-free table is a parallel-scheduler-era optimization.
+ * Sink + source. Each sink task builds a thread-local table whose rows embed the aggregate state
+ * next to the group key (per aggregate: a count and a value slot — no per-group heap allocations),
+ * updated by columnar kernels. `Combine` does NOT merge into one global table under one lock:
+ * it scatters each local table's rows into hash-partitioned row buffers (one small mutex per
+ * partition), and the SOURCE then builds and emits one partition per task — so the merge, the
+ * usual serial bottleneck of high-cardinality GROUP BYs, runs in parallel across partitions.
  */
 class PhysicalHashAggregate : public PhysicalOperator {
  public:
@@ -56,6 +59,8 @@ class PhysicalHashAggregate : public PhysicalOperator {
   auto IsSource() const -> bool override { return true; }
   auto GetGlobalSourceState(ClientContext &context, GlobalSinkState *own_sink_state) const
       -> std::unique_ptr<GlobalSourceState> override;
+  auto GetLocalSourceState(ExecutionContext &context, GlobalSourceState &gstate) const
+      -> std::unique_ptr<LocalSourceState> override;
   auto GetData(ExecutionContext &context, DataChunk &output, GlobalSourceState &gstate, LocalSourceState &lstate) const
       -> SourceResultType override;
 

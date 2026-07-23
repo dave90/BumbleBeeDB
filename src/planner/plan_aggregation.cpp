@@ -119,10 +119,15 @@ auto Planner::PlanSelectAgg(const SelectStatement &statement, AbstractPlanNodeRe
 
     agg_types.push_back(agg_type);
     output_col_names.emplace_back(fmt::format("agg#{}", term_idx));
-    // The placeholder left behind by AddAggCallToContext resolves to this column of
-    // the aggregation node's output.
+    // The placeholder resolves to this column of the aggregation node's output; it must carry
+    // the aggregate's real output type (mirrors InferAggSchema): COUNT is INTEGER, SUM/MIN/MAX
+    // keep their argument's type.
+    const bool is_count =
+        agg_type == AggregationType::CountStarAggregate || agg_type == AggregationType::CountAggregate;
+    LogicalType agg_result_type =
+        is_count ? LogicalType(LogicalTypeId::INTEGER) : input_exprs.back()->GetReturnType().GetType();
     ctx_.expr_in_agg_.emplace_back(std::make_shared<ColumnValueExpression>(
-        0, agg_begin_idx + term_idx, Column::Make("<agg_result>", LogicalType(LogicalTypeId::INTEGER))));
+        0, agg_begin_idx + term_idx, Column::Make("<agg_result>", std::move(agg_result_type))));
 
     term_idx++;
   }

@@ -12,17 +12,25 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "execution/plans/aggregation_plan.h"
 #include "type/logical_type.h"
 #include "type/value.h"
+#include "type/vector/vector.h"
 
 namespace bumblebee {
 
 /**
- * @brief A running accumulator for one aggregate over one group — the B7 aggregate state, value-at-a-time.
+ * @brief A running accumulator for one aggregate over one group — the B7 aggregate state.
  *
  * Numeric only for now (accumulates through `long double`, which carries the 64-bit integer range); a
  * string MIN/MAX is a future extension. NULL inputs are ignored except by COUNT(*), matching SQL.
+ *
+ * Two update paths: `Update(Value)` folds one row (used where rows scatter across group states), and
+ * `UpdateVector` folds a whole vector in one columnar pass — a constant collapses to O(1), a flat
+ * vector runs a tight per-physical-type loop over sequential data (no per-row Value boxing, no
+ * selection indirection), which the compiler can unroll and auto-vectorize.
  */
 class AggregateAccumulator {
  public:
@@ -53,6 +61,69 @@ class AggregateAccumulator {
         break;
       default:
         break;  // Count: the count_++ above is all it needs
+    }
+  }
+
+  /**
+   * @brief Fold a whole vector of aggregate arguments into the state in one columnar pass.
+   *
+   * COUNT(*) never reads the data at all; a CONSTANT vector is folded in O(1); a FLAT vector takes
+   * the typed tight-loop path below; any other encoding (dictionary, sequence) is normalified first
+   * so the hot loop always runs over contiguous data.
+   */
+  void UpdateVector(Vector &v, idx_t count) {
+    if (count == 0) {
+      return;
+    }
+    if (type_ == AggregationType::CountStarAggregate) {
+      count_ += static_cast<int64_t>(count);
+      return;
+    }
+    if (v.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+      const auto val = v.GetValue(0);
+      if (val.IsNull()) {
+        return;  // a NULL constant contributes nothing (COUNT(*) was handled above)
+      }
+      const auto d = val.GetAs<long double>();
+      count_ += static_cast<int64_t>(count);
+      if (type_ == AggregationType::SumAggregate) {
+        sum_ += d * static_cast<long double>(count);
+      } else if (type_ == AggregationType::MinAggregate) {
+        FoldMin(d);
+      } else if (type_ == AggregationType::MaxAggregate) {
+        FoldMax(d);
+      }
+      return;
+    }
+    if (v.GetVectorType() != VectorType::FLAT_VECTOR) {
+      v.Normalify(count);
+    }
+    switch (v.GetLogicalType().GetPhysicalType()) {
+      case PhysicalType::TINYINT:
+        return UpdateFlat<int8_t>(FlatVector::GetData<int8_t>(v), v.Validity(), count);
+      case PhysicalType::SMALLINT:
+        return UpdateFlat<int16_t>(FlatVector::GetData<int16_t>(v), v.Validity(), count);
+      case PhysicalType::INTEGER:
+        return UpdateFlat<int32_t>(FlatVector::GetData<int32_t>(v), v.Validity(), count);
+      case PhysicalType::BIGINT:
+        return UpdateFlat<int64_t>(FlatVector::GetData<int64_t>(v), v.Validity(), count);
+      case PhysicalType::UTINYINT:
+        return UpdateFlat<uint8_t>(FlatVector::GetData<uint8_t>(v), v.Validity(), count);
+      case PhysicalType::USMALLINT:
+        return UpdateFlat<uint16_t>(FlatVector::GetData<uint16_t>(v), v.Validity(), count);
+      case PhysicalType::UINTEGER:
+        return UpdateFlat<uint32_t>(FlatVector::GetData<uint32_t>(v), v.Validity(), count);
+      case PhysicalType::UBIGINT:
+        return UpdateFlat<uint64_t>(FlatVector::GetData<uint64_t>(v), v.Validity(), count);
+      case PhysicalType::FLOAT:
+        return UpdateFlat<float>(FlatVector::GetData<float>(v), v.Validity(), count);
+      case PhysicalType::DOUBLE:
+        return UpdateFlat<double>(FlatVector::GetData<double>(v), v.Validity(), count);
+      default:
+        // Non-numeric physical type: fall back to the row-at-a-time path (same NULL semantics).
+        for (idx_t i = 0; i < count; i++) {
+          Update(v.GetValue(i));
+        }
     }
   }
 
@@ -88,6 +159,138 @@ class AggregateAccumulator {
   }
 
  private:
+  void FoldMin(long double d) {
+    acc_ = has_acc_ ? (d < acc_ ? d : acc_) : d;
+    has_acc_ = true;
+  }
+  void FoldMax(long double d) {
+    acc_ = has_acc_ ? (d > acc_ ? d : acc_) : d;
+    has_acc_ = true;
+  }
+
+  /** @brief Lane-reducible min/max for one element: NaN-dropping builtins for floats (they lower
+   * to `fminnm`/`fmaxnm` lanes, which the strict `<`-select form would not), plain select for ints. */
+  template <class T>
+  static auto LaneMin(T a, T b) -> T {
+    if constexpr (std::is_same_v<T, float>) {
+      return __builtin_fminf(a, b);
+    } else if constexpr (std::is_same_v<T, double>) {
+      return __builtin_fmin(a, b);
+    } else {
+      return b < a ? b : a;
+    }
+  }
+  template <class T>
+  static auto LaneMax(T a, T b) -> T {
+    if constexpr (std::is_same_v<T, float>) {
+      return __builtin_fmaxf(a, b);
+    } else if constexpr (std::is_same_v<T, double>) {
+      return __builtin_fmax(a, b);
+    } else {
+      return b > a ? b : a;
+    }
+  }
+
+  /**
+   * @brief The columnar hot loop: fold `count` contiguous values of physical type `T`.
+   *
+   * The chunk accumulates in a plain register type — int64 for the integers, double for the
+   * floats — and folds into the wide state ONCE at the end, so the inner loop is pure `acc += x` /
+   * `min(acc, x)` over sequential memory: branch-free when the chunk has no NULLs, and exactly the
+   * shape the auto-vectorizer turns into SIMD (verified with -Rpass=loop-vectorize: widening
+   * integer sum lanes, smin/smax lanes, fadd/fminnm lanes). Two FP details make the float paths
+   * eligible: the SUM loop opts into reassociation (strict IEEE ordering would force a serial
+   * dependency chain — every vectorized engine reduces per-lane), and min/max go through
+   * LaneMin/LaneMax. The NULL-carrying variant walks the validity mask per row but still reads
+   * the data sequentially.
+   */
+  template <class T>
+  void UpdateFlat(const T *data, const ValidityMask &validity, idx_t count) {
+    using Acc = std::conditional_t<std::is_integral_v<T>, int64_t, double>;
+    if (validity.AllValid()) {
+      count_ += static_cast<int64_t>(count);
+      switch (type_) {
+        case AggregationType::SumAggregate: {
+          Acc local{};
+          {
+#if defined(__clang__)
+#pragma clang fp reassociate(on)
+#endif
+            for (idx_t i = 0; i < count; i++) {
+              local += static_cast<Acc>(data[i]);
+            }
+          }
+          sum_ += static_cast<long double>(local);
+          break;
+        }
+        case AggregationType::MinAggregate: {
+          T m = data[0];
+          for (idx_t i = 1; i < count; i++) {
+            m = LaneMin(m, data[i]);
+          }
+          FoldMin(static_cast<long double>(m));
+          break;
+        }
+        case AggregationType::MaxAggregate: {
+          T m = data[0];
+          for (idx_t i = 1; i < count; i++) {
+            m = LaneMax(m, data[i]);
+          }
+          FoldMax(static_cast<long double>(m));
+          break;
+        }
+        default:
+          break;  // COUNT: the bump above is all it needs
+      }
+      return;
+    }
+
+    // NULLs present: skip invalid rows, count the valid ones (COUNT/SUM/MIN/MAX all count non-NULLs).
+    idx_t valid = 0;
+    switch (type_) {
+      case AggregationType::SumAggregate: {
+        Acc local{};
+        for (idx_t i = 0; i < count; i++) {
+          if (validity.RowIsValid(i)) {
+            local += static_cast<Acc>(data[i]);
+            valid++;
+          }
+        }
+        sum_ += static_cast<long double>(local);
+        break;
+      }
+      case AggregationType::MinAggregate:
+      case AggregationType::MaxAggregate: {
+        bool seen = false;
+        T m{};
+        const bool want_min = type_ == AggregationType::MinAggregate;
+        for (idx_t i = 0; i < count; i++) {
+          if (!validity.RowIsValid(i)) {
+            continue;
+          }
+          m = !seen ? data[i] : (want_min ? (data[i] < m ? data[i] : m) : (data[i] > m ? data[i] : m));
+          seen = true;
+          valid++;
+        }
+        if (seen) {
+          if (want_min) {
+            FoldMin(static_cast<long double>(m));
+          } else {
+            FoldMax(static_cast<long double>(m));
+          }
+        }
+        break;
+      }
+      default: {  // COUNT(x): just count the valid rows
+        for (idx_t i = 0; i < count; i++) {
+          valid += validity.RowIsValid(i) ? 1 : 0;
+        }
+        break;
+      }
+    }
+    count_ += static_cast<int64_t>(valid);
+  }
+
   AggregationType type_;
   int64_t count_{0};
   long double sum_{0};

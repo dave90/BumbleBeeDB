@@ -1,0 +1,45 @@
+# Negative coverage: the subquery feature ceiling. Derived tables (FROM subqueries) and
+# non-recursive CTEs are supported (positive coverage in slt/subqueries/); the forms below are
+# not. These pin the boundary so it moves deliberately as features land.
+
+statement ok
+CREATE TABLE t(a INT, b INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+
+# Scalar subquery in the SELECT list.
+statement error
+SELECT (SELECT MAX(a) FROM t) AS m FROM t;
+
+# Scalar subquery in a predicate.
+statement error
+SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t);
+
+# IN (subquery).
+statement error
+SELECT a FROM t WHERE a IN (SELECT a FROM t);
+
+# EXISTS (subquery).
+statement error
+SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t);
+
+# Correlated subquery (references the outer row).
+statement error
+SELECT a, (SELECT COUNT(*) FROM t AS u WHERE u.a < t.a) FROM t;
+
+# A CTE cannot reference an earlier CTE -- each CTE reads base tables only.
+statement error
+WITH a AS (SELECT a FROM t), b AS (SELECT a FROM a) SELECT * FROM b;
+
+# The same CTE cannot be referenced twice in one FROM (self-join of a CTE).
+statement error
+WITH s AS (SELECT a FROM t) SELECT COUNT(*) FROM s AS x JOIN s AS y ON x.a = y.a;
+
+# LATERAL derived tables are rejected in the binder.
+statement error
+SELECT x.a FROM t, LATERAL (SELECT a FROM t AS u WHERE u.a = t.a) AS x;
+
+# GROUP BY on an expression (rather than a bare column) is not supported.
+statement error
+SELECT g, COUNT(*) FROM (SELECT b / 20 AS g FROM t GROUP BY b / 20) AS s GROUP BY g;

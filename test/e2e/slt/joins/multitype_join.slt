@@ -1,0 +1,58 @@
+# Joins whose keys and payloads span several types: a BIGINT join key with DOUBLE/VARCHAR payload
+# columns on both sides, and a VARCHAR join key. The output carries INT, BIGINT, DOUBLE and VARCHAR
+# columns together.
+
+statement ok
+CREATE TABLE cust(cid BIGINT, cname VARCHAR, credit DOUBLE);
+
+statement ok
+INSERT INTO cust VALUES (100,'alice',50.5),(200,'bob',10.0),(300,'carol',0.25);
+
+statement ok
+CREATE TABLE ord(oid INT, cid BIGINT, amount DOUBLE);
+
+statement ok
+INSERT INTO ord VALUES (1,100,9.75),(2,100,4.25),(3,300,2.5);
+
+# INNER join on the BIGINT key; project a DOUBLE from each side.
+query rowsort
+SELECT c.cname, o.amount, c.credit FROM cust c JOIN ord o ON c.cid = o.cid;
+----
+'alice' 4.25 50.5
+'alice' 9.75 50.5
+'carol' 2.5 0.25
+
+# LEFT join keeps bob (no orders): his DOUBLE/INT right columns null-extend.
+query rowsort
+SELECT c.cname, o.amount FROM cust c LEFT JOIN ord o ON c.cid = o.cid;
+----
+'alice' 4.25
+'alice' 9.75
+'bob' NULL
+'carol' 2.5
+
+# Aggregate a DOUBLE payload across the join, grouped by a VARCHAR key.
+query
+SELECT c.cname, SUM(o.amount) AS spent FROM cust c JOIN ord o ON c.cid = o.cid GROUP BY c.cname ORDER BY c.cname;
+----
+'alice' 14
+'carol' 2.5
+
+# VARCHAR join key, one-to-many, with DOUBLE and BIGINT payloads.
+statement ok
+CREATE TABLE a(k VARCHAR, x DOUBLE);
+
+statement ok
+INSERT INTO a VALUES ('p',1.5),('q',2.5);
+
+statement ok
+CREATE TABLE b(k VARCHAR, y BIGINT);
+
+statement ok
+INSERT INTO b VALUES ('p',100),('p',200),('r',300);
+
+query rowsort
+SELECT a.k, a.x, b.y FROM a JOIN b ON a.k = b.k;
+----
+'p' 1.5 100
+'p' 1.5 200

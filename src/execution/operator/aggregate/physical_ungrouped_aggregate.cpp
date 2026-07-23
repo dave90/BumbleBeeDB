@@ -33,6 +33,8 @@ struct UngroupedLocalSinkState : LocalSinkState {
   std::unique_ptr<ExpressionExecutor> exec_;
   std::vector<LogicalType> arg_types_;
   std::vector<AggregateAccumulator> accums_;
+  /** Reused per Sink call: Execute() re-references its columns, so no per-chunk allocation. */
+  DataChunk args_;
 };
 
 struct UngroupedGlobalSourceState : GlobalSourceState {
@@ -61,19 +63,19 @@ auto PhysicalUngroupedAggregate::GetLocalSinkState(ExecutionContext & /*context*
   for (auto type : agg_types_) {
     ls->accums_.emplace_back(type);
   }
+  ls->args_.Initialize(ls->arg_types_);
   return ls;
 }
 
 auto PhysicalUngroupedAggregate::Sink(ExecutionContext & /*context*/, DataChunk &input, GlobalSinkState & /*gstate*/,
                                       LocalSinkState &lstate) const -> SinkResultType {
   auto &ls = static_cast<UngroupedLocalSinkState &>(lstate);
-  DataChunk args;
-  args.Initialize(ls.arg_types_);
-  ls.exec_->Execute(input, args);
-  for (idx_t i = 0; i < input.GetSize(); i++) {
-    for (idx_t a = 0; a < ls.accums_.size(); a++) {
-      ls.accums_[a].Update(args.GetValue(a, i));
-    }
+  ls.exec_->Execute(input, ls.args_);
+  // Column-at-a-time: each aggregate folds its whole argument vector in one pass over contiguous
+  // data (constants collapse to O(1)) instead of a row loop boxing every cell into a Value.
+  const idx_t count = input.GetSize();
+  for (idx_t a = 0; a < ls.accums_.size(); a++) {
+    ls.accums_[a].UpdateVector(ls.args_.data_[a], count);
   }
   return SinkResultType::NEED_MORE_INPUT;
 }

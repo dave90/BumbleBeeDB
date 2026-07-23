@@ -11,9 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 #include <memory>
+#include <string>
 
 #include "common/config.h"
 #include "gtest/gtest.h"
+#include "type/list_entry.h"
+#include "type/logical_type.h"
 #include "type/value.h"
 #include "type/vector/vector.h"
 #include "type/vector/operations/vector_operations.h"
@@ -359,6 +362,87 @@ TEST_F(CopyNullTest, MultiBatchAppendDoesNotLeakStaleInvalidsAcrossBatches) {
       EXPECT_EQ(target.RowIsValid(pos), expected_valid) << "batch " << b << " row " << i << " (pos " << pos << ")";
     }
   }
+}
+
+// A NULL row in a STRING source may carry an INDETERMINATE handle: a LEFT-join pad slot is
+// marked NULL but its string_t payload is never written, so its length/pointer are garbage.
+// Copy must mirror the NULL WITHOUT dereferencing the handle. Before the fix it copied the
+// payload unconditionally, read the bogus length, and asserted in the string heap.
+TEST_F(CopyNullTest, StringSourceNullRowWithGarbageHandleIsNotDereferenced) {
+  Vector source(PhysicalType::STRING, N);
+  Vector target(PhysicalType::STRING, N);
+  auto *sdata = FlatVector::GetData<string_t>(source);
+  for (idx_t i = 0; i < N; i++) {
+    sdata[i] = StringVector::AddString(source, ("row" + std::to_string(i)).c_str());
+  }
+  // Poison two rows with an oversized, non-inlinable handle (pointer indeterminate) and mark
+  // them NULL, exactly as LEFT-join padding leaves them.
+  sdata[3] = string_t(static_cast<uint32_t>(0xDEADBEEF));
+  sdata[42] = string_t(static_cast<uint32_t>(0x7FFFFFFF));
+  source.SetInvalid(3);
+  source.SetInvalid(42);
+
+  VectorOperations::Copy(source, target, N, 0, 0);  // must not crash
+
+  auto *tdata = FlatVector::GetData<string_t>(target);
+  for (idx_t i = 0; i < N; i++) {
+    if (i == 3 || i == 42) {
+      EXPECT_FALSE(target.RowIsValid(i)) << "row " << i << " should be NULL";
+    } else {
+      ASSERT_TRUE(target.RowIsValid(i)) << "row " << i;
+      EXPECT_EQ(tdata[i].GetString(), "row" + std::to_string(i));
+    }
+  }
+}
+
+// Same hazard through the selection overload: the poisoned NULL row is among the selected
+// source rows, so the copy walks over it and must not dereference its handle.
+TEST_F(CopyNullTest, StringSelectionOverloadSkipsGarbageNullHandle) {
+  Vector source(PhysicalType::STRING, N);
+  Vector target(PhysicalType::STRING, N);
+  auto *sdata = FlatVector::GetData<string_t>(source);
+  for (idx_t i = 0; i < N; i++) {
+    sdata[i] = StringVector::AddString(source, ("v" + std::to_string(i)).c_str());
+  }
+  sdata[5] = string_t(static_cast<uint32_t>(0xCAFEBABE));
+  source.SetInvalid(5);
+
+  SelectionVector sel(3);
+  sel.SetIndex(0, 4);
+  sel.SetIndex(1, 5);  // the poisoned NULL row
+  sel.SetIndex(2, 6);
+  VectorOperations::Copy(source, target, sel, 3, 0, 0);  // must not crash
+
+  auto *tdata = FlatVector::GetData<string_t>(target);
+  EXPECT_TRUE(target.RowIsValid(0));
+  EXPECT_EQ(tdata[0].GetString(), "v4");
+  EXPECT_FALSE(target.RowIsValid(1));  // from the poisoned source[5]
+  EXPECT_TRUE(target.RowIsValid(2));
+  EXPECT_EQ(tdata[2].GetString(), "v6");
+}
+
+// The analogous hazard for LIST: a NULL row's ListEntry (offset/length) is indeterminate, so
+// the copy must not append its element range from the source child.
+TEST_F(CopyNullTest, ListSourceNullRowWithGarbageEntryIsNotDereferenced) {
+  const auto list_type = LogicalType::List(LogicalTypeId::INTEGER);
+  Vector source(list_type, 4);
+  Vector target(list_type, 4);
+  source.SetValue(0, Value::List(list_type, {Value(1), Value(2), Value(3)}));
+  source.SetValue(1, Value::List(list_type, {Value(7)}));
+  source.SetValue(2, Value::List(list_type, {Value(8), Value(9)}));
+  // Poison row 3 with an absurd element range and mark it NULL.
+  auto *entries = FlatVector::GetData<ListEntry>(source);
+  entries[3] = ListEntry{static_cast<idx_t>(1) << 40, static_cast<idx_t>(1) << 40};
+  source.SetInvalid(3);
+
+  VectorOperations::Copy(source, target, 4, 0, 0);  // must not read the garbage range
+
+  EXPECT_TRUE(target.RowIsValid(0));
+  EXPECT_TRUE(target.RowIsValid(1));
+  EXPECT_TRUE(target.RowIsValid(2));
+  EXPECT_FALSE(target.RowIsValid(3));
+  EXPECT_TRUE(target.GetValue(0) == Value::List(list_type, {Value(1), Value(2), Value(3)}));
+  EXPECT_TRUE(target.GetValue(2) == Value::List(list_type, {Value(8), Value(9)}));
 }
 
 }  // namespace bumblebee

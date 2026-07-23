@@ -1,0 +1,38 @@
+# The scalar string functions upper()/lower() applied alongside INT, BIGINT and DOUBLE columns:
+# in the projection, in a WHERE predicate (against a DOUBLE filter), and as the filtered column
+# itself. (GROUP BY / ORDER BY on a function expression is not supported.)
+
+statement ok
+CREATE TABLE item(id INT, sku BIGINT, price DOUBLE, name VARCHAR);
+
+statement ok
+INSERT INTO item VALUES
+  (1,9001,9.75,'Apple'),(2,9002,4.25,'pear'),(3,9003,15.00,'KIWI'),(4,9004,2.25,'Mango');
+
+# upper() in the projection next to INT and DOUBLE columns.
+query
+SELECT id, upper(name) AS un, price FROM item ORDER BY id;
+----
+1 'APPLE' 9.75
+2 'PEAR' 4.25
+3 'KIWI' 15
+4 'MANGO' 2.25
+
+# lower() projected alongside a BIGINT column, filtered by a DOUBLE predicate.
+query
+SELECT id, lower(name) AS ln, sku FROM item WHERE price > 5 ORDER BY id;
+----
+1 'apple' 9001
+3 'kiwi' 9003
+
+# A function in the WHERE clause selects the matching INT/DOUBLE columns.
+query
+SELECT id, price FROM item WHERE upper(name) = 'KIWI';
+----
+3 15
+
+# Function on both sides: the predicate normalizes case, the projection re-cases.
+query
+SELECT upper(name) AS un FROM item WHERE lower(name) = 'mango';
+----
+'MANGO'
