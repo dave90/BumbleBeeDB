@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "binder/table_ref/bound_base_table_ref.h"
+#include "fmt/ranges.h"
 #include "catalog/schema.h"
 #include "common/config.h"
 #include "execution/expressions/abstract_expression.h"
@@ -74,8 +75,19 @@ class SeqScanPlanNode : public AbstractPlanNode {
   /** A predicate pushed down into the scan, or nullptr. */
   AbstractExpressionRef filter_predicate_;
 
+  /** Column indices some operator above actually reads (set by OptimizeColumnPruning; empty =
+   * all). The scan's output schema stays full-width — unlisted columns are simply never
+   * materialized and surface as constant-NULL vectors nothing reads. */
+  std::vector<idx_t> pruned_columns_;
+
  protected:
   auto PlanNodeToString() const -> std::string override {
+    if (!pruned_columns_.empty()) {
+      return filter_predicate_ != nullptr
+                 ? fmt::format("SeqScan {{ table={}, filter={}, columns=[{}] }}", table_name_, filter_predicate_,
+                               fmt::join(pruned_columns_, ", "))
+                 : fmt::format("SeqScan {{ table={}, columns=[{}] }}", table_name_, fmt::join(pruned_columns_, ", "));
+    }
     if (filter_predicate_ != nullptr) {
       return fmt::format("SeqScan {{ table={}, filter={} }}", table_name_, filter_predicate_);
     }

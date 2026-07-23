@@ -1,0 +1,77 @@
+# Column pruning: scans only materialize columns some operator reads. These queries exercise
+# pruned shapes (filters on non-projected columns, joins, aggregates, subqueries with unused
+# outputs) on heap AND external parquet tables — results must be identical to unpruned scans.
+# fixture: lineitem-arrow.parquet
+
+statement ok
+CREATE TABLE t(a INT, b VARCHAR, c DOUBLE, d BIGINT);
+
+statement ok
+INSERT INTO t VALUES (1,'x',1.5,10),(2,'y',2.5,20),(3,'z',3.5,30);
+
+query
+SELECT a FROM t WHERE d > 15 ORDER BY a;
+----
+2
+3
+
+query
+SELECT b FROM t WHERE a = 2;
+----
+'y'
+
+query
+SELECT COUNT(*) FROM t;
+----
+3
+
+query rowsort
+SELECT a, SUM(d) FROM t GROUP BY a;
+----
+1 10
+2 20
+3 30
+
+# Unused subquery output: its input column is pruned, the used one is exact.
+query
+SELECT x FROM (SELECT a AS x, c AS y FROM t) s WHERE x >= 2 ORDER BY x;
+----
+2
+3
+
+# External parquet table: pruned scans skip decoding entire columns.
+statement ok
+CREATE TABLE li () WITH (format='parquet', location='${TMPDIR}');
+
+query
+SELECT COUNT(*) FROM li WHERE l_orderkey = 1;
+----
+6
+
+query
+SELECT SUM(l_partkey) FROM li WHERE l_discount > 0.05;
+----
+281089
+
+query
+SELECT COUNT(*) FROM li;
+----
+6005
+
+# Join between a pruned heap side and a pruned external side.
+statement ok
+CREATE TABLE keys(k BIGINT, note VARCHAR);
+
+statement ok
+INSERT INTO keys VALUES (1,'one'), (2,'two');
+
+query
+SELECT COUNT(*) FROM li, keys WHERE li.l_orderkey = keys.k;
+----
+7
+
+query rowsort
+SELECT keys.note, COUNT(*) FROM li, keys WHERE li.l_orderkey = keys.k GROUP BY keys.note;
+----
+'one' 6
+'two' 1

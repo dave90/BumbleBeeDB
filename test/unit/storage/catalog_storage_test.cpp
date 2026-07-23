@@ -73,11 +73,15 @@ TEST(CatalogStorageTest, MetadataOnlyCatalogHasNoStorage) {
   EXPECT_EQ(catalog.GetTable("t"), info);
 }
 
-TEST(CatalogStorageTest, ParquetFormatNotImplemented) {
+TEST(CatalogStorageTest, ParquetFormatCreatesExternalStorage) {
   MemoryDiskManager dm(256);
   BufferPoolManager bpm(16, &dm);
   Catalog catalog(&bpm);
-  EXPECT_THROW(catalog.CreateTable("p", MakeSchema(), StorageFormat::PARQUET), NotImplementedException);
+  auto info = catalog.CreateTable("p", MakeSchema(), StorageFormat::PARQUET, {}, false, "/tmp/p_loc");
+  ASSERT_NE(info, NULL_TABLE_INFO);
+  ASSERT_NE(info->storage_, nullptr);
+  EXPECT_EQ(info->storage_->GetFormat(), StorageFormat::PARQUET);
+  EXPECT_EQ(static_cast<ParquetTable *>(info->storage_.get())->GetPath(), "/tmp/p_loc");
 }
 
 TEST(CatalogStorageTest, DropTableRemovesTableAndIndex) {

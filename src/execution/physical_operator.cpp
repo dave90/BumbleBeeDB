@@ -95,6 +95,12 @@ auto PhysicalOperator::GetName() const -> std::string {
       return "TableScan";
     case PhysicalOperatorType::PARQUET_SCAN:
       return "ParquetScan";
+    case PhysicalOperatorType::PARQUET_INSERT:
+      return "ParquetInsert";
+    case PhysicalOperatorType::PARQUET_UPDATE:
+      return "ParquetUpdate";
+    case PhysicalOperatorType::PARQUET_DELETE:
+      return "ParquetDelete";
     case PhysicalOperatorType::VALUES:
       return "Values";
     case PhysicalOperatorType::FILTER:

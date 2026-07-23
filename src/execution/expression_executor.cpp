@@ -194,7 +194,23 @@ auto ExpressionExecutor::Evaluate(const AbstractExpression &expr, DataChunk &inp
   // Cast: evaluate the child, then materialize it at the target type (no-op when already that type).
   if (const auto *cast = dynamic_cast<const CastExpression *>(&expr)) {
     Vector child = Evaluate(*cast->children_[0], input, count);
-    return CastIfNeeded(std::move(child), cast->GetReturnType().GetType(), count);
+    const auto target = cast->GetReturnType().GetType();
+    if (!cast->strict_) {
+      return CastIfNeeded(std::move(child), target, count);
+    }
+    // Explicit SQL CAST: run the try-cast kernels and ERROR on a failed row (the implicit path
+    // above silently NULLs it). Same-type casts still pass through, but the result always
+    // carries the TARGET logical type (e.g. BIGINT -> TIMESTAMP shares a physical int64).
+    if (child.GetLogicalType() == target) {
+      return child;
+    }
+    Vector out(target);
+    std::string error;
+    if (!VectorOperations::TryCast(child, out, count, &error)) {
+      throw ExecutionException(fmt::format("CAST to {} failed: {}", target.ToString(),
+                                           error.empty() ? "value out of range or malformed" : error));
+    }
+    return out;
   }
 
   // IS [NOT] NULL: a boolean read straight off the child's validity mask — the one predicate that

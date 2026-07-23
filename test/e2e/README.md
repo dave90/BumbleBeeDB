@@ -8,7 +8,8 @@ category subfolders under `slt/`.
 
 ```sh
 # Build the shell first.
-cmake --build build --target BumbleBee
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j
 
 # Run the whole corpus (defaults to build/BumbleBee).
 python -m pytest test/e2e -v
@@ -87,7 +88,32 @@ tests, not here.
 # config: morsel_pages=4 max_memory=65536 threads=1 prefer_external=true
 # seed: mock            # seed the demo tables before running (default: empty catalog)
 # require: small_vector # skip unless run against the small-vector build
+# require: durable      # skip unless run file-backed (BBDB_SLT_DURABLE=1)
+# fixture: t1.parquet   # copy these files from test/e2e/fixtures/ into the file's ${TMPDIR}
+# restart               # cleanly shut the shell down and relaunch it on the same database file
 ```
+
+Every file also gets a fresh scratch folder; the literal `${TMPDIR}` in any statement expands to
+its path (removed after the run). External parquet tables use this for their `location`, with
+`# fixture:` staging pre-existing data files into it first.
+
+## Storage modes
+
+By default every file runs against an in-memory instance (`--memory --no-seed`). Setting
+`BBDB_SLT_DURABLE=1` runs the SAME corpus file-backed instead (`--db ${TMPDIR}/bb.db`), so the
+on-disk storage layer — real file IO, page eviction to disk, catalog serialization at shutdown —
+is exercised without duplicating any test:
+
+```bash
+BBDB_SLT_DURABLE=1 python -m pytest test/e2e -v
+```
+
+Reopen semantics (data surviving a process restart) live in `persistence/`: those files use the
+`# restart` record, which cleanly shuts the shell down (clean shutdown is what serializes the
+catalog — there is no WAL) and relaunches it on the same database file. `# restart` is only
+meaningful file-backed, so such files must declare `# require: durable` (the parser enforces it);
+they are skipped in memory runs. Note that named sessions and open transactions reset with the
+process — the transaction files pin exactly that.
 
 `# config:` values are translated into `BumbleBee` CLI flags when the file's process launches. Only keys
 with an observable effect are accepted; an unknown key fails the test loudly (typo protection). Supported:

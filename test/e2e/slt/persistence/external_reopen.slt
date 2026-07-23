@@ -1,0 +1,53 @@
+# External parquet tables persist as catalog entries (schema + location, catalog record v4):
+# after a reopen the table reads its folder again and is still writable — and joins with
+# reloaded heap tables work.
+# require: durable
+# fixture: t1.parquet
+
+# Adopt the staged file (t1.parquet: i INT32 = 1, j = 'hello'), then append through SQL.
+statement ok
+CREATE TABLE ext (i INT, j VARCHAR) WITH (format='parquet', location='${TMPDIR}');
+
+statement ok
+INSERT INTO ext VALUES (2,'world');
+
+statement ok
+CREATE TABLE heap(k INT, note VARCHAR);
+
+statement ok
+INSERT INTO heap VALUES (2,'from heap');
+
+# restart
+
+# The external table reloaded with its schema and location; the data files were untouched.
+query rowsort
+SELECT i, j FROM ext;
+----
+1 'hello'
+2 'world'
+
+# Writes after reopen advance the manifest as usual.
+statement ok
+INSERT INTO ext VALUES (3,'again');
+
+query
+SELECT COUNT(*) FROM ext;
+----
+3
+
+statement ok
+DELETE FROM ext WHERE i = 1;
+
+# Reloaded heap x reloaded external join.
+query
+SELECT ext.j, heap.note FROM ext, heap WHERE ext.i = heap.k;
+----
+'world' 'from heap'
+
+# restart
+
+query rowsort
+SELECT i, j FROM ext;
+----
+2 'world'
+3 'again'

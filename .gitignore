@@ -45,3 +45,4 @@ dist/
 python/_version.py
 build-smallvec/
 build-tsan/
+build-debug/

@@ -18,10 +18,15 @@
 #include <unordered_set>
 #include <vector>
 
+#include <filesystem>
+
 #include "binder/binder.h"
 #include "binder/bound_statement.h"
 #include "binder/statement/create_statement.h"
 #include "binder/statement/drop_statement.h"
+#include "binder/statement/insert_statement.h"
+#include "binder/statement/update_statement.h"
+#include "binder/statement/delete_statement.h"
 #include "binder/statement/explain_statement.h"
 #include "binder/statement/transaction_statement.h"
 #include "catalog/column.h"
@@ -36,7 +41,12 @@
 #include "main/client_context.h"
 #include "optimizer/optimizer.h"
 #include "parallel/executor.h"
+#include "storage/parquet/external_schema.h"
+#include "storage/parquet/parquet_manifest.h"
+#include "storage/parquet/parquet_reader.h"
+#include "storage/parquet/parquet_table_ops.h"
 #include "planner/planner.h"
+#include "storage/table/parquet_table.h"
 #include "type/logical_type.h"
 
 namespace bumblebee {
@@ -270,6 +280,10 @@ physical plans instead of running it.
 }
 
 void BumbleBeeInstance::HandleCreateStatement(const CreateStatement &stmt, ResultWriter &writer) {
+  if (stmt.format_ == StorageFormat::PARQUET) {
+    HandleCreateExternalTable(stmt, writer);
+    return;
+  }
   Schema schema(stmt.columns_);
 
   // Resolve primary-key column names (the binder guaranteed they exist) to their indices.
@@ -295,6 +309,121 @@ void BumbleBeeInstance::HandleCreateStatement(const CreateStatement &stmt, Resul
     catalog_->CreateIndexForKey("_pk_" + stmt.table_, stmt.table_, pk_attrs);
   }
   WriteOneCell(fmt::format("Table created with id = {}", info->oid_), writer);
+}
+
+void BumbleBeeInstance::HandleCreateExternalTable(const CreateStatement &stmt, ResultWriter &writer) {
+  namespace fs = std::filesystem;
+  const auto &location = stmt.location_;
+
+  // The folder is created if missing (a brand-new empty external table).
+  std::error_code ec;
+  fs::create_directories(location, ec);
+  if (ec) {
+    throw Exception(fmt::format("cannot create external table location '{}': {}", location, ec.message()));
+  }
+
+  // Live files: the newest manifest when one exists, otherwise every *.parquet in the folder
+  // (adoption of a foreign directory).
+  auto existing_manifest = ParquetManifestIO::ReadLatest(location);
+  std::vector<ManifestEntry> entries;
+  if (existing_manifest.has_value()) {
+    entries = existing_manifest->entries_;
+  } else {
+    for (const auto &file : ParquetManifestIO::ListParquetFiles(location)) {
+      entries.push_back(ManifestEntry{file, 0});  // row counts filled from footers below
+    }
+  }
+
+  auto &allocator = GlobalParquetAllocator();
+  std::optional<Schema> schema;
+  if (!stmt.columns_.empty()) {
+    schema = Schema(stmt.columns_);
+  } else if (entries.empty()) {
+    throw Exception(fmt::format(
+        "cannot infer schema for external table '{}': location '{}' has no parquet files; declare the columns",
+        stmt.table_, location));
+  }
+
+  // Validate every live file against the schema (declared or inferred from the first file), and
+  // collect row counts for the manifest.
+  for (auto &entry : entries) {
+    auto file_path = (fs::path(location) / entry.file_name_).string();
+    ParquetReader reader(allocator, file_path);
+    if (!schema.has_value()) {
+      // Inference: the first file defines the schema.
+      std::vector<Column> columns;
+      columns.reserve(reader.names_.size());
+      for (idx_t i = 0; i < reader.names_.size(); i++) {
+        columns.push_back(Column::Make(reader.names_[i], reader.return_types_[i]));
+      }
+      schema = Schema(columns);
+    } else if (!ExternalSchemaMatches(*schema, reader.names_, reader.return_types_)) {
+      throw Exception(fmt::format(
+          "external table '{}': parquet file '{}' does not match the {} schema", stmt.table_, entry.file_name_,
+          stmt.columns_.empty() ? "inferred" : "declared"));
+    }
+    entry.row_count_ = reader.NumRows();
+  }
+
+  // Materialize the manifest if the folder had none: adopted files (or an empty list) become
+  // version 0. From here on, directory contents no longer matter — only the manifest does.
+  if (!existing_manifest.has_value()) {
+    ParquetManifest manifest;
+    manifest.version_ = 0;
+    manifest.entries_ = entries;
+    ParquetManifestIO::Write(location, manifest);
+  }
+
+  auto info = catalog_->CreateTable(stmt.table_, *schema, StorageFormat::PARQUET, {}, false, location);
+  if (info == NULL_TABLE_INFO) {
+    throw Exception(fmt::format("failed to create table {}: it already exists", stmt.table_));
+  }
+  WriteOneCell(fmt::format("External table created with id = {} at '{}'", info->oid_, location), writer);
+}
+
+void BumbleBeeInstance::CmdVacuumExternal(const std::string &table_name, ResultWriter &writer) {
+  namespace fs = std::filesystem;
+  auto info = catalog_->GetTable(table_name);
+  if (info == NULL_TABLE_INFO) {
+    throw Exception(fmt::format("no such table: {}", table_name));
+  }
+  auto *parquet = dynamic_cast<ParquetTable *>(info->storage_.get());
+  if (parquet == nullptr) {
+    throw Exception(fmt::format("\\vacuum only applies to external parquet tables ('{}' is row-format)",
+                                table_name));
+  }
+  const auto &dir = parquet->GetPath();
+
+  // The writer lock keeps the sweep from racing an in-flight rewrite (whose fresh part files are
+  // not yet referenced by any manifest and would look like orphans).
+  ExternalWriteGuard guard(*parquet, table_name);
+  auto manifest = ParquetManifestIO::ReadLatest(dir);
+  if (!manifest.has_value()) {
+    throw Exception(fmt::format("external table '{}': no manifest found at '{}'", table_name, dir));
+  }
+  std::unordered_set<std::string> live;
+  for (const auto &e : manifest->entries_) {
+    live.insert(e.file_name_);
+  }
+  const auto newest_manifest = fmt::format("{}{}", ParquetManifestIO::MANIFEST_PREFIX, manifest->version_);
+
+  size_t removed = 0;
+  for (const auto &entry : fs::directory_iterator(dir)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const auto name = entry.path().filename().string();
+    const bool orphan_part = name.ends_with(".parquet") && !live.contains(name);
+    const bool old_manifest =
+        name.starts_with(ParquetManifestIO::MANIFEST_PREFIX) && name != newest_manifest;
+    if (orphan_part || old_manifest) {
+      std::error_code ec;
+      if (fs::remove(entry.path(), ec)) {
+        removed++;
+      }
+    }
+  }
+  WriteOneCell(fmt::format("Vacuumed {} file(s) from '{}'", removed, dir), writer);
 }
 
 void BumbleBeeInstance::HandleDropStatement(const DropStatement &stmt, ResultWriter &writer) {
@@ -443,6 +572,29 @@ void BumbleBeeInstance::ExecuteStatement(const BoundStatement &statement, Result
   // here nor retried under a fresh transaction; a failure aborts the whole transaction instead.
   const bool autocommit = ActiveTxn() == nullptr;
 
+  // External parquet tables commit by manifest swap, outside MVCC: a ROLLBACK could never undo the
+  // file rewrite, so a write to one inside an explicit transaction is refused up front (mirroring
+  // how DDL is non-transactional) instead of silently ignoring the transaction.
+  if (!autocommit) {
+    const BoundBaseTableRef *target = nullptr;
+    if (statement.type_ == StatementType::INSERT_STATEMENT) {
+      target = dynamic_cast<const InsertStatement &>(statement).table_.get();
+    } else if (statement.type_ == StatementType::UPDATE_STATEMENT) {
+      target = dynamic_cast<const UpdateStatement &>(statement).table_.get();
+    } else if (statement.type_ == StatementType::DELETE_STATEMENT) {
+      target = dynamic_cast<const DeleteStatement &>(statement).table_.get();
+    }
+    if (target != nullptr) {
+      auto info = catalog_->GetTable(target->oid_);
+      if (info != NULL_TABLE_INFO && info->storage_ != nullptr &&
+          info->storage_->GetFormat() == StorageFormat::PARQUET) {
+        throw Exception(fmt::format(
+            "external table '{}' does not support transactional writes: run the statement outside BEGIN/COMMIT",
+            target->table_));
+      }
+    }
+  }
+
   // Detect → re-plan → retry: an in-memory breaker that overflows the budget throws MemoryLimitException
   // naming its logical node; in autocommit mode we abort, force just that node external, and re-run under
   // a fresh transaction. That retry needs a clean rollback, which we cannot do for a single statement of
@@ -539,6 +691,16 @@ auto BumbleBeeInstance::ExecuteSql(const std::string &sql, ResultWriter &writer)
     // demand. Nothing runs GC automatically yet, so this is how a timed-out transaction gets aborted.
     if (sql == "\\gc") {
       CmdGarbageCollect(writer);
+      return true;
+    }
+    // `\vacuum <table>` sweeps an external table's folder: files not referenced by the newest
+    // manifest (crash leftovers) and superseded manifest versions.
+    static const std::string kVacuum = "\\vacuum ";
+    if (sql.rfind(kVacuum, 0) == 0) {
+      auto name = sql.substr(kVacuum.size());
+      StringUtil::LTrim(&name);
+      StringUtil::RTrim(&name);
+      CmdVacuumExternal(name, writer);
       return true;
     }
     throw Exception(fmt::format("unsupported meta-command: {}", sql));

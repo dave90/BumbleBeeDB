@@ -85,7 +85,50 @@ auto SecondTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> 
   return static_cast<int64_t>(val.val.ival);
 }
 
+/**
+ * @brief Read the string payload of a `WITH (name = value)` storage option.
+ *
+ * @param elem The option's PGDefElem.
+ * @return The option value rendered as a string.
+ */
+auto DefElemString(duckdb_libpgquery::PGDefElem *elem) -> std::string {
+  if (elem->arg == nullptr) {
+    throw BinderException(fmt::format("storage option '{}' needs a value", elem->defname));
+  }
+  auto *val = reinterpret_cast<duckdb_libpgquery::PGValue *>(elem->arg);
+  switch (val->type) {
+    case duckdb_libpgquery::T_PGString:
+      return val->val.str;
+    case duckdb_libpgquery::T_PGInteger:
+      return std::to_string(val->val.ival);
+    default:
+      throw BinderException(fmt::format("storage option '{}' has an unsupported value type", elem->defname));
+  }
+}
+
 }  // namespace
+
+auto Binder::ResolveTypeName(duckdb_libpgquery::PGTypeName *type_name) -> LogicalType {
+  // The base type is the last part of the qualified type name: `pg_catalog.int4` -> `int4`.
+  const auto name = std::string(
+      reinterpret_cast<duckdb_libpgquery::PGValue *>(type_name->names->tail->data.ptr_value)->val.str);
+
+  auto base_type = LogicalType::FromString(name);
+  if (base_type.GetTypeId() == LogicalTypeId::UNKNOWN) {
+    throw NotImplementedException(fmt::format("unsupported type: {}", name));
+  }
+
+  if (base_type.GetTypeId() == LogicalTypeId::DOUBLE || base_type.GetTypeId() == LogicalTypeId::DECIMAL) {
+    // `DECIMAL(w, s)` and `NUMERIC(w, s)` both reach us as `numeric` with two typmods.
+    // Without typmods they stay a plain DOUBLE, as bare `DOUBLE` does.
+    auto width = SingleTypmod(type_name->typmods);
+    auto scale = SecondTypmod(type_name->typmods);
+    if (width.has_value() && scale.has_value()) {
+      base_type = LogicalType::Decimal(static_cast<int>(*width), static_cast<int>(*scale));
+    }
+  }
+  return base_type;
+}
 
 auto Binder::BindColumnDefinition(duckdb_libpgquery::PGColumnDef *cdef) -> Column {
   std::string colname;
@@ -97,30 +140,14 @@ auto Binder::BindColumnDefinition(duckdb_libpgquery::PGColumnDef *cdef) -> Colum
   }
 
   auto *type_name = cdef->typeName;
-  // The base type is the last part of the qualified type name: `pg_catalog.int4` -> `int4`.
-  const auto name = std::string(
-      reinterpret_cast<duckdb_libpgquery::PGValue *>(type_name->names->tail->data.ptr_value)->val.str);
-
-  auto base_type = LogicalType::FromString(name);
-  if (base_type.GetTypeId() == LogicalTypeId::UNKNOWN) {
-    throw NotImplementedException(fmt::format("unsupported type: {}", name));
-  }
+  auto base_type = ResolveTypeName(type_name);
 
   // The declared width of a VARCHAR. Only meaningful for a scalar STRING column;
   // an array of strings stores its payload out of line either way.
   uint32_t varchar_length = VARCHAR_DEFAULT_LENGTH;
-
   if (base_type.GetTypeId() == LogicalTypeId::STRING) {
     if (auto len = SingleTypmod(type_name->typmods); len.has_value() && *len > 0) {
       varchar_length = static_cast<uint32_t>(*len);
-    }
-  } else if (base_type.GetTypeId() == LogicalTypeId::DOUBLE || base_type.GetTypeId() == LogicalTypeId::DECIMAL) {
-    // `DECIMAL(w, s)` and `NUMERIC(w, s)` both reach us as `numeric` with two typmods.
-    // Without typmods they stay a plain DOUBLE, as bare `DOUBLE` does.
-    auto width = SingleTypmod(type_name->typmods);
-    auto scale = SecondTypmod(type_name->typmods);
-    if (width.has_value() && scale.has_value()) {
-      base_type = LogicalType::Decimal(static_cast<int>(*width), static_cast<int>(*scale));
     }
   }
 
@@ -153,7 +180,36 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
   auto columns = std::vector<Column>{};
   std::vector<std::string> pk;
 
-  for (auto c = pg_stmt->tableElts->head; c != nullptr; c = lnext(c)) {
+  // Storage options: `WITH (format = 'parquet', location = '/path')` declares an external table.
+  auto format = StorageFormat::ROW;
+  std::string location;
+  if (pg_stmt->options != nullptr) {
+    for (auto o = pg_stmt->options->head; o != nullptr; o = lnext(o)) {
+      auto *elem = reinterpret_cast<duckdb_libpgquery::PGDefElem *>(o->data.ptr_value);
+      const auto option = StringUtil::Lower(elem->defname);
+      if (option == "format") {
+        const auto value = StringUtil::Lower(DefElemString(elem));
+        if (value != "parquet") {
+          throw BinderException(fmt::format("unsupported storage format '{}' (supported: parquet)", value));
+        }
+        format = StorageFormat::PARQUET;
+      } else if (option == "location") {
+        location = DefElemString(elem);
+      } else {
+        throw BinderException(fmt::format("unsupported storage option '{}'", option));
+      }
+    }
+  }
+  const bool external = format == StorageFormat::PARQUET;
+  if (external && location.empty()) {
+    throw BinderException("external table needs a location: WITH (format='parquet', location='/path')");
+  }
+  if (!external && !location.empty()) {
+    throw BinderException("location is only valid together with format='parquet'");
+  }
+
+  // An empty column list is only legal for an external table (schema inferred from the files).
+  for (auto c = pg_stmt->tableElts != nullptr ? pg_stmt->tableElts->head : nullptr; c != nullptr; c = lnext(c)) {
     auto *node = reinterpret_cast<duckdb_libpgquery::PGNode *>(c->data.ptr_value);
     switch (node->type) {
       case duckdb_libpgquery::T_PGColumnDef: {
@@ -204,7 +260,7 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
     }
   }
 
-  if (columns.empty()) {
+  if (columns.empty() && !external) {
     throw BinderException("should have at least 1 column");
   }
 
@@ -215,6 +271,17 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
       throw BinderException(fmt::format("column name '{}' is reserved for the auto-generated primary key",
                                         AUTO_ID_COLUMN));
     }
+  }
+
+  // External tables live outside the heap/index machinery: no primary key, no auto `_id`.
+  if (external) {
+    if (!pk.empty()) {
+      throw BinderException("external tables do not support PRIMARY KEY");
+    }
+    auto stmt = std::make_unique<CreateStatement>(std::move(table), std::move(columns), std::vector<std::string>{});
+    stmt->format_ = StorageFormat::PARQUET;
+    stmt->location_ = std::move(location);
+    return stmt;
   }
 
   // No PRIMARY KEY declared: prepend an auto-increment `_id` BIGINT column and make it the primary key.

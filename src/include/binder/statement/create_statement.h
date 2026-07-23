@@ -17,6 +17,7 @@
 
 #include "binder/bound_statement.h"
 #include "catalog/column.h"
+#include "storage/table/table_storage.h"
 
 namespace bumblebee {
 
@@ -37,11 +38,18 @@ class CreateStatement : public BoundStatement {
   /** The table name. */
   std::string table_;
 
-  /** The column definitions. */
+  /** The column definitions. Empty only for an external table whose schema is inferred from the
+   * files at `location_`. */
   std::vector<Column> columns_;
 
   /** The names of the primary key columns, if any. */
   std::vector<std::string> primary_key_;
+
+  /** The storage backend: ROW (default) or PARQUET for `WITH (format='parquet', location=...)`. */
+  StorageFormat format_{StorageFormat::ROW};
+
+  /** The folder holding the external table's data files (PARQUET only). */
+  std::string location_;
 
   auto ToString() const -> std::string override;
 };

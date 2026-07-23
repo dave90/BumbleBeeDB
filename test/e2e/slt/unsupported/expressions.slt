@@ -34,15 +34,12 @@ SELECT a % b FROM t;
 statement error
 SELECT s || s FROM t;
 
-# CASE / COALESCE / CAST — not implemented in the binder.
+# CASE / COALESCE — not implemented in the binder. (CAST is supported; see functions/casts.slt.)
 statement error
 SELECT CASE WHEN a = 1 THEN 1 ELSE 0 END FROM t;
 
 statement error
 SELECT COALESCE(b, 0) FROM t;
-
-statement error
-SELECT CAST(a AS BIGINT) FROM t;
 
 # Unsupported aggregates / scalar functions.
 statement error

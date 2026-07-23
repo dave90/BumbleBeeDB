@@ -16,6 +16,7 @@
 #include <unordered_set>
 
 #include "execution/physical_operator.h"
+#include "storage/table/table_storage.h"
 #include "execution/plans/abstract_plan.h"
 #include "main/client_context.h"
 
@@ -35,6 +36,9 @@ class PhysicalPlanGenerator {
 
   /** @brief Lower `plan` and, if it is a SELECT, wrap it in a `PhysicalResultCollector`. */
   auto PlanRoot(const AbstractPlanNodeRef &plan) -> std::unique_ptr<PhysicalOperator>;
+
+  /** @return The storage format behind `oid` (dispatches scan/write lowering per backend). */
+  auto TableStorageFormat(table_oid_t oid) const -> StorageFormat;
 
   /** @brief Force these logical nodes to lower to their external, memory-bounded variants on retry. */
   void SetForceExternal(const std::unordered_set<const AbstractPlanNode *> &nodes) { force_external_ = nodes; }

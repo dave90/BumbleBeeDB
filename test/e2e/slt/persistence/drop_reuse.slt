@@ -1,0 +1,55 @@
+# DROP TABLE returns its pages to the free list, and that free list is PERSISTED: after a
+# reopen the pages are reused by new tables without corrupting anything.
+# require: durable
+
+statement ok
+CREATE TABLE big(v INT, pad VARCHAR);
+
+statement ok
+INSERT INTO big VALUES (1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'), (2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+
+statement ok
+CREATE TABLE keeper(k INT);
+
+statement ok
+INSERT INTO keeper VALUES (42);
+
+statement ok
+DROP TABLE big;
+
+# restart
+
+# The dropped table is gone from the reloaded catalog; the kept one is intact.
+statement error
+SELECT * FROM big;
+
+query
+SELECT k FROM keeper;
+----
+42
+
+# New tables allocate over the recycled pages and behave normally.
+statement ok
+CREATE TABLE fresh(v INT, s VARCHAR);
+
+statement ok
+INSERT INTO fresh VALUES (7,'seven'), (8,'eight');
+
+query rowsort
+SELECT v, s FROM fresh;
+----
+7 'seven'
+8 'eight'
+
+# restart
+
+query rowsort
+SELECT v, s FROM fresh;
+----
+7 'seven'
+8 'eight'
+
+query
+SELECT k FROM keeper;
+----
+42

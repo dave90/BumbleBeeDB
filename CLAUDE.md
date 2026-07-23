@@ -3,7 +3,9 @@
 BumbleBeeDB is a relational database written from scratch in C++20: a SQL front end
 (parser/binder/planner/optimizer on a vendored `libpg_query`), a vectorized push-based execution
 engine (DuckDB-style `DataChunk`/`Vector`), MVCC concurrency, and a persistent row-format storage
-engine with a buffer pool. Single process, embedded + interactive shell.
+engine with a buffer pool. External parquet tables (Databricks-style: a folder of parquet files
+governed by a manifest) can be queried and written alongside heap tables. Single process,
+embedded + interactive shell.
 
 ## Build
 
@@ -46,15 +48,22 @@ python3 -m pytest test/e2e/slt/order_limit/topn.slt # one file
 # the `# require: small_vector` files)
 cmake --build build-smallvec --target BumbleBee
 BBDB_SLT_BIN=build-smallvec/BumbleBee BBDB_SLT_SMALL_VECTOR=1 python3 -m pytest test/e2e -q
+
+# Same corpus file-backed (--db instead of --memory): real disk IO + catalog serialization,
+# and it unlocks the `# require: durable` files in persistence/ (reopen semantics via `# restart`)
+BBDB_SLT_DURABLE=1 python3 -m pytest test/e2e -q
 ```
 
-Run the **full matrix** (unit + e2e on both builds) before declaring a change done. Do **not** run
+Run the **full matrix** (unit + e2e on both builds + the durable e2e run) before declaring a
+change done. Do **not** run
 `unit_tests` from the smallvec build — unit tests assume `STANDARD_VECTOR_SIZE == 1024`.
 
 `.slt` format and the `# config:` directives (`max_memory`, `threads`, `prefer_external`,
 `morsel_pages`) are documented in `test/e2e/README.md`. Each `.slt` file gets a fresh in-memory
-instance (`--memory --no-seed`). Use `query rowsort` whenever the operator doesn't guarantee row
-order (hash join / hash aggregate / ties under parallelism).
+instance (`--memory --no-seed`) plus a per-file scratch folder: `${TMPDIR}` in SQL expands to it,
+and a `# fixture: <files>` directive copies files from `test/e2e/fixtures/` into it (how the
+external-table tests get parquet data). Use `query rowsort` whenever the operator doesn't
+guarantee row order (hash join / hash aggregate / ties under parallelism).
 
 ## Repository map
 
@@ -62,7 +71,7 @@ order (hash join / hash aggregate / ties under parallelism).
 src/include/            all public headers (mirrors src/), path-relative includes
 src/binder/             SQL AST -> bound statements (libpg_query parse tree in)
 src/planner/            bound statements -> AbstractPlanNode tree
-src/optimizer/          plan rewrites: filter pushdown, NLJ->HashJoin, SortLimitAsTopN, ...
+src/optimizer/          plan rewrites: filter pushdown, NLJ->HashJoin, SortLimitAsTopN, column pruning, ...
 src/execution/          physical operators, expression executor, physical plan generator
   operator/{scan,filter*,projection*,join,aggregate,order,persistent,helper*}/
   sort/                 shared sort machinery: TopNHeap, SortEntry + GatherSorted
@@ -70,6 +79,8 @@ src/execution/          physical operators, expression executor, physical plan g
 src/parallel/           Executor, Pipeline, PipelineExecutor, task scheduler (morsel-driven)
 src/type/               LogicalType, Value, BumbleString, Vector/DataChunk + kernels
 src/storage/            row-format TableHeap, pages, buffer pool (ARC), disk, B+tree, MVCC
+  parquet/              parquet reader/writer (ported from BumbleBee-datalog), manifest protocol,
+                        write ops (lock/part files), zone filter — external tables' storage layer
 src/concurrency/        Transaction, TransactionManager, watermark
 src/catalog/            catalog (persisted through the Database owner)
 src/main/main.cpp       the shell
@@ -97,6 +108,27 @@ runs pipelines with morsel-parallel tasks → a `PhysicalResultCollector` sinks 
   result collector clones + normalifies every batch it stores.
 - Write sinks (Insert/Update/Delete) apply chunks via MVCC (`storage/mvcc/mvcc.h`) directly in
   `Sink`; first-committer-wins on write-write conflicts (throws `ExecutionException`).
+- The optimizer's LAST pass is column pruning: every `SeqScan` learns which columns some ancestor
+  actually reads (`SeqScanPlanNode::pruned_columns_`, shown as `columns=[...]` in EXPLAIN).
+  Schemas stay full-width — pruned slots surface as constant-NULL vectors nothing reads — so no
+  column renumbering happens anywhere. The heap scan then skips the row->vector gather for pruned
+  columns; the parquet scan never decodes their pages. Join key expressions reference tuple 0 on
+  the left and tuple 1 on the right — any pass collecting column refs must scan both spaces.
+
+### External parquet tables (`src/storage/parquet/`, docs: plan_external.md)
+
+`CREATE TABLE t (...) WITH (format='parquet', location='/path')` — empty column list infers the
+schema from the folder's files. Commit protocol: the newest `_bbdb_manifest.N` lists the live
+part files; a writer takes the fail-fast writer lock (`ExternalWriteGuard`: in-process mutex +
+`_bbdb_lock` file — a concurrent writer THROWS, never waits), rewrites copy-on-write (only files
+containing touched rows; INSERT just appends a part file), and commits by atomically renaming
+manifest N+1. Scans read the newest manifest once (statement-level snapshot; no MVCC) and prune
+whole row groups against min/max statistics (`parquet_zone_filter`); morsel = (file, row group).
+RID = `(file_idx << 32) | row_in_file`. Writes are refused inside explicit transactions
+(non-transactional by design, like DDL); `\vacuum <table>` sweeps orphan files + old manifests.
+Page buffers come from `GlobalParquetAllocator()` (process-wide — scan-local reader state can
+outlive operator states). The reader/writer is ported from the BumbleBee-datalog repo
+(`~/git/BumbleBee`); port further pieces from there rather than writing fresh.
 
 ### The vector layer (`src/type/vector/`)
 
@@ -148,9 +180,12 @@ node and retries (`prefer_external` forces the out-of-core variants up front).
 
 ## SQL surface: supported & known limitations
 
-Supported: CREATE/DROP TABLE, INSERT/UPDATE/DELETE, SELECT with joins (inner/left), GROUP BY +
-aggregates, DISTINCT, ORDER BY (multi-key ASC/DESC), LIMIT, subqueries, BEGIN/COMMIT/ROLLBACK
-(autocommit otherwise), EXPLAIN (incl. physical), VARCHAR/INT/BIGINT/... types, NULLs.
+Supported: CREATE/DROP TABLE (incl. external parquet tables via `WITH (format='parquet',
+location=...)`), INSERT/UPDATE/DELETE, SELECT with joins (inner/left), GROUP BY + aggregates,
+DISTINCT, ORDER BY (multi-key ASC/DESC), LIMIT, subqueries, BEGIN/COMMIT/ROLLBACK (autocommit
+otherwise), EXPLAIN (incl. physical), VARCHAR/INT/BIGINT/DECIMAL/DATE/TIMESTAMP/... types, NULLs,
+`CAST(x AS T)` / `x::T` (strict: failed conversions error), string literals coercing into
+DATE/TIMESTAMP columns and predicates.
 
 Current limitations to keep in mind (several are pinned by tests in `test/e2e/slt/unsupported/`):
 
@@ -160,8 +195,11 @@ Current limitations to keep in mind (several are pinned by tests in `test/e2e/sl
   in DESC.
 - `ORDER BY x LIMIT n` always collapses to TopN (`OptimizeSortLimitAsTopN`) — bounded memory,
   never spills, no cost-based cutoff for huge n.
-- Every table has a primary key: a visible auto `BIGINT _id` (column 0, usable unquoted) is added
-  when none is declared; a B+tree index enforces PK uniqueness; index maintenance is INSERT-only.
+- Every HEAP table has a primary key: a visible auto `BIGINT _id` (column 0, usable unquoted) is
+  added when none is declared; a B+tree index enforces PK uniqueness; index maintenance is
+  INSERT-only. External parquet tables have NO `_id`, PK, or index, and their writes are
+  non-transactional (refused inside BEGIN...COMMIT; the manifest swap is the commit point, one
+  writer at a time — a concurrent writer fails immediately).
 - Durability is clean-shutdown only (no WAL yet). Persistent instances write `bb.db` (or `--db`).
 - Concurrency: MVCC snapshot isolation by default, Serializable via commit-time validation; no
   lock manager. Transaction timeout is GC-driven only (`\gc` / `--txn-timeout`); nothing runs GC
@@ -181,7 +219,8 @@ used by the e2e harness). `EXPLAIN <q>` / `EXPLAIN (physical) <q>` shows plans w
 `\session <name>` switches between named sessions (each can hold its own open transaction —
 how the e2e concurrent-transaction tests interleave deterministically); `\gc` drives
 `TransactionManager::GarbageCollection()`, the only transaction-timeout enforcer (nothing runs GC
-automatically).
+automatically); `\vacuum <table>` sweeps an external parquet table's folder (orphan part files,
+superseded manifests).
 
 ## Workflow expectations for changes
 

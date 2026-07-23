@@ -38,14 +38,17 @@ class CastExpression : public AbstractExpression {
    * @param child  The value to cast.
    * @param target The type to cast to (this expression's return type).
    */
-  CastExpression(AbstractExpressionRef child, LogicalType target)
-      : AbstractExpression({std::move(child)}, Column::Make("<cast>", target)) {}
+  CastExpression(AbstractExpressionRef child, LogicalType target, bool strict = false)
+      : AbstractExpression({std::move(child)}, Column::Make("<cast>", target)), strict_(strict) {}
 
   auto ToString() const -> std::string override {
     return fmt::format("cast({} as {})", GetChildAt(0), GetReturnType().GetType());
   }
 
   BUMBLEBEE_EXPR_CLONE_WITH_CHILDREN(CastExpression);
+
+  /** Explicit SQL CAST: a row that fails to convert raises an error instead of becoming NULL. */
+  bool strict_{false};
 };
 
 }  // namespace bumblebee

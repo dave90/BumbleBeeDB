@@ -15,6 +15,8 @@
 #include <cstring>
 
 #include "common/macros.h"
+#include "common/util/string_util.h"
+#include "type/date.h"
 #include "common/numeric_utils.h"
 
 namespace bumblebee {
@@ -116,6 +118,84 @@ void Timestamp::FormatTwoDigits(char *ptr, int32_t value) {
     ptr[0] = NumericHelper::DIGITS[index];
     ptr[1] = NumericHelper::DIGITS[index + 1];
   }
+}
+
+auto Timestamp::TryConvertTimestamp(const char *buf, idx_t len, timestamp_t &result) -> bool {
+  idx_t pos = 0;
+  date_t date = 0;
+  if (!Date::TryConvertDate(buf, len, pos, date, /*strict=*/false)) {
+    return false;
+  }
+  result = FromDatetime(date);
+
+  // Skip trailing whitespace; a bare date is midnight.
+  auto skip_spaces = [&]() {
+    while (pos < len && StringUtil::CharacterIsSpace(buf[pos])) {
+      pos++;
+    }
+  };
+  skip_spaces();
+  if (pos == len) {
+    return true;
+  }
+  // The date/time separator: one space (already consumed above) or a 'T'.
+  if (buf[pos] == 'T' || buf[pos] == 't') {
+    pos++;
+  }
+
+  auto parse_two_digits = [&](int32_t &out, int32_t max) -> bool {
+    if (pos + 1 >= len || !StringUtil::CharacterIsDigit(buf[pos]) || !StringUtil::CharacterIsDigit(buf[pos + 1])) {
+      return false;
+    }
+    out = (buf[pos] - '0') * 10 + (buf[pos + 1] - '0');
+    pos += 2;
+    return out <= max;
+  };
+
+  int32_t hour = 0;
+  int32_t minute = 0;
+  int32_t second = 0;
+  int64_t micros = 0;
+  if (!parse_two_digits(hour, 23)) {
+    return false;
+  }
+  if (pos >= len || buf[pos] != ':') {
+    return false;
+  }
+  pos++;
+  if (!parse_two_digits(minute, 59)) {
+    return false;
+  }
+  if (pos < len && buf[pos] == ':') {
+    pos++;
+    if (!parse_two_digits(second, 59)) {
+      return false;
+    }
+    if (pos < len && buf[pos] == '.') {
+      pos++;
+      // Up to six fractional digits, scaled to microseconds; further digits are truncated.
+      int64_t scale = 100000;
+      bool any = false;
+      while (pos < len && StringUtil::CharacterIsDigit(buf[pos])) {
+        if (scale > 0) {
+          micros += (buf[pos] - '0') * scale;
+          scale /= 10;
+        }
+        pos++;
+        any = true;
+      }
+      if (!any) {
+        return false;
+      }
+    }
+  }
+  skip_spaces();
+  if (pos != len) {
+    return false;
+  }
+
+  result = FromDatetime(date) + hour * MICROS_PER_HOUR + minute * MICROS_PER_MINUTE + second * MICROS_PER_SEC + micros;
+  return true;
 }
 
 }  // namespace bumblebee

@@ -22,6 +22,7 @@
 
 #include "catalog/schema_codec.h"
 #include "common/exception.h"
+#include "storage/table/parquet_table.h"
 #include "storage/table/table_heap.h"
 
 namespace bumblebee {
@@ -159,7 +160,10 @@ void Database::LoadCatalog(ByteReader &r) {
     }
     auto auto_id = r.GetU8() != 0;
     auto next_id = r.GetI64();
-    catalog_->LoadTable(oid, name, schema, first_page_id, last_page_id, format, pk_attrs, auto_id, next_id);
+    // v4: the external table's folder (empty for row-format tables).
+    auto location = r.GetString();
+    catalog_->LoadTable(oid, name, schema, first_page_id, last_page_id, format, pk_attrs, auto_id, next_id,
+                        location);
   }
 
   auto index_count = r.GetU32();
@@ -224,12 +228,18 @@ void Database::SerializeCatalog(ByteWriter &w) {
     w.PutU32(t->oid_);
     w.PutString(t->name_);
     SerializeSchema(w, t->schema_);
-    // Only row-format tables carry page ids; a metadata-only catalog would have no storage, but a
-    // Database always has a buffer pool so every table here is backed by a TableHeap.
-    auto *heap = static_cast<TableHeap *>(t->storage_.get());
-    w.PutI32(heap->GetFirstPageId());
-    w.PutI32(heap->GetLastPageId());
-    w.PutU8(static_cast<uint8_t>(t->storage_->GetFormat()));
+    // Only row-format tables carry page ids; an external parquet table has none (its data lives
+    // in files at its location, persisted below).
+    const auto format = t->storage_->GetFormat();
+    if (format == StorageFormat::ROW) {
+      auto *heap = static_cast<TableHeap *>(t->storage_.get());
+      w.PutI32(heap->GetFirstPageId());
+      w.PutI32(heap->GetLastPageId());
+    } else {
+      w.PutI32(INVALID_PAGE_ID);
+      w.PutI32(INVALID_PAGE_ID);
+    }
+    w.PutU8(static_cast<uint8_t>(format));
     // v3: primary-key column indices, the auto-_id flag, and the _id auto-increment high-water mark.
     w.PutU32(static_cast<uint32_t>(t->pk_attrs_.size()));
     for (auto a : t->pk_attrs_) {
@@ -237,6 +247,9 @@ void Database::SerializeCatalog(ByteWriter &w) {
     }
     w.PutU8(t->auto_id_ ? 1 : 0);
     w.PutI64(t->next_id_.load());
+    // v4: the external table's folder (empty for row-format tables).
+    const auto *parquet = format == StorageFormat::PARQUET ? static_cast<ParquetTable *>(t->storage_.get()) : nullptr;
+    w.PutString(parquet != nullptr ? parquet->GetPath() : "");
   }
 
   auto indexes = catalog_->GetIndexes();

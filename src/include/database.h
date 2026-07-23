@@ -73,7 +73,7 @@ class Database {
                          const std::vector<uint32_t> &key_attrs, const Schema &key_schema, page_id_t header_page_id);
 
   static constexpr uint32_t kMagic = 0xB0BDB001;    // identifies a catalog root page
-  static constexpr uint32_t kVersion = 3;           // catalog record format (v2: +last_commit_ts; v3: +PK/_id)
+  static constexpr uint32_t kVersion = 4;  // catalog record format (v2: +last_commit_ts; v3: +PK/_id; v4: +external location)
   static constexpr page_id_t kCatalogRootPage = 0;  // page 0 is reserved for the catalog chain head
   // Page 0 reserves magic(4) + total-length(4) + next(4); an overflow page reserves only next(4).
   static constexpr size_t kRootPayload = PAGE_SIZE - 12;

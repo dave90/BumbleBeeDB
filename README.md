@@ -4,7 +4,9 @@ BumbleBeeDB is a relational database written from scratch in C++20. It has a
 vectorized execution model (DuckDB-style `DataChunk` / `Vector` types), a SQL
 front end (parser, binder, planner, optimizer) built on DuckDB's fork of
 `libpg_query`, MVCC-based concurrency control, and a persistent on-disk storage
-engine.
+engine. Besides its native row-format tables it supports **external parquet
+tables** (Databricks-style): a folder of parquet files queried and written
+through plain SQL.
 
 ## Requirements
 
@@ -13,7 +15,8 @@ engine.
 - On Linux: `libuuid` development headers (`uuid-dev`). Not needed on macOS.
 
 Third-party dependencies (`fmt`, GoogleTest) are fetched automatically at
-configure time via CMake `FetchContent`; `libpg_query` is vendored in-tree under
+configure time via CMake `FetchContent`; `libpg_query` and the parquet stack
+(`thrift`, `snappy`, `zstd`, `miniz`, `utf8proc`) are vendored in-tree under
 `third_party/`.
 
 ## Building
@@ -79,6 +82,9 @@ Useful meta-commands (`\help` lists them all):
   aborts any transaction open longer than the timeout. GC is the *only* timeout
   driver today (nothing runs it in the background), which keeps timeout
   behavior deterministic and testable.
+- `\vacuum <table>` — sweep an external parquet table's folder: removes part
+  files no manifest references (leftovers of a crashed rewrite) and superseded
+  manifest versions.
 
 Examples:
 
@@ -89,6 +95,39 @@ Examples:
 # Open a specific database file
 ./build/BumbleBee --db /tmp/my.db
 ```
+
+## External parquet tables
+
+A table can live outside the database file, as parquet files in a folder you
+point it at:
+
+```sql
+-- Declare the schema yourself (must match any files already in the folder) ...
+CREATE TABLE events (id BIGINT, payload VARCHAR)
+WITH (format = 'parquet', location = '/data/events');
+
+-- ... or let an empty column list infer it from the files found there.
+CREATE TABLE events () WITH (format = 'parquet', location = '/data/events');
+```
+
+External tables are queried like any other table — joins with heap tables,
+aggregates, filters (with whole parquet row groups skipped via their min/max
+statistics when a predicate provably excludes them, and unread columns never
+decoded at all). They are writable too, with **non-transactional, copy-on-write**
+semantics:
+
+- `INSERT` appends a new part file; `UPDATE` / `DELETE` rewrite only the part
+  files that contain matched rows. Deleting every row leaves a valid empty
+  table.
+- The commit point is an atomic swap of a manifest file (`_bbdb_manifest.N`)
+  listing the live part files; readers always see either the old or the new
+  state, and a crashed half-finished rewrite is invisible.
+- One writer at a time per table: a second concurrent writer fails immediately
+  (`concurrent modification of external table ...`) instead of waiting.
+- Writes are refused inside `BEGIN ... COMMIT` — a `ROLLBACK` could never undo a
+  file rewrite. Reads inside transactions are fine (statement-level snapshots).
+- `DROP TABLE` removes only the catalog entry; the data files are yours and are
+  never deleted.
 
 ## Testing
 
@@ -138,6 +177,15 @@ compile-time constant) and point the harness at it:
 cmake -S . -B build-smallvec -DCMAKE_BUILD_TYPE=Release -DBBDB_VECTOR_SIZE=4
 cmake --build build-smallvec --target BumbleBee
 BBDB_SLT_BIN=build-smallvec/BumbleBee BBDB_SLT_SMALL_VECTOR=1 python -m pytest test/e2e -v
+```
+
+By default the corpus runs against in-memory instances. Run the same files
+**file-backed** — exercising real disk IO and catalog persistence, plus the
+`persistence/` tests that restart the shell mid-file to assert data survives a
+reopen — with:
+
+```bash
+BBDB_SLT_DURABLE=1 python -m pytest test/e2e -v
 ```
 
 Per-file `# config:` directives lower runtime knobs (morsel size, memory budget,

@@ -101,8 +101,9 @@ TEST(InstanceTest, TheWholePipelineOnOneQuery) {
   EXPECT_NE(out.find("HashJoin"), std::string::npos);
   EXPECT_EQ(out.find("NestedLoopJoin"), std::string::npos);
   // ...because the single-table conjunct was pushed into t1's scan first. v1 is column 1 (column 0 is
-  // the auto "_id" primary key), so the pushed filter references #0.1.
-  EXPECT_NE(out.find("SeqScan { table=t1, filter=(#0.1>10) }"), std::string::npos);
+  // the auto "_id" primary key), so the pushed filter references #0.1. Column pruning then noted
+  // which columns the query actually reads (v1 for the filter/output and v2 for the join key).
+  EXPECT_NE(out.find("SeqScan { table=t1, filter=(#0.1>10), columns=[1, 2] }"), std::string::npos);
   // And the array column survives the whole pipeline.
   EXPECT_NE(out.find("t1.tags:INTEGER[]"), std::string::npos);
 }

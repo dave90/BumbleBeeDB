@@ -36,6 +36,7 @@
 #include "binder/expressions/bound_constant.h"
 #include "binder/expressions/bound_func_call.h"
 #include "binder/expressions/bound_star.h"
+#include "binder/expressions/bound_type_cast.h"
 #include "binder/expressions/bound_unary_op.h"
 #include "binder/statement/explain_statement.h"
 #include "binder/statement/select_statement.h"
@@ -796,6 +797,8 @@ auto Binder::BindExpression(duckdb_libpgquery::PGNode *node) -> std::unique_ptr<
       return BindAExpr(reinterpret_cast<duckdb_libpgquery::PGAExpr *>(node));
     case duckdb_libpgquery::T_PGBoolExpr:
       return BindBoolExpr(reinterpret_cast<duckdb_libpgquery::PGBoolExpr *>(node));
+    case duckdb_libpgquery::T_PGTypeCast:
+      return BindTypeCast(reinterpret_cast<duckdb_libpgquery::PGTypeCast *>(node));
     case duckdb_libpgquery::T_PGNullTest: {
       // `x IS NULL` / `x IS NOT NULL`: a unary predicate over the argument's validity.
       auto *null_test = reinterpret_cast<duckdb_libpgquery::PGNullTest *>(node);
@@ -807,6 +810,12 @@ auto Binder::BindExpression(duckdb_libpgquery::PGNode *node) -> std::unique_ptr<
       break;
   }
   throw NotImplementedException(fmt::format("expr of type {} not implemented", Binder::NodeTagToString(node->type)));
+}
+
+auto Binder::BindTypeCast(duckdb_libpgquery::PGTypeCast *root) -> std::unique_ptr<BoundExpression> {
+  auto child = BindExpression(root->arg);
+  auto target = ResolveTypeName(root->typeName);
+  return std::make_unique<BoundTypeCast>(std::move(child), std::move(target));
 }
 
 auto Binder::BindLimitCount(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<BoundExpression> {

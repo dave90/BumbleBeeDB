@@ -1,0 +1,55 @@
+# External-table DDL: WITH-option validation, declared-schema checks, inference, and DROP
+# keeping the data files.
+# fixture: t1.parquet
+
+# format must be parquet.
+statement error
+CREATE TABLE t (a INT) WITH (format='csv', location='${TMPDIR}');
+
+# location is required with format.
+statement error
+CREATE TABLE t (a INT) WITH (format='parquet');
+
+# location alone is meaningless.
+statement error
+CREATE TABLE t (a INT) WITH (location='${TMPDIR}');
+
+# External tables have no PRIMARY KEY (and no auto _id).
+statement error
+CREATE TABLE t (a INT PRIMARY KEY) WITH (format='parquet', location='${TMPDIR}');
+
+# An empty column list needs the external format.
+statement error
+CREATE TABLE t ();
+
+# Declared columns must match the files (t1.parquet is i INT32, j STRING).
+statement error
+CREATE TABLE t (i BIGINT, j VARCHAR) WITH (format='parquet', location='${TMPDIR}');
+
+statement error
+CREATE TABLE t (i INT) WITH (format='parquet', location='${TMPDIR}');
+
+# A matching declaration works.
+statement ok
+CREATE TABLE t (i INT, j VARCHAR) WITH (format='parquet', location='${TMPDIR}');
+
+query
+SELECT i, j FROM t;
+----
+1 'hello'
+
+# No auto _id column on external tables.
+statement error
+SELECT _id FROM t;
+
+statement ok
+DROP TABLE t;
+
+# Re-adoption after drop: the data files were kept, so inference works again.
+statement ok
+CREATE TABLE t2 () WITH (format='parquet', location='${TMPDIR}');
+
+query
+SELECT COUNT(*) FROM t2;
+----
+1

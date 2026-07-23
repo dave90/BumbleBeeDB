@@ -13,47 +13,67 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "catalog/schema.h"
 #include "common/exception.h"
 #include "storage/table/table_storage.h"
 
 namespace bumblebee {
 
 /**
- * @brief DEFERRED: a read-only columnar table backed by a Parquet file.
+ * @brief External table backed by parquet files in a user-provided folder.
  *
- * A placeholder proving `TableStorage` is extensible to a columnar backend. When implemented, its
- * `MakeScan` will read row groups natively into `DataChunk`s (a `TableScan::Next` that fills a chunk
- * without any row↔vector bridge); mutation is unsupported. Not implemented this milestone.
+ * Data files are governed by the manifest protocol (see parquet/parquet_manifest.h): a scan reads
+ * the newest manifest once (statement-level snapshot); writers rewrite part files copy-on-write
+ * and commit by an atomic manifest swap. There is no MVCC and no transactionality — the manifest
+ * swap is the commit point, and one writer at a time is enforced by `write_lock_` (a concurrent
+ * writer fails immediately rather than waiting).
+ *
+ * The rid-oriented TableStorage mutation interface does not apply to copy-on-write storage; the
+ * external write operators use the manifest/writer API directly, so those methods throw.
  */
 class ParquetTable : public TableStorage {
  public:
-  explicit ParquetTable(std::string path) : path_(std::move(path)) {}
+  ParquetTable(std::string path, std::shared_ptr<Schema> schema)
+      : path_(std::move(path)), schema_(std::move(schema)) {}
 
   auto GetFormat() const -> StorageFormat override { return StorageFormat::PARQUET; }
+
+  /** @return The folder holding the table's data files. */
+  auto GetPath() const -> const std::string & { return path_; }
+
+  /** @return The table schema. */
+  auto GetSchema() const -> const std::shared_ptr<Schema> & { return schema_; }
+
+  /** @brief Fail-fast writer lock: at most one writer per table, losers throw immediately. */
+  auto TryLockForWrite() -> bool { return write_lock_.try_lock(); }
+  void UnlockWrite() { write_lock_.unlock(); }
 
   auto MakeScan(const std::vector<idx_t> & /*projection*/ = {}) -> std::unique_ptr<TableScan> override {
     throw NotImplementedException("ParquetTable scan is not implemented yet");
   }
 
   void Append(DataChunk & /*chunk*/, Vector & /*out_rids*/) override {
-    throw NotImplementedException("ParquetTable is read-only");
+    throw NotImplementedException("external parquet tables are written through the manifest protocol");
   }
   void Update(Vector & /*row_ids*/, DataChunk & /*chunk*/) override {
-    throw NotImplementedException("ParquetTable is read-only");
+    throw NotImplementedException("external parquet tables are written through the manifest protocol");
   }
   void Delete(Vector & /*row_ids*/, idx_t /*count*/) override {
-    throw NotImplementedException("ParquetTable is read-only");
+    throw NotImplementedException("external parquet tables are written through the manifest protocol");
   }
   void Fetch(Vector & /*row_ids*/, idx_t /*count*/, DataChunk & /*out*/) override {
-    throw NotImplementedException("ParquetTable is not implemented yet");
+    throw NotImplementedException("ParquetTable fetch is not implemented yet");
   }
 
  private:
   std::string path_;
+  std::shared_ptr<Schema> schema_;
+  std::mutex write_lock_;
 };
 
 }  // namespace bumblebee

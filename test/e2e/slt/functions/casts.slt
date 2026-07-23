@@ -1,0 +1,95 @@
+# Explicit CAST (CAST(x AS T) and x::T) plus the string -> DATE/TIMESTAMP literal coercions
+# CAST unlocks on INSERT and in predicates.
+
+query
+SELECT CAST('42' AS INT);
+----
+42
+
+query
+SELECT CAST(5 AS VARCHAR);
+----
+'5'
+
+query
+SELECT CAST(1 AS BIGINT) + 1;
+----
+2
+
+# The :: shorthand parses to the same cast.
+query
+SELECT '7'::BIGINT;
+----
+7
+
+query
+SELECT CAST('2024-03-15' AS DATE);
+----
+2024-03-15
+
+query
+SELECT CAST('2024-03-15 10:30:00' AS TIMESTAMP);
+----
+2024-03-15 10:30:00
+
+query
+SELECT CAST(1.234 AS DECIMAL(10,2));
+----
+1.23
+
+# CAST over an aggregate.
+statement ok
+CREATE TABLE nums(v INT);
+
+statement ok
+INSERT INTO nums VALUES (1),(2),(3);
+
+query
+SELECT CAST(SUM(v) AS VARCHAR) FROM nums;
+----
+'6'
+
+# An explicit CAST that cannot convert raises an error (implicit coercions would NULL).
+statement error
+SELECT CAST('not a number' AS INT);
+
+statement error
+SELECT CAST('not a date' AS DATE);
+
+# Timestamp literals: coercion on INSERT, casts and string literals in predicates.
+statement ok
+CREATE TABLE ev(ts TIMESTAMP, d DATE);
+
+statement ok
+INSERT INTO ev VALUES ('2024-01-01 08:00:00', '2024-01-01'), ('2024-06-15 12:30:45', '2024-06-15');
+
+query rowsort
+SELECT ts, d FROM ev;
+----
+2024-01-01 08:00:00 2024-01-01
+2024-06-15 12:30:45 2024-06-15
+
+query
+SELECT COUNT(*) FROM ev WHERE ts > CAST('2024-03-01' AS TIMESTAMP);
+----
+1
+
+query
+SELECT d FROM ev WHERE ts = CAST('2024-01-01 08:00:00' AS TIMESTAMP);
+----
+2024-01-01
+
+# A malformed literal is rejected at execution, not stored as NULL.
+statement error
+INSERT INTO ev VALUES ('yesterday-ish', '2024-01-01');
+
+query
+SELECT COUNT(*) FROM ev;
+----
+2
+
+# Casting between calendar types.
+query
+SELECT CAST(CAST('2024-03-15' AS DATE) AS VARCHAR);
+----
+'2024-03-15'

@@ -20,6 +20,8 @@
 #include "type/null_value.h"
 #include "type/vector/operations/unary_execution.h"
 #include "type/vector/operator/cast_operators.h"
+#include "type/date.h"
+#include "type/timestamp.h"
 #include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
@@ -221,8 +223,45 @@ auto NumericCastSwitch(Vector &source, Vector &result, idx_t count, std::string 
   }
 }
 
+/** @brief Parse a STRING row into a date_t ("YYYY-MM-DD", whole input must parse). */
+struct TryStringToDateCast {
+  template <class INPUT_TYPE, class RESULT_TYPE>
+  static inline auto Operation(INPUT_TYPE &val, RESULT_TYPE &result) -> bool {
+    idx_t pos = 0;
+    date_t parsed = 0;
+    if (!Date::TryConvertDate(val.GetDataUnsafe(), val.Size(), pos, parsed, /*strict=*/true)) {
+      return false;
+    }
+    result = parsed;
+    return true;
+  }
+};
+
+/** @brief Parse a STRING row into a timestamp_t ("YYYY-MM-DD[ HH:MM:SS[.ffffff]]"). */
+struct TryStringToTimestampCast {
+  template <class INPUT_TYPE, class RESULT_TYPE>
+  static inline auto Operation(INPUT_TYPE &val, RESULT_TYPE &result) -> bool {
+    timestamp_t parsed = 0;
+    if (!Timestamp::TryConvertTimestamp(val.GetDataUnsafe(), val.Size(), parsed)) {
+      return false;
+    }
+    result = parsed;
+    return true;
+  }
+};
+
 /** @brief Parse a STRING source into whatever `result` is typed as. */
 auto StringCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+  // DATE and TIMESTAMP share physical types with plain integers; dispatch on the LOGICAL type
+  // first so "2024-01-01" parses as a calendar date instead of failing as an integer literal.
+  switch (result.GetLogicalTypeId()) {
+    case LogicalTypeId::DATE:
+      return VectorCastLoop<string_t, int32_t, TryStringToDateCast>(source, result, count, error_message);
+    case LogicalTypeId::TIMESTAMP:
+      return VectorCastLoop<string_t, int64_t, TryStringToTimestampCast>(source, result, count, error_message);
+    default:
+      break;
+  }
   switch (result.GetType()) {
     case PhysicalType::TINYINT:
       return VectorCastLoop<string_t, int8_t, TryIntegerCast>(source, result, count, error_message);

@@ -12,6 +12,9 @@
 
 #include "type/value.h"
 
+#include "type/vector/operations/vector_operations.h"
+#include "type/vector/vector.h"
+
 #include <sstream>
 
 #include "common/macros.h"
@@ -70,6 +73,17 @@ auto Value::ToString() const -> std::string {
   switch (type_.GetTypeId()) {
     case LogicalTypeId::BOOLEAN:
       return value_.utinyint_ != 0 ? "true" : "false";
+    case LogicalTypeId::DATE:
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::DECIMAL: {
+      // Calendar and decimal rendering lives in the vector cast kernels; a 1-row round trip
+      // through them keeps this boundary function consistent with chunk-level output.
+      Vector src(type_, 1);
+      src.SetValue(0, *this);
+      Vector dst(LogicalType(LogicalTypeId::STRING), 1);
+      VectorOperations::Cast(src, dst, 1);
+      return dst.GetValue(0).GetString();
+    }
     case LogicalTypeId::STRING:
       return fmt::format("'{}'", string_value_);
     case LogicalTypeId::LIST:
@@ -131,11 +145,37 @@ auto Value::CastAs(const LogicalType &type) const -> Value {
     case LogicalTypeId::SMALLINT:
       return Value{GetAs<int16_t>()};
     case LogicalTypeId::INTEGER:
-    case LogicalTypeId::DATE:
       return Value{GetAs<int32_t>()};
     case LogicalTypeId::BIGINT:
-    case LogicalTypeId::TIMESTAMP:
       return Value{GetAs<int64_t>()};
+    case LogicalTypeId::DATE: {
+      // Same physical value, stamped with the calendar type so rendering and re-wrapping keep it.
+      auto v = Value{GetAs<int32_t>()};
+      v.type_ = type;
+      return v;
+    }
+    case LogicalTypeId::TIMESTAMP: {
+      auto v = Value{GetAs<int64_t>()};
+      v.type_ = type;
+      return v;
+    }
+    case LogicalTypeId::DECIMAL: {
+      // The physical payload is already scaled; only the logical identity changes here.
+      Value v;
+      switch (type.GetPhysicalType()) {
+        case PhysicalType::SMALLINT:
+          v = Value{GetAs<int16_t>()};
+          break;
+        case PhysicalType::INTEGER:
+          v = Value{GetAs<int32_t>()};
+          break;
+        default:
+          v = Value{GetAs<int64_t>()};
+          break;
+      }
+      v.type_ = type;
+      return v;
+    }
     case LogicalTypeId::UTINYINT:
       return Value{GetAs<uint8_t>()};
     case LogicalTypeId::USMALLINT:

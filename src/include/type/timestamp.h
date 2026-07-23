@@ -77,6 +77,16 @@ class Timestamp {
   /** @return Midnight of `date`, as a timestamp. */
   static auto FromDatetime(date_t date) -> timestamp_t;
 
+  /**
+   * @brief Parse "YYYY-MM-DD[ HH:MM[:SS[.ffffff]]]" (a 'T' separator also works).
+   *
+   * @param buf The characters to parse.
+   * @param len The number of characters.
+   * @param result Receives the parsed timestamp.
+   * @return True when the whole input parsed.
+   */
+  static auto TryConvertTimestamp(const char *buf, idx_t len, timestamp_t &result) -> bool;
+
   /** @brief Break the microseconds-since-midnight `dtime` into hour, minute, second, micros. */
   static void Convert(int64_t dtime, int32_t &hour, int32_t &min, int32_t &sec, int32_t &micros);
 

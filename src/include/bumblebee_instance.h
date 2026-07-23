@@ -217,6 +217,8 @@ class BumbleBeeInstance {
 
  private:
   void HandleCreateStatement(const CreateStatement &stmt, ResultWriter &writer);
+  void HandleCreateExternalTable(const CreateStatement &stmt, ResultWriter &writer);
+  void CmdVacuumExternal(const std::string &table_name, ResultWriter &writer);
   void HandleDropStatement(const DropStatement &stmt, ResultWriter &writer);
   void HandleTransactionStatement(const TransactionStatement &stmt, ResultWriter &writer);
   void HandleExplainStatement(const ExplainStatement &stmt, ResultWriter &writer);

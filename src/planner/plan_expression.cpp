@@ -19,6 +19,7 @@
 #include "binder/bound_expression.h"
 #include "binder/expressions/bound_agg_call.h"
 #include "binder/expressions/bound_alias.h"
+#include "binder/expressions/bound_type_cast.h"
 #include "binder/expressions/bound_binary_op.h"
 #include "binder/expressions/bound_column_ref.h"
 #include "binder/expressions/bound_constant.h"
@@ -26,6 +27,7 @@
 #include "binder/expressions/bound_unary_op.h"
 #include "common/exception.h"
 #include "common/macros.h"
+#include "execution/expressions/cast_expression.h"
 #include "execution/expressions/abstract_expression.h"
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/constant_value_expression.h"
@@ -140,6 +142,11 @@ void Planner::AddAggCallToContext(BoundExpression &expr) {
       AddAggCallToContext(*alias_expr.child_);
       return;
     }
+    case ExpressionType::TYPE_CAST: {
+      auto &cast_expr = dynamic_cast<BoundTypeCast &>(expr);
+      AddAggCallToContext(*cast_expr.child_);
+      return;
+    }
     default:
       break;
   }
@@ -170,6 +177,13 @@ auto Planner::PlanExpression(const BoundExpression &expr, const std::vector<Abst
       const auto &alias_expr = dynamic_cast<const BoundAlias &>(expr);
       auto [_, child_expr] = PlanExpression(*alias_expr.child_, children);
       return std::make_tuple(alias_expr.alias_, std::move(child_expr));
+    }
+    case ExpressionType::TYPE_CAST: {
+      const auto &cast_expr = dynamic_cast<const BoundTypeCast &>(expr);
+      auto [_, child_expr] = PlanExpression(*cast_expr.child_, children);
+      return std::make_tuple(UNNAMED_COLUMN,
+                             std::make_shared<CastExpression>(std::move(child_expr), cast_expr.target_,
+                                                              /*strict=*/true));
     }
     case ExpressionType::UNARY_OP: {
       const auto &unary_expr = dynamic_cast<const BoundUnaryOp &>(expr);

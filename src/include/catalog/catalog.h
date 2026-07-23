@@ -27,6 +27,7 @@
 #include "storage/index/b_plus_tree_index.h"
 #include "storage/index/index.h"
 #include "storage/row/row_operations.h"
+#include "storage/table/parquet_table.h"
 #include "storage/table/table_heap.h"
 #include "storage/table/table_storage.h"
 #include "type/value.h"
@@ -112,7 +113,8 @@ class Catalog {
    *         if a table with that name already exists.
    */
   auto CreateTable(const std::string &table_name, const Schema &schema, StorageFormat format = StorageFormat::ROW,
-                   const std::vector<uint32_t> &pk_attrs = {}, bool auto_id = false)
+                   const std::vector<uint32_t> &pk_attrs = {}, bool auto_id = false,
+                   const std::string &location = "")
       -> std::shared_ptr<TableInfo> {
     std::lock_guard lk(latch_);
     if (table_names_.find(table_name) != table_names_.end()) {
@@ -121,14 +123,17 @@ class Catalog {
     const auto table_oid = next_table_oid_++;
 
     std::unique_ptr<TableStorage> storage;
-    if (bpm_ != nullptr) {
-      switch (format) {
-        case StorageFormat::ROW:
+    switch (format) {
+      case StorageFormat::ROW:
+        // Row storage needs a buffer pool; a metadata-only catalog leaves storage_ null.
+        if (bpm_ != nullptr) {
           storage = std::make_unique<TableHeap>(bpm_, std::make_shared<Schema>(schema));
-          break;
-        case StorageFormat::PARQUET:
-          throw NotImplementedException("Parquet-backed tables are not implemented yet");
-      }
+        }
+        break;
+      case StorageFormat::PARQUET:
+        // External storage is buffer-pool independent.
+        storage = std::make_unique<ParquetTable>(location, std::make_shared<Schema>(schema));
+        break;
     }
 
     auto table_info = std::make_shared<TableInfo>(schema, table_name, table_oid, std::move(storage));
@@ -173,18 +178,20 @@ class Catalog {
    */
   auto LoadTable(table_oid_t oid, const std::string &table_name, const Schema &schema, page_id_t first_page_id,
                  page_id_t last_page_id, StorageFormat format, const std::vector<uint32_t> &pk_attrs = {},
-                 bool auto_id = false, int64_t next_id = 0) -> std::shared_ptr<TableInfo> {
+                 bool auto_id = false, int64_t next_id = 0, const std::string &location = "")
+      -> std::shared_ptr<TableInfo> {
     std::lock_guard lk(latch_);
     std::unique_ptr<TableStorage> storage;
-    if (bpm_ != nullptr) {
-      switch (format) {
-        case StorageFormat::ROW:
+    switch (format) {
+      case StorageFormat::ROW:
+        if (bpm_ != nullptr) {
           storage =
               std::make_unique<TableHeap>(bpm_, std::make_shared<Schema>(schema), first_page_id, last_page_id);
-          break;
-        case StorageFormat::PARQUET:
-          throw NotImplementedException("Parquet-backed tables are not implemented yet");
-      }
+        }
+        break;
+      case StorageFormat::PARQUET:
+        storage = std::make_unique<ParquetTable>(location, std::make_shared<Schema>(schema));
+        break;
     }
     auto table_info = std::make_shared<TableInfo>(schema, table_name, oid, std::move(storage));
     table_info->pk_attrs_ = pk_attrs;

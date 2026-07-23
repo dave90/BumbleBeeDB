@@ -20,6 +20,7 @@
 #include "fmt/format.h"
 #include "parallel/pipeline_builder.h"
 #include "storage/table/table_heap.h"
+#include "type/value.h"
 
 namespace bumblebee {
 
@@ -54,6 +55,10 @@ struct TableScanGlobalState : GlobalSourceState {
 /** @brief One worker's cursor over the morsel it is currently draining. */
 struct TableScanLocalState : LocalSourceState {
   std::unique_ptr<TableScan> cursor_;
+  // Projected scans gather into this narrow chunk (one vector per projected column); its vectors
+  // are then referenced zero-copy into the full-width output slots.
+  DataChunk narrow_;
+  bool narrow_ready_{false};
 };
 
 void PhysicalTableScan::BuildPipelines(Pipeline &current, PipelineBuilder & /*builder*/) const {
@@ -82,11 +87,44 @@ auto PhysicalTableScan::GetData(ExecutionContext & /*context*/, DataChunk &outpu
   auto &ls = static_cast<TableScanLocalState &>(lstate);
   auto &heap = *gs.scan_state_->heap_;
 
+  // Projected scan: the heap gathers only the projected columns, into a chunk that narrow. The
+  // full-width output then references those vectors in their original slots (zero-copy; validity
+  // is shared) and constant-NULLs the pruned ones, so downstream column numbering is unchanged.
+  const bool projected = !projection_.empty();
+  DataChunk *scan_target = &output;
+  if (projected) {
+    BUMBLEBEE_ASSERT(!emit_rids_, "projected scans are never used for DML");
+    if (!ls.narrow_ready_) {
+      std::vector<LogicalType> types;
+      types.reserve(projection_.size());
+      for (auto col : projection_) {
+        types.push_back(output_schema_->GetColumn(col).GetType());
+      }
+      ls.narrow_.Initialize(types);
+      ls.narrow_ready_ = true;
+    }
+    scan_target = &ls.narrow_;
+  }
+
   // When emitting RIDs, the trailing output column receives them; otherwise the scan produces no RIDs.
   Vector *rid_out = emit_rids_ ? &output.data_[output.ColumnCount() - 1] : nullptr;
   while (true) {
     if (ls.cursor_) {
-      if (ls.cursor_->Next(output, rid_out)) {
+      scan_target->Reset();
+      if (ls.cursor_->Next(*scan_target, rid_out)) {
+        if (projected) {
+          for (idx_t k = 0; k < projection_.size(); k++) {
+            output.data_[projection_[k]].Reference(ls.narrow_.data_[k]);
+          }
+          for (idx_t c = 0, k = 0; c < output.ColumnCount(); c++) {
+            if (k < projection_.size() && projection_[k] == c) {
+              k++;
+              continue;
+            }
+            output.data_[c].Reference(Value::Null(output_schema_->GetColumn(c).GetType()));
+          }
+          output.SetCardinality(ls.narrow_.GetSize());
+        }
         return SourceResultType::HAVE_MORE_OUTPUT;
       }
       ls.cursor_.reset();  // this morsel is drained; pull the next

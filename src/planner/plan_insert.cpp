@@ -73,7 +73,12 @@ auto IsNumericType(const LogicalType &t) -> bool {
  * means `to` is the wider supertype.
  */
 auto CanAssign(const LogicalType &from, const LogicalType &to) -> bool {
-  return from == to || from.GetTypeId() == LogicalTypeId::UNKNOWN ||
+  // String literals coerce into calendar columns by parsing ("2024-01-01" -> DATE); the cast is
+  // strict, so a malformed literal errors instead of silently landing NULL.
+  const bool string_to_calendar =
+      from.GetTypeId() == LogicalTypeId::STRING &&
+      (to.GetTypeId() == LogicalTypeId::DATE || to.GetTypeId() == LogicalTypeId::TIMESTAMP);
+  return from == to || from.GetTypeId() == LogicalTypeId::UNKNOWN || string_to_calendar ||
          (IsNumericType(from) && IsNumericType(to) && LogicalType::CommonType(from, to) == to);
 }
 
@@ -110,7 +115,9 @@ auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRe
     AbstractExpressionRef col =
         std::make_shared<ColumnValueExpression>(0, static_cast<uint32_t>(c), child_columns[c]);
     if (from != to) {
-      col = std::make_shared<CastExpression>(std::move(col), to);
+      // Strict: the allowed coercions either cannot fail (lossless widenings, NULL broadcast) or
+      // must error loudly when they do (string -> DATE/TIMESTAMP parses).
+      col = std::make_shared<CastExpression>(std::move(col), to, /*strict=*/true);
       needs_cast = true;
     }
     proj_exprs.push_back(std::move(col));

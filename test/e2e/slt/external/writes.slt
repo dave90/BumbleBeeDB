@@ -1,0 +1,117 @@
+# External-table writes: INSERT append, copy-on-write UPDATE/DELETE, delete-all -> empty table ->
+# re-insert, INSERT ... SELECT from a heap table, and the non-transactional contract.
+
+statement ok
+CREATE TABLE t (a INT, b VARCHAR) WITH (format='parquet', location='${TMPDIR}/t');
+
+statement ok
+INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z');
+
+query rowsort
+SELECT a, b FROM t;
+----
+1 'x'
+2 'y'
+3 'z'
+
+# Append: a second INSERT adds a part file, both are visible.
+statement ok
+INSERT INTO t VALUES (4,'w');
+
+query
+SELECT COUNT(*) FROM t;
+----
+4
+
+# Copy-on-write UPDATE.
+statement ok
+UPDATE t SET b = 'updated' WHERE a = 2;
+
+query
+SELECT b FROM t WHERE a = 2;
+----
+'updated'
+
+query
+SELECT COUNT(*) FROM t;
+----
+4
+
+# Predicate DELETE.
+statement ok
+DELETE FROM t WHERE a > 2;
+
+query rowsort
+SELECT a, b FROM t;
+----
+1 'x'
+2 'updated'
+
+# Deleting every row is legal: the table stays, empty.
+statement ok
+DELETE FROM t;
+
+query
+SELECT COUNT(*) FROM t;
+----
+0
+
+# And it comes back to life on the next insert.
+statement ok
+INSERT INTO t VALUES (9,'back');
+
+query
+SELECT a, b FROM t;
+----
+9 'back'
+
+# INSERT ... SELECT from a heap table into the external table.
+statement ok
+CREATE TABLE src(v INT, s VARCHAR);
+
+statement ok
+INSERT INTO src VALUES (10,'ten'),(11,'eleven');
+
+statement ok
+INSERT INTO t SELECT v, s FROM src;
+
+query
+SELECT COUNT(*) FROM t;
+----
+3
+
+# UPDATE with an expression over the old value.
+statement ok
+UPDATE t SET a = a + 100 WHERE b = 'back';
+
+query
+SELECT a FROM t WHERE b = 'back';
+----
+109
+
+# Non-transactional: external writes are refused inside BEGIN ... COMMIT; reads are fine.
+statement ok
+BEGIN;
+
+statement error
+INSERT INTO t VALUES (99,'nope');
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+query
+SELECT COUNT(*) FROM t;
+----
+3
+
+statement ok
+COMMIT;
+
+# The refused write left no trace.
+query
+SELECT COUNT(*) FROM t WHERE a = 99;
+----
+0

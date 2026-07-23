@@ -31,6 +31,10 @@ def _is_small_vector_build() -> bool:
     return os.environ.get("BBDB_SLT_SMALL_VECTOR", "0") not in ("0", "", "false", "no")
 
 
+def _is_durable_run() -> bool:
+    return os.environ.get("BBDB_SLT_DURABLE", "0") not in ("0", "", "false", "no")
+
+
 def pytest_collect_file(parent, file_path: Path):
     if file_path.suffix == ".slt":
         return SltCollector.from_parent(parent, path=file_path)
@@ -45,7 +49,7 @@ class SltCollector(pytest.File):
 class SltItem(pytest.Item):
     def runtest(self) -> None:
         try:
-            run_slt_file(self.path, _runner_binary(), _is_small_vector_build())
+            run_slt_file(self.path, _runner_binary(), _is_small_vector_build(), _is_durable_run())
         except SltSkip as skip:
             pytest.skip(str(skip))
 

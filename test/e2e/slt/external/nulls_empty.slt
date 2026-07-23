@@ -1,0 +1,39 @@
+# External parquet tables: NULL handling from real definition levels, and the empty-table state
+# (declared columns over an empty folder).
+# fixture: null.parquet
+
+statement ok
+CREATE TABLE n () WITH (format='parquet', location='${TMPDIR}');
+
+query
+SELECT COUNT(*) FROM n;
+----
+9
+
+query
+SELECT COUNT(*) FROM n WHERE col4 IS NULL;
+----
+3
+
+query
+SELECT COUNT(*) FROM n WHERE col_timestamp IS NULL;
+----
+4
+
+query
+SELECT SUM(col5) FROM n;
+----
+330
+
+# An empty external table: declared columns over a fresh (empty) subfolder.
+statement ok
+CREATE TABLE e (a INT, b VARCHAR) WITH (format='parquet', location='${TMPDIR}/empty_sub');
+
+query
+SELECT COUNT(*) FROM e;
+----
+0
+
+query rowsort
+SELECT a, b FROM e;
+----

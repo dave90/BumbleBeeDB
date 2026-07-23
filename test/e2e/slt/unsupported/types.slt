@@ -37,19 +37,29 @@ CREATE TABLE t5(a DECIMAL(10,2));
 statement error
 INSERT INTO t5 VALUES (1.5);
 
-# DATE: no date literal; a string does not coerce.
+# DATE: string literals coerce by parsing now (see functions/casts.slt); a malformed one errors.
 statement ok
 CREATE TABLE t6(a DATE);
 
-statement error
+statement ok
 INSERT INTO t6 VALUES ('2020-01-01');
 
-# CAST is not implemented, so there is no way to bridge into a narrower type either.
+query
+SELECT a FROM t6;
+----
+2020-01-01
+
+statement error
+INSERT INTO t6 VALUES ('not-a-date');
+
+# CAST bridges types explicitly (see functions/casts.slt).
 statement ok
 CREATE TABLE t7(a INT);
 
 statement ok
 INSERT INTO t7 VALUES (1);
 
-statement error
+query
 SELECT CAST(a AS BIGINT) FROM t7;
+----
+1

@@ -1,0 +1,57 @@
+# External parquet tables: adoption of a foreign folder (schema inference), scans, filters,
+# aggregates, ORDER BY / LIMIT, and a join between an external table and a heap table.
+# fixture: lineitem-arrow.parquet
+
+statement ok
+CREATE TABLE li () WITH (format='parquet', location='${TMPDIR}');
+
+query
+SELECT COUNT(*) FROM li;
+----
+6005
+
+query
+SELECT l_partkey FROM li WHERE l_orderkey = 1 ORDER BY l_partkey;
+----
+3
+16
+25
+64
+68
+156
+
+query
+SELECT COUNT(*), SUM(l_partkey) FROM li WHERE l_discount > 0.05;
+----
+2753 281089
+
+# TopN over the external scan.
+query
+SELECT l_orderkey, l_partkey FROM li ORDER BY l_partkey DESC, l_orderkey LIMIT 3;
+----
+324 200
+1121 200
+1254 200
+
+# Join external x heap.
+statement ok
+CREATE TABLE keys(k BIGINT);
+
+statement ok
+INSERT INTO keys VALUES (1), (2);
+
+query
+SELECT COUNT(*) FROM li, keys WHERE li.l_orderkey = keys.k;
+----
+7
+
+# Aggregation with GROUP BY over the external table.
+query rowsort
+SELECT l_orderkey, COUNT(*) FROM li WHERE l_orderkey < 4 GROUP BY l_orderkey;
+----
+1 6
+2 1
+3 6
+
+statement ok
+DROP TABLE li;

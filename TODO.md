@@ -1,5 +1,4 @@
 - window
-- external tables
+- external tables schema evolution (per-file schema resolution: missing col -> NULL, extra -> ignore, widen -> cast; maybe ALTER TABLE for external only — see plan_external.md §6)
 - benchamrks
-- e2e tests more cases
 - e2e with configs

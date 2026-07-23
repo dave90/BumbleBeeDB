@@ -1,0 +1,54 @@
+# Clean-shutdown durability: rows, schemas (incl. DECIMAL/DATE typmods) and the auto `_id`
+# high-water mark survive a reopen; the restored commit-timestamp watermark keeps persisted rows
+# visible to fresh snapshots (the classic reload bug is every row silently vanishing).
+# require: durable
+
+statement ok
+CREATE TABLE t(v INT, s VARCHAR, dec DECIMAL(10,2), d DATE);
+
+statement ok
+INSERT INTO t VALUES (10,'ten',CAST(1.50 AS DECIMAL(10,2)),'2024-01-01'),
+  (20,'twenty',CAST(2.25 AS DECIMAL(10,2)),'2024-06-15');
+
+# restart
+
+# The rows are there, values intact — including the decimal scale and the calendar type,
+# which round-trip through the catalog's schema codec.
+query rowsort
+SELECT _id, v, s, dec, d FROM t;
+----
+0 10 'ten' 1.50 2024-01-01
+1 20 'twenty' 2.25 2024-06-15
+
+# The `_id` counter resumes above every persisted row instead of colliding.
+statement ok
+INSERT INTO t VALUES (30,'thirty',CAST(3.00 AS DECIMAL(10,2)),'2024-12-31');
+
+query
+SELECT _id FROM t ORDER BY _id;
+----
+0
+1
+2
+
+# Reloaded state composes with the full engine: filter + aggregate over old and new rows.
+query
+SELECT COUNT(*), SUM(v) FROM t WHERE v >= 20;
+----
+2 50
+
+# A second restart on top of already-reloaded state (the catalog chain rewrites correctly).
+# restart
+
+query
+SELECT COUNT(*) FROM t;
+----
+3
+
+statement ok
+INSERT INTO t VALUES (40,'forty',CAST(4.75 AS DECIMAL(10,2)),'2025-01-01');
+
+query
+SELECT _id, v FROM t WHERE _id = 3;
+----
+3 40

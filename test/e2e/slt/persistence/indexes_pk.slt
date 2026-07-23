@@ -1,0 +1,53 @@
+# The primary-key B+tree reloads with the table: after a reopen it still finds rows and still
+# rejects duplicates (a broken header-page reattach would silently allow them).
+# require: durable
+
+statement ok
+CREATE TABLE p(id INT PRIMARY KEY, v VARCHAR);
+
+statement ok
+INSERT INTO p VALUES (1,'one'), (2,'two'), (3,'three');
+
+statement error
+INSERT INTO p VALUES (2,'dup');
+
+# restart
+
+# Uniqueness is still enforced by the reloaded index.
+statement error
+INSERT INTO p VALUES (3,'dup');
+
+statement ok
+INSERT INTO p VALUES (4,'four');
+
+query rowsort
+SELECT id, v FROM p;
+----
+1 'one'
+2 'two'
+3 'three'
+4 'four'
+
+# Delete + re-insert of the same key after reopen (the index's delete/revive path over
+# reloaded pages).
+statement ok
+DELETE FROM p WHERE id = 1;
+
+statement ok
+INSERT INTO p VALUES (1,'one again');
+
+query
+SELECT v FROM p WHERE id = 1;
+----
+'one again'
+
+# And once more across a restart.
+# restart
+
+query
+SELECT v FROM p WHERE id = 1;
+----
+'one again'
+
+statement error
+INSERT INTO p VALUES (1,'dup');

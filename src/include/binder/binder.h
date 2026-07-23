@@ -154,6 +154,9 @@ class Binder {
   auto BindFuncCall(duckdb_libpgquery::PGFuncCall *root) -> std::unique_ptr<BoundExpression>;
 
   auto BindAExpr(duckdb_libpgquery::PGAExpr *root) -> std::unique_ptr<BoundExpression>;
+  auto BindTypeCast(duckdb_libpgquery::PGTypeCast *root) -> std::unique_ptr<BoundExpression>;
+  /** @brief Resolve a scalar type name (with typmods: VARCHAR(n), DECIMAL(w,s)) to a LogicalType. */
+  auto ResolveTypeName(duckdb_libpgquery::PGTypeName *type_name) -> LogicalType;
 
   auto BindBoolExpr(duckdb_libpgquery::PGBoolExpr *root) -> std::unique_ptr<BoundExpression>;
 

@@ -41,6 +41,9 @@ enum class SinkFinalizeType : uint8_t { READY, NO_OUTPUT_POSSIBLE };
 enum class PhysicalOperatorType : uint8_t {
   TABLE_SCAN,
   PARQUET_SCAN,
+  PARQUET_INSERT,
+  PARQUET_UPDATE,
+  PARQUET_DELETE,
   VALUES,
   FILTER,
   PROJECTION,

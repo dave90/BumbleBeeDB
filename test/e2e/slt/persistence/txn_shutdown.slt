@@ -1,0 +1,54 @@
+# A transaction still open at shutdown is rolled back — its writes must not resurrect after the
+# reopen — while everything committed before it survives.
+# require: durable
+
+statement ok
+CREATE TABLE t(v INT);
+
+statement ok
+INSERT INTO t VALUES (1), (2);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (99);
+
+statement ok
+UPDATE t SET v = 100 WHERE v = 1;
+
+# The uncommitted writes are visible inside the transaction...
+query rowsort
+SELECT v FROM t;
+----
+100
+2
+99
+
+# ...but the shutdown aborts the open transaction: after reopen only committed state remains.
+# restart
+
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+
+# The reopened database accepts new transactions normally.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO t VALUES (3);
+
+statement ok
+COMMIT;
+
+# restart
+
+query rowsort
+SELECT v FROM t;
+----
+1
+2
+3

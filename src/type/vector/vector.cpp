@@ -489,10 +489,13 @@ auto Vector::WrapValue(Value raw) const -> Value {
     case LogicalTypeId::FLOAT:
     case LogicalTypeId::DOUBLE:
     case LogicalTypeId::STRING:
+    case LogicalTypeId::DATE:
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::DECIMAL:
       return raw.CastAs(type_);
     default:
-      // DATE / TIMESTAMP / DECIMAL / HASH / ADDRESS: Value has no constructor that
-      // produces one, so the row keeps the logical type of its physical representation.
+      // HASH / ADDRESS: Value has no constructor that produces one, so the row keeps the
+      // logical type of its physical representation.
       return raw;
   }
 }

@@ -38,6 +38,8 @@ delimit a record's output with an ``\\echo`` sentinel.
 from __future__ import annotations
 
 import subprocess
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,6 +97,7 @@ class SltFile:
     config: dict[str, str] = field(default_factory=dict)
     seed_mock: bool = False
     requires: set[str] = field(default_factory=set)
+    fixtures: list[str] = field(default_factory=list)
     records: list[Record] = field(default_factory=list)
 
     def cli_flags(self) -> list[str]:
@@ -124,6 +127,9 @@ def _parse_directive(comment: str, out: SltFile) -> None:
         out.seed_mock = body[len("seed:"):].strip() == "mock"
     elif body.startswith("require:"):
         out.requires.update(body[len("require:"):].split())
+    elif body.startswith("fixture:"):
+        # Files (from test/e2e/fixtures/) copied into the per-file ${TMPDIR} before the run.
+        out.fixtures.extend(body[len("fixture:"):].split())
 
 
 def parse_slt(path: Path) -> SltFile:
@@ -140,6 +146,12 @@ def parse_slt(path: Path) -> SltFile:
             i += 1
             continue
         if stripped.startswith("#"):
+            # `# restart`: cleanly shut the shell down and relaunch it against the same database
+            # file — how the durable tests assert that state survives a reopen.
+            if stripped.lstrip("#").strip() == "restart":
+                result.records.append(Record(kind="restart", sql="", line=i + 1))
+                i += 1
+                continue
             _parse_directive(stripped, result)
             i += 1
             continue
@@ -221,8 +233,9 @@ def _consume_sql(lines: list[str], start: int) -> tuple[list[str], int]:
 class BumbleBeeSession:
     """Drives a single long-lived ``BumbleBee --test-protocol`` process for one `.slt` file."""
 
-    def __init__(self, binary: str, flags: list[str], seed_mock: bool):
-        argv = [binary, "--memory", "--test-protocol", *flags]
+    def __init__(self, binary: str, flags: list[str], seed_mock: bool, db_path: str | None = None):
+        storage = ["--db", db_path] if db_path is not None else ["--memory"]
+        argv = [binary, *storage, "--test-protocol", *flags]
         if not seed_mock:
             argv.append("--no-seed")
         self._proc = subprocess.Popen(
@@ -310,21 +323,45 @@ def _compare(actual: list[str], expected: list[str], sort: bool) -> None:
         )
 
 
-def run_slt_file(path: Path, binary: str, is_small_vector_build: bool) -> None:
+def run_slt_file(path: Path, binary: str, is_small_vector_build: bool, durable: bool = False) -> None:
     """Parse and execute a `.slt` file end to end; raise :class:`SltError` on any failure.
 
-    Returns None on success. Skips (via SltSkip) files whose `# require:` is unmet.
+    Returns None on success. Skips (via SltSkip) files whose `# require:` is unmet. With
+    `durable`, the shell runs file-backed (`--db` in the scratch dir) instead of in-memory, so
+    the on-disk storage layer (real file IO, catalog serialization) is exercised by the same
+    corpus; `# restart` records then relaunch the shell to assert reopen semantics.
     """
     slt = parse_slt(path)
 
     if "small_vector" in slt.requires and not is_small_vector_build:
         raise SltSkip("requires the small-vector build (set BBDB_SLT_SMALL_VECTOR=1)")
+    if "durable" in slt.requires and not durable:
+        raise SltSkip("requires the durable (file-backed) run (set BBDB_SLT_DURABLE=1)")
+    if any(r.kind == "restart" for r in slt.records) and "durable" not in slt.requires:
+        raise SltError(f"{path.name}: '# restart' needs '# require: durable' (meaningless in-memory)")
 
-    session = BumbleBeeSession(binary, slt.cli_flags(), slt.seed_mock)
+    # Each file gets a fresh scratch folder, referenced from SQL as ${TMPDIR} (external tables
+    # need a filesystem location). `# fixture:` files are copied into it before the run.
+    tmpdir = tempfile.mkdtemp(prefix="bbdb_slt_")
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    for fixture in slt.fixtures:
+        shutil.copy(fixtures_dir / fixture, tmpdir)
+    for record in slt.records:
+        if record.sql:
+            record.sql = record.sql.replace("${TMPDIR}", tmpdir)
+
+    db_path = str(Path(tmpdir) / "bb.db") if durable else None
+    session = BumbleBeeSession(binary, slt.cli_flags(), slt.seed_mock, db_path)
     try:
         for record in slt.records:
             if record.kind == "sleep":
                 time.sleep(record.sleep_ms / 1000.0)
+                continue
+            if record.kind == "restart":
+                # Clean shutdown (this is what serializes the catalog — no WAL exists), then a
+                # fresh process over the same database file. Named sessions reset with it.
+                session.close()
+                session = BumbleBeeSession(binary, slt.cli_flags(), slt.seed_mock, db_path)
                 continue
             ok, err_msg, rows = session.run_record(record)
             loc = f"{path.name}:{record.line}"
@@ -342,6 +379,7 @@ def run_slt_file(path: Path, binary: str, is_small_vector_build: bool) -> None:
                     raise SltError(f"{loc}: {exc}\n  SQL: {record.sql}") from None
     finally:
         session.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class SltSkip(Exception):
