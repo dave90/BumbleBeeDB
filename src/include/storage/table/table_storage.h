@@ -65,6 +65,15 @@ class TableStorage {
   virtual auto GetFormat() const -> StorageFormat = 0;
 
   /**
+   * @brief A cheap estimate of the number of rows this storage holds, for cost-based planning.
+   *
+   * Approximate by design (a heap counts slotted-page tuples including logically-deleted ones; a
+   * parquet table sums its manifest's per-file row counts). Returns 0 when unknown — the caller
+   * (the optimizer's cardinality estimator) treats 0 as "no signal" and falls back to a default.
+   */
+  virtual auto EstimatedRowCount() const -> idx_t { return 0; }
+
+  /**
    * @brief Open a scan.
    *
    * @param projection Column indices to materialize (column pruning); empty means all columns.

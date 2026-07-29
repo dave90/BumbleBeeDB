@@ -210,4 +210,18 @@ TEST(ValueTest, ScalarHasNoChildren) {
   EXPECT_TRUE(Value{static_cast<int32_t>(1)}.GetChildren().empty());
 }
 
+// A temporal type must absorb a string in a comparison: '1995-01-01' vs a DATE column coerces the
+// LITERAL to DATE — resolving to STRING instead would format every date of the column per row.
+TEST(LogicalTypeTest, CommonTypeTemporalAbsorbsString) {
+  const LogicalType str{LogicalTypeId::STRING};
+  const LogicalType date{LogicalTypeId::DATE};
+  const LogicalType ts{LogicalTypeId::TIMESTAMP};
+  EXPECT_EQ(LogicalType::CommonType(date, str).GetTypeId(), LogicalTypeId::DATE);
+  EXPECT_EQ(LogicalType::CommonType(str, date).GetTypeId(), LogicalTypeId::DATE);
+  EXPECT_EQ(LogicalType::CommonType(ts, str).GetTypeId(), LogicalTypeId::TIMESTAMP);
+  EXPECT_EQ(LogicalType::CommonType(str, ts).GetTypeId(), LogicalTypeId::TIMESTAMP);
+  // Numbers still cast toward the string (lexicographic compare on the number's rendering).
+  EXPECT_EQ(LogicalType::CommonType(LogicalType{LogicalTypeId::INTEGER}, str).GetTypeId(), LogicalTypeId::STRING);
+}
+
 }  // namespace bumblebee

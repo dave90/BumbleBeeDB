@@ -13,6 +13,7 @@
 #include "execution/prl_hash_table.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -36,6 +37,22 @@ auto NextPowerOfTwo(idx_t n) -> idx_t {
 }  // namespace
 
 auto PRLHashTable::NonNullKeyRows(DataChunk &key_chunk, SelectionVector &sel) -> idx_t {
+  // Fast path — the overwhelmingly common one, and the one a 30M-row probe pays per chunk: no key
+  // column holds a NULL at all, so every row qualifies and the per-row `RowIsValid` (an
+  // out-of-line switch on the encoding, once per row per column) is skipped entirely.
+  bool has_null = false;
+  for (idx_t c = 0; c < key_chunk.ColumnCount() && !has_null; c++) {
+    VectorData vdata;
+    key_chunk.data_[c].Orrify(key_chunk.GetSize(), vdata);
+    has_null = !vdata.validity_->AllValid();
+  }
+  if (!has_null) {
+    for (idx_t i = 0; i < key_chunk.GetSize(); i++) {
+      sel.SetIndex(i, i);
+    }
+    return key_chunk.GetSize();
+  }
+
   idx_t n = 0;
   for (idx_t i = 0; i < key_chunk.GetSize(); i++) {
     bool valid = true;
@@ -317,8 +334,23 @@ void PRLHashTable::BuildDirectory() {
   directory_stale_ = false;
 }
 
+PRLHashTable::ProbeState::ProbeState()
+    : cand_addr_(STANDARD_VECTOR_SIZE),
+      cand_row_(STANDARD_VECTOR_SIZE),
+      cand_rows_vec_(LogicalType{LogicalTypeId::UBIGINT}, reinterpret_cast<data_ptr_t>(cand_addr_.data())),
+      cand_col_sel_(cand_row_.data()),
+      match_sel_(STANDARD_VECTOR_SIZE),
+      no_match_sel_(STANDARD_VECTOR_SIZE) {}
+
 void PRLHashTable::Probe(Vector &hashes, DataChunk &keys, const SelectionVector &sel, idx_t count,
                          std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows,
+                         std::vector<uint8_t> *matched) {
+  ProbeState state;
+  Probe(state, hashes, keys, sel, count, out_addrs, out_rows, matched);
+}
+
+void PRLHashTable::Probe(ProbeState &state, Vector &hashes, DataChunk &keys, const SelectionVector &sel,
+                         idx_t count, std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows,
                          std::vector<uint8_t> *matched) {
   if (count == 0 || count_ == 0) {
     return;
@@ -329,26 +361,20 @@ void PRLHashTable::Probe(Vector &hashes, DataChunk &keys, const SelectionVector 
   auto col_data = keys.Orrify();
 
   // Candidate batch: hash-equal directory entries awaiting key verification.
-  std::vector<data_ptr_t> cand_addr(STANDARD_VECTOR_SIZE);
-  std::vector<sel_t> cand_row(STANDARD_VECTOR_SIZE);
+  auto &cand_addr = state.cand_addr_;
+  auto &cand_row = state.cand_row_;
   idx_t n_cand = 0;
-
-  Vector cand_rows_vec{LogicalType{LogicalTypeId::UBIGINT}, reinterpret_cast<data_ptr_t>(cand_addr.data())};
-  SelectionVector cand_col_sel(cand_row.data());
-  SelectionVector identity;
-  SelectionVector match_sel(STANDARD_VECTOR_SIZE);
-  SelectionVector no_match_sel(STANDARD_VECTOR_SIZE);
 
   auto flush = [&]() {
     if (n_cand == 0) {
       return;
     }
     idx_t failures = 0;
-    const idx_t n = RowOperations::Match(keys, col_data.get(), layout_, key_count_, cand_rows_vec, identity,
-                                         cand_col_sel, n_cand, match_sel, no_match_sel, failures,
-                                         null_equal_keys_);
+    const idx_t n = RowOperations::Match(keys, col_data.get(), layout_, key_count_, state.cand_rows_vec_,
+                                         state.identity_, state.cand_col_sel_, n_cand, state.match_sel_,
+                                         state.no_match_sel_, failures, null_equal_keys_);
     for (idx_t j = 0; j < n; j++) {
-      const idx_t pos = match_sel.GetIndex(j);
+      const idx_t pos = state.match_sel_.GetIndex(j);
       out_addrs.push_back(cand_addr[pos]);
       out_rows.push_back(cand_row[pos]);
       if (matched != nullptr) {
@@ -358,19 +384,42 @@ void PRLHashTable::Probe(Vector &hashes, DataChunk &keys, const SelectionVector 
     n_cand = 0;
   };
 
-  for (idx_t k = 0; k < count; k++) {
-    const idx_t idx = sel.GetIndex(k);
-    const hash_t h = hash_data[idx];
-    auto bucket = h & bitmask_;
-    while (directory_[bucket].row_ != nullptr) {
-      if (directory_[bucket].hash_ == h) {
-        cand_addr[n_cand] = directory_[bucket].row_;
-        cand_row[n_cand] = static_cast<sel_t>(idx);
-        if (++n_cand == STANDARD_VECTOR_SIZE) {
-          flush();
+  // Two passes over a small block of probe rows: the first computes each row's bucket and issues a
+  // prefetch, the second chases the clusters. Bucket addresses are essentially random, so a
+  // directory that outgrows the cache would otherwise stall on every single row; splitting the
+  // passes lets the loads of a whole block be in flight at once. `dir`/`mask` are hoisted because
+  // nothing in the loop (flush included) can touch the directory.
+  static constexpr idx_t PREFETCH_BLOCK = 32;
+  const auto *dir = directory_.data();
+  const hash_t mask = bitmask_;
+  const sel_t *sel_data = sel.GetData();
+  std::array<hash_t, PREFETCH_BLOCK> block_hash{};
+  std::array<idx_t, PREFETCH_BLOCK> block_bucket{};
+  std::array<sel_t, PREFETCH_BLOCK> block_row{};
+
+  for (idx_t base = 0; base < count; base += PREFETCH_BLOCK) {
+    const idx_t n_block = std::min<idx_t>(PREFETCH_BLOCK, count - base);
+    for (idx_t j = 0; j < n_block; j++) {
+      const idx_t idx = sel_data != nullptr ? sel_data[base + j] : base + j;
+      const hash_t h = hash_data[idx];
+      block_row[j] = static_cast<sel_t>(idx);
+      block_hash[j] = h;
+      block_bucket[j] = h & mask;
+      __builtin_prefetch(dir + block_bucket[j]);
+    }
+    for (idx_t j = 0; j < n_block; j++) {
+      const hash_t h = block_hash[j];
+      idx_t bucket = block_bucket[j];
+      while (dir[bucket].row_ != nullptr) {
+        if (dir[bucket].hash_ == h) {
+          cand_addr[n_cand] = dir[bucket].row_;
+          cand_row[n_cand] = block_row[j];
+          if (++n_cand == STANDARD_VECTOR_SIZE) {
+            flush();
+          }
         }
+        bucket = (bucket + 1) & mask;
       }
-      bucket = (bucket + 1) & bitmask_;
     }
   }
   flush();

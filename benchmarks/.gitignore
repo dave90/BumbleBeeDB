@@ -1,0 +1,5 @@
+# Generated fixtures, per-table parquet symlinks, generated setup + DML scripts, db files.
+data/
+# Timestamped result CSVs and saved reference outputs.
+results/
+__pycache__/

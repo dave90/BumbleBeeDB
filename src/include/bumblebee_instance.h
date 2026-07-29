@@ -22,6 +22,8 @@
 #include "catalog/catalog.h"
 #include "concurrency/transaction_manager.h"
 #include "database.h"
+#include "execution/plans/abstract_plan.h"
+#include "type/value.h"
 #include "storage/buffer/buffer_pool_manager.h"
 #include "storage/disk/memory_disk_manager.h"
 
@@ -212,6 +214,8 @@ class BumbleBeeInstance {
   idx_t max_threads_{0};
   /** Heap pages per parallel-scan morsel passed to each statement's ClientContext. */
   idx_t morsel_pages_{MORSEL_PAGES};
+  /** Hash-aggregate sink partitioning threshold override (0 = operator default; tests lower it). */
+  idx_t agg_partition_threshold_{0};
   /** Target rows per columnar morsel passed to each statement's ClientContext (reserved). */
   idx_t morsel_size_{MORSEL_SIZE};
 
@@ -224,6 +228,16 @@ class BumbleBeeInstance {
   void HandleExplainStatement(const ExplainStatement &stmt, ResultWriter &writer);
   /** @brief Bind → plan → optimize → lower → execute one non-DDL statement, streaming rows to `writer`. */
   void ExecuteStatement(const BoundStatement &statement, ResultWriter &writer);
+  /**
+   * @brief Optimize + execute a planned uncorrelated scalar subquery to its single value.
+   *
+   * Runs inside the session's explicit transaction when one is open, else in its own autocommit
+   * transaction. 0 rows -> NULL; more than 1 row -> ExecutionException.
+   *
+   * @param subplan The subquery's logical plan (one output column).
+   * @return Value The single result cell.
+   */
+  auto EvalScalarSubquery(const AbstractPlanNodeRef &subplan) -> Value;
   /** @brief Copy this instance's tunables (memory, threads, morsel, spill) onto a statement's ClientContext. */
   void ApplyConfig(ClientContext &client) const;
   void CmdDisplayTables(ResultWriter &writer);

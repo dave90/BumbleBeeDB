@@ -12,13 +12,18 @@
 
 #include "execution/operator/scan/physical_parquet_scan.h"
 
+#include <algorithm>
 #include <atomic>
-#include <set>
 #include <filesystem>
+#include <functional>
+#include <set>
 #include <vector>
 
 #include "catalog/catalog.h"
 #include "common/exception.h"
+#include "common/macros.h"
+#include "execution/expression_executor.h"
+#include "execution/expressions/column_value_expression.h"
 #include "fmt/format.h"
 #include "parallel/pipeline_builder.h"
 #include "storage/parquet/external_schema.h"
@@ -61,6 +66,12 @@ struct ParquetScanGlobalState : GlobalSourceState {
   std::atomic<idx_t> next_morsel_{0};
   std::vector<idx_t> column_ids_;  // file column per output column (identity + optional RID tail)
   std::vector<idx_t> null_columns_;  // pruned output columns, constant-NULLed per emitted chunk
+  // One shared constant-NULL vector per pruned column: every emitted chunk references it instead
+  // of allocating a fresh constant (immutable, so sharing across worker threads is safe).
+  std::vector<std::unique_ptr<Vector>> null_vectors_;
+  // Row-level filter pushdown: the output columns the pushed WHERE reads. Non-empty ⟺ the scan
+  // evaluates the predicate itself (the plan carries no Filter operator above it).
+  std::vector<idx_t> filter_columns_;
 
   auto MaxThreads() -> idx_t override { return std::max<idx_t>(1, morsels_.size()); }
 };
@@ -70,6 +81,10 @@ struct ParquetScanLocalState : LocalSourceState {
   std::unique_ptr<ParquetReaderScanState> state_;
   idx_t file_idx_{0};
   idx_t next_rid_base_{0};  // absolute row offset in the file of the next chunk's first row
+  // Pushed-filter evaluation state (one per worker): the executor over the scan predicate and a
+  // reusable selection the reader callback folds into its row mask.
+  std::unique_ptr<ExpressionExecutor> filter_exec_;
+  SelectionVector filter_sel_;
 };
 
 void PhysicalParquetScan::BuildPipelines(Pipeline &current, PipelineBuilder & /*builder*/) const {
@@ -135,6 +150,35 @@ auto PhysicalParquetScan::GetGlobalSourceState(ClientContext &context, GlobalSin
   if (emit_rids_) {
     gs->column_ids_.push_back(COLUMN_IDENTIFIER_ROW_ID);
   }
+  gs->null_vectors_.resize(schema.GetColumnCount());
+  for (auto c : gs->null_columns_) {
+    gs->null_vectors_[c] = std::make_unique<Vector>(Value::Null(schema.GetColumn(c).GetType()));
+  }
+
+  // Row-level filter pushdown (mirrors the plan-time decision in PhysicalPlanGenerator: a
+  // non-RID parquet scan gets no Filter operator above it, so the scan MUST apply the predicate).
+  // Collect the output columns the predicate reads: they are decoded first, then the evaluation
+  // callback prunes the reader's row mask.
+  if (predicate_ != nullptr && !emit_rids_) {
+    std::function<void(const AbstractExpression &)> collect = [&](const AbstractExpression &e) {
+      if (const auto *col = dynamic_cast<const ColumnValueExpression *>(&e); col != nullptr) {
+        BUMBLEBEE_ASSERT(col->GetTupleIdx() == 0, "a scan predicate reads tuple 0 only");
+        if (std::find(gs->filter_columns_.begin(), gs->filter_columns_.end(), col->GetColIdx()) ==
+            gs->filter_columns_.end()) {
+          gs->filter_columns_.push_back(col->GetColIdx());
+        }
+      }
+      for (const auto &child : e.GetChildren()) {
+        collect(*child);
+      }
+    };
+    collect(*predicate_);
+    for (const auto c : gs->filter_columns_) {
+      // Column pruning collects the scan's own filter refs, so a filter column is always decoded.
+      BUMBLEBEE_ENSURE(gs->column_ids_[c] != COLUMN_IDENTIFIER_ROW_ID,
+                       "parquet filter pushdown: predicate reads a pruned column");
+    }
+  }
   return gs;
 }
 
@@ -152,10 +196,12 @@ auto PhysicalParquetScan::GetData(ExecutionContext & /*context*/, DataChunk &out
     if (ls.state_) {
       gs.readers_[ls.file_idx_]->Scan(*ls.state_, output);
       if (output.GetSize() > 0) {
-        // Pruned columns were never decoded: surface them as constant NULLs (which by
-        // construction of the pruning pass nothing ever reads) instead of stale buffers.
-        for (auto c : gs.null_columns_) {
-          output.data_[c].Reference(Value::Null(output_schema_->GetColumn(c).GetType()));
+
+        if (!gs.null_columns_.empty() &&
+            output.data_[gs.null_columns_.front()].GetVectorType() != VectorType::CONSTANT_VECTOR) {
+          for (auto c : gs.null_columns_) {
+            output.data_[c].Reference(*gs.null_vectors_[c]);
+          }
         }
         if (emit_rids_) {
           // rid = (file_index << 32) | row_index_in_file, for rows [next_rid_base_, +size).
@@ -177,12 +223,34 @@ auto PhysicalParquetScan::GetData(ExecutionContext & /*context*/, DataChunk &out
     const auto &morsel = gs.morsels_[morsel_idx];
     ls.file_idx_ = morsel.file_idx_;
     ls.next_rid_base_ = morsel.file_row_start_;
+    ls.batch_idx_ = morsel_idx;  // the serial-order position of every chunk this morsel emits
     ls.state_ = std::make_unique<ParquetReaderScanState>();
     gs.readers_[morsel.file_idx_]->InitializeScan(*ls.state_, gs.column_ids_, {morsel.group_idx_});
+    if (!gs.filter_columns_.empty()) {
+      if (ls.filter_exec_ == nullptr) {
+        ls.filter_exec_ = std::make_unique<ExpressionExecutor>(*predicate_);
+        ls.filter_sel_.Initialize(STANDARD_VECTOR_SIZE);
+      }
+      ls.state_->filter_columns_ = gs.filter_columns_;
+      ls.state_->row_filter_ = [&ls](DataChunk &chunk, idx_t count, parquet_filter_t &mask) {
+        const idx_t n = ls.filter_exec_->Select(chunk, ls.filter_sel_);
+        if (n == count) {
+          return;  // everything matched — the mask stays as-is
+        }
+        parquet_filter_t pass;  // starts all-clear
+        for (idx_t k = 0; k < n; k++) {
+          pass.set(ls.filter_sel_.GetIndex(k));
+        }
+        mask &= pass;
+      };
+    }
   }
 }
 
 auto PhysicalParquetScan::ParamsToString() const -> std::string {
+  if (predicate_ != nullptr && !emit_rids_) {
+    return fmt::format("{{ table={}, storage=parquet, filter={} }}", table_name_, predicate_);
+  }
   return fmt::format("{{ table={}, storage=parquet }}", table_name_);
 }
 

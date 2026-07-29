@@ -91,6 +91,9 @@ class TableHeap : public TableStorage {
 
   auto GetFormat() const -> StorageFormat override { return StorageFormat::ROW; }
 
+  /** @brief Approximate row count: sum the slotted-page tuple counts across the page directory. */
+  auto EstimatedRowCount() const -> idx_t override;
+
   auto MakeScan(const std::vector<idx_t> &projection = {}) -> std::unique_ptr<TableScan> override;
 
   /**
@@ -171,7 +174,7 @@ class TableHeap : public TableStorage {
   SchemaRef schema_;
   RowLayout layout_;
 
-  std::mutex latch_;
+  mutable std::mutex latch_;
   page_id_t first_page_id_;
   page_id_t last_page_id_;
   /**

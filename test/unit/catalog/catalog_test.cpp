@@ -66,7 +66,7 @@ TEST(CatalogTest, OidsAreDistinct) {
 TEST(CatalogTest, GetTableNames) {
   auto catalog = MakeTestCatalog();
   auto names = catalog->GetTableNames();
-  EXPECT_EQ(names.size(), 7U);
+  EXPECT_EQ(names.size(), 8U);
   EXPECT_NE(std::find(names.begin(), names.end(), "y"), names.end());
   EXPECT_NE(std::find(names.begin(), names.end(), "arr"), names.end());
 }

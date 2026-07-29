@@ -1,0 +1,59 @@
+# MIN / MAX over a VARCHAR argument (ungrouped): lexicographic ordering, NULLs skipped.
+# The GROUPED form (MIN(str) ... GROUP BY) is covered in grouped_string_min_max.slt.
+
+statement ok
+CREATE TABLE t(s VARCHAR(20), n INT);
+
+statement ok
+INSERT INTO t VALUES ('banana', 1), ('apple', 2), ('cherry', 3), ('date', 4);
+
+# Plain lexicographic min/max.
+query
+SELECT MIN(s), MAX(s) FROM t;
+----
+'apple' 'date'
+
+# NULLs are ignored (like every aggregate but COUNT(*)).
+statement ok
+INSERT INTO t VALUES (NULL, 5);
+
+query
+SELECT MIN(s), MAX(s) FROM t;
+----
+'apple' 'date'
+
+# A group with only NULLs yields NULL.
+query
+SELECT MAX(s) FROM t WHERE s IS NULL;
+----
+NULL
+
+# Empty input yields NULL.
+query
+SELECT MIN(s) FROM t WHERE n > 100;
+----
+NULL
+
+# Case sensitivity: uppercase sorts before lowercase in byte order.
+statement ok
+CREATE TABLE c(s VARCHAR(10));
+
+statement ok
+INSERT INTO c VALUES ('Zebra'), ('apple'), ('Apple');
+
+query
+SELECT MIN(s), MAX(s) FROM c;
+----
+'Apple' 'apple'
+
+# Multi-chunk: many rows so the accumulator folds across chunk boundaries (small-vector build).
+statement ok
+CREATE TABLE big(s VARCHAR(10));
+
+statement ok
+INSERT INTO big VALUES ('m'),('a'),('z'),('b'),('y'),('c'),('x'),('d');
+
+query
+SELECT MIN(s), MAX(s) FROM big;
+----
+'a' 'z'

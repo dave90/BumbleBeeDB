@@ -1,0 +1,145 @@
+# UPDATE / DELETE whose WHERE holds an IN / EXISTS subquery. Same flattening as a SELECT's WHERE:
+# the subquery conjunct becomes a SEMI (IN / EXISTS) or ANTI (NOT IN / NOT EXISTS) hash join over
+# the scan, and the physical DML lowering accepts it because such a join emits each qualifying row
+# of its LEFT side exactly once and passes the left schema (with the write's __rid column) through.
+
+statement ok
+CREATE TABLE dim (b INT, w INT);
+
+statement ok
+INSERT INTO dim VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+statement ok
+CREATE TABLE fact (fk INT, bucket INT);
+
+# fk 100 and 104 BOTH point at bucket 1: the join has two rows for one target row, which must still
+# update it exactly once (a semi join, not an inner one).
+statement ok
+INSERT INTO fact VALUES (100, 1), (101, 2), (102, 3), (103, 4), (104, 1);
+
+statement ok
+CREATE TABLE bench (k INT, v INT);
+
+statement ok
+INSERT INTO bench VALUES (100, 0), (101, 0), (102, 0), (103, 0), (999, 0);
+
+# UPDATE driven by a two-table join. Buckets with w < 25 are 1 and 2 -> fk 100, 101, 104.
+query rowsort
+SELECT k, v FROM bench;
+----
+100 0
+101 0
+102 0
+103 0
+999 0
+
+statement ok
+UPDATE bench SET v = v + 1 WHERE k IN (SELECT fact.fk FROM fact, dim WHERE fact.bucket = dim.b AND dim.w < 25);
+
+# k=100 matched twice in the join and is still 1, not 2.
+query rowsort
+SELECT k, v FROM bench;
+----
+100 1
+101 1
+102 0
+103 0
+999 0
+
+# NOT IN -> ANTI join: the complement, including the row no fact points at.
+statement ok
+UPDATE bench SET v = v + 10 WHERE k NOT IN (SELECT fact.fk FROM fact, dim WHERE fact.bucket = dim.b AND dim.w < 25);
+
+query rowsort
+SELECT k, v FROM bench;
+----
+100 1
+101 1
+102 10
+103 10
+999 10
+
+# A subquery conjunct composes with an ordinary one (the ordinary conjuncts stay a Filter under the join).
+statement ok
+UPDATE bench SET v = 99 WHERE v = 10 AND k IN (SELECT fact.fk FROM fact, dim WHERE fact.bucket = dim.b);
+
+query rowsort
+SELECT k, v FROM bench;
+----
+100 1
+101 1
+102 99
+103 99
+999 10
+
+# EXISTS / NOT EXISTS over the join.
+statement ok
+UPDATE bench SET v = 5 WHERE EXISTS (SELECT 1 FROM fact, dim WHERE fact.bucket = dim.b AND fact.fk = 100);
+
+query
+SELECT count(*) FROM bench WHERE v = 5;
+----
+5
+
+statement ok
+UPDATE bench SET v = 6 WHERE NOT EXISTS (SELECT 1 FROM fact WHERE fact.fk = 12345);
+
+query
+SELECT count(*) FROM bench WHERE v = 6;
+----
+5
+
+# An empty subquery result: IN updates nothing, NOT IN updates everything.
+statement ok
+UPDATE bench SET v = 0 WHERE k IN (SELECT fact.fk FROM fact, dim WHERE fact.bucket = dim.b AND dim.w > 9999);
+
+query
+SELECT count(*) FROM bench WHERE v = 6;
+----
+5
+
+# DELETE driven by the same shape. Buckets with w > 25 are 3 and 4 -> fk 102, 103.
+statement ok
+DELETE FROM bench WHERE k IN (SELECT fact.fk FROM fact, dim WHERE fact.bucket = dim.b AND dim.w > 25);
+
+query rowsort
+SELECT k FROM bench;
+----
+100
+101
+999
+
+# NOT IN delete: keeps only the rows the join does name.
+statement ok
+DELETE FROM bench WHERE k NOT IN (SELECT fact.fk FROM fact, dim WHERE fact.bucket = dim.b);
+
+query
+SELECT k FROM bench;
+----
+100
+101
+
+# A NULL anywhere in the subquery result makes NOT IN unknown for every row -> nothing is touched.
+statement ok
+CREATE TABLE withnull (x INT);
+
+statement ok
+INSERT INTO withnull VALUES (100), (NULL);
+
+statement ok
+DELETE FROM bench WHERE k NOT IN (SELECT x FROM withnull);
+
+query rowsort
+SELECT k FROM bench;
+----
+100
+101
+
+# ...while plain IN still matches the non-NULL entries.
+statement ok
+DELETE FROM bench WHERE k IN (SELECT x FROM withnull);
+
+query
+SELECT k FROM bench;
+----
+101

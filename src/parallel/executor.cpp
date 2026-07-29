@@ -13,6 +13,7 @@
 #include "parallel/executor.h"
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <mutex>  // NOLINT
 #include <string>
@@ -118,6 +119,66 @@ auto Executor::GetOrCreateOperatorState(const PhysicalOperator &op) -> GlobalOpe
   return slot.get();
 }
 
+auto Executor::PeakTaskDemand() const -> idx_t {
+  // How many tasks can be runnable AT ONCE? A pipeline only starts once every pipeline it depends on
+  // has finished, so two pipelines on the same dependency chain never overlap and must not be added
+  // up. The answer is the heaviest antichain of the dependency DAG; this is a sound upper bound on
+  // it, and an exact one for the two shapes that actually occur: a chain (an INSERT's
+  // Values->Insert->ResultCollector: max, i.e. 1) and independent siblings (two hash-join builds
+  // feeding one probe: their sum).
+  //
+  // Any antichain that contains `p` is `p` plus pipelines incomparable to `p`, so
+  // `max over p of (w(p) + sum of incomparable weights)` can never under-count.
+  const idx_t n = pipelines_.size();
+  if (n <= 1) {
+    return n == 0 ? 0 : pipelines_[0]->MaxThreads();
+  }
+
+  std::unordered_map<const Pipeline *, idx_t> index;
+  index.reserve(n);
+  for (idx_t i = 0; i < n; i++) {
+    index[pipelines_[i].get()] = i;
+  }
+  // Reachability over `dependencies_` ("must finish before me"): reaches[i] = the pipelines i waits on,
+  // directly or transitively. `pipelines_` is grown from the root down and dependencies always point
+  // at earlier-created pipelines, but the closure below does not rely on any particular order.
+  std::vector<std::vector<char>> reaches(n, std::vector<char>(n, 0));
+  std::vector<char> done(n, 0);
+  std::function<void(idx_t)> close = [&](idx_t i) {
+    if (done[i] != 0) {
+      return;
+    }
+    done[i] = 1;  // set first: a cyclic DAG would be a bug, not a hang
+    for (const auto *dep : pipelines_[i]->dependencies_) {
+      const idx_t d = index[dep];
+      close(d);
+      reaches[i][d] = 1;
+      for (idx_t k = 0; k < n; k++) {
+        reaches[i][k] |= reaches[d][k];
+      }
+    }
+  };
+  for (idx_t i = 0; i < n; i++) {
+    close(i);
+  }
+
+  std::vector<idx_t> weight(n);
+  for (idx_t i = 0; i < n; i++) {
+    weight[i] = pipelines_[i]->MaxThreads();
+  }
+  idx_t peak = 0;
+  for (idx_t i = 0; i < n; i++) {
+    idx_t concurrent = weight[i];
+    for (idx_t j = 0; j < n; j++) {
+      if (j != i && reaches[i][j] == 0 && reaches[j][i] == 0) {
+        concurrent += weight[j];  // neither waits on the other: they can run together
+      }
+    }
+    peak = std::max(peak, concurrent);
+  }
+  return peak;
+}
+
 void Executor::CreateTasks(Pipeline &p, std::vector<TaskRef> &out) {
   const idx_t n = std::max<idx_t>(1, p.MaxThreads());
   // ARM THE COUNTER BEFORE ANY TASK CAN BE OBSERVED: a fast worker could otherwise drain the
@@ -177,8 +238,8 @@ void Executor::ExecuteQuery() {
   }
   scheduler_.EnqueueAll(std::move(ready));
 
-  // The client thread becomes a worker (no idle coordinator core); spawn the rest of the pool.
-  const idx_t nthreads = std::clamp<idx_t>(context_.config_.max_threads_, 1, MAX_THREADS);
+  const idx_t nthreads = std::clamp<idx_t>(std::min<idx_t>(context_.config_.max_threads_, PeakTaskDemand()), 1,
+                                           MAX_THREADS);
   std::vector<std::thread> workers;
   workers.reserve(nthreads > 0 ? nthreads - 1 : 0);
   for (idx_t i = 1; i < nthreads; i++) {

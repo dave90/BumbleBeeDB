@@ -53,6 +53,17 @@ class FrameHeader {
   auto GetDataMut() -> data_ptr_t;
   void Reset();
 
+  /**
+   * @brief Materialize this frame's page buffer if it does not have one yet.
+   *
+   * The pool is sized for the worst case (`BUFFER_POOL_SIZE` frames), and allocating every buffer
+   * up front means zero-filling hundreds of megabytes at startup that a short query never touches
+   * — a fixed cost bigger than most queries. Frames therefore take their buffer the first time
+   * they are bound to a page, and keep it afterwards (a Reset back to the free list does not give
+   * it up), so nothing on the steady-state path allocates. Called under the pool latch.
+   */
+  void EnsureData();
+
   /** The index of this frame in the buffer pool. */
   const frame_id_t frame_id_;
 
@@ -65,7 +76,8 @@ class FrameHeader {
   /** Whether the page has been modified since it was read in. */
   bool is_dirty_;
 
-  /** The page's data: a fixed PAGE_SIZE heap buffer (its own allocation so ASan flags OOB access). */
+  /** The page's data: a fixed PAGE_SIZE heap buffer (its own allocation so ASan flags OOB access).
+   * Null until the frame is first bound to a page — see EnsureData(). */
   std::unique_ptr<data_t[]> data_;
 
   /** The page currently in this frame, or nullopt when free. */

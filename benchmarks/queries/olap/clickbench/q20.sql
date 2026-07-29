@@ -1,0 +1,1 @@
+SELECT COUNT(*) AS c FROM hits WHERE URL LIKE '%google%'

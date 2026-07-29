@@ -162,6 +162,16 @@ class Vector {
   void Initialize(idx_t capacity) { Initialize(false, capacity); }
   void Initialize(bool zero_data) { Initialize(zero_data, STANDARD_VECTOR_SIZE); }
 
+  /**
+   * @brief Back to an empty flat vector over `cache_mngr`'s standard-size buffer.
+   *
+   * Reuses the buffer only when the cache is its sole remaining owner (checked after this
+   * vector drops its own references); otherwise the buffer stays alive under whoever still
+   * references it and `cache_mngr` is replaced with a fresh allocation. Keeps the current
+   * logical type. Not for LIST/ARRAY vectors — their child buffers cannot be reused in place.
+   */
+  void ResetFromCache(vector_data_mngr_ptr_t &cache_mngr);
+
   /** @return A rendering of the first `count` rows. */
   auto ToString(idx_t count) const -> std::string;
 
@@ -253,6 +263,9 @@ class Vector {
 
   /** @return The manager owning the data. */
   auto GetDataMngr() -> vector_data_mngr_ptr_t { return data_mngr_; }
+
+  /** @return The data manager as a raw pointer (identity checks without refcount traffic). */
+  auto DataMngrPtr() const -> const VectorDataMngr * { return data_mngr_.get(); }
 
   /** @brief Replace the auxiliary manager. */
   void SetAuxiliary(vector_data_mngr_ptr_t new_buffer) { aux_data_mngr_ = std::move(new_buffer); }

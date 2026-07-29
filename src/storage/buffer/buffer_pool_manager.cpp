@@ -24,9 +24,12 @@
 
 namespace bumblebee {
 
-FrameHeader::FrameHeader(frame_id_t frame_id)
-    : frame_id_(frame_id), data_(std::make_unique<data_t[]>(PAGE_SIZE)) {  // value-init → zero-filled
-  Reset();
+FrameHeader::FrameHeader(frame_id_t frame_id) : frame_id_(frame_id) { Reset(); }
+
+void FrameHeader::EnsureData() {
+  if (data_ == nullptr) {
+    data_ = std::make_unique<data_t[]>(PAGE_SIZE);  // value-init → zero-filled
+  }
 }
 
 auto FrameHeader::GetData() const -> const_data_ptr_t { return data_.get(); }
@@ -178,6 +181,7 @@ auto BufferPoolManager::CheckedPage(page_id_t page_id, AccessType access_type) -
         auto frame_id = free_frames_.back();
         free_frames_.pop_back();
         frame = frames_[frame_id];
+        frame->EnsureData();  // the one point a frame goes from unused to holding a page
 
         // Read the page's data into the frame.
         DiskRequest request{false, frame->data_.get(), page_id, disk_scheduler_->CreatePromise()};

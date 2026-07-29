@@ -1,0 +1,149 @@
+{
+  "engine": "duckdb",
+  "db": "data/db/duck_olap.duckdb",
+  "reset_db": true,
+  "setup": [
+    "data/setup/duckdb_olap.sql"
+  ],
+  "setup_cmd": "${DUCKDB_BIN:-$HOME/.duckdb/cli/latest/duckdb} $DB < $FILE",
+  "run_cmd": "${DUCKDB_BIN:-$HOME/.duckdb/cli/latest/duckdb} -list -noheader -separator ' ' $DB -c \"$(cat $FILE)\"",
+  "stdin_cmd": "${DUCKDB_BIN:-$HOME/.duckdb/cli/latest/duckdb} -list -noheader -separator ' ' $DB < $FILE",
+  "query_dir": "queries/olap",
+  "previous_comparison": true,
+  "tests": [
+    {
+      "test": "clickbench_q00",
+      "file": "clickbench/q00.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q01",
+      "file": "clickbench/q01.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q02",
+      "file": "clickbench/q02.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q03",
+      "file": "clickbench/q03.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q06",
+      "file": "clickbench/q06.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q07",
+      "file": "clickbench/q07.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q12",
+      "file": "clickbench/q12.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q14",
+      "file": "clickbench/q14.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q19",
+      "file": "clickbench/q19.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q20",
+      "file": "clickbench/q20.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q21",
+      "file": "clickbench/q21.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q25",
+      "file": "clickbench/q25.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q26",
+      "file": "clickbench/q26.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q30",
+      "file": "clickbench/q30.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q32",
+      "file": "clickbench/q32.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q33",
+      "file": "clickbench/q33.sql",
+      "timeout": 300
+    },
+    {
+      "test": "clickbench_q36",
+      "file": "clickbench/q36.sql",
+      "timeout": 300
+    },
+    {
+      "test": "tpch_q01",
+      "file": "tpch/q01.sql",
+      "timeout": 300
+    },
+    {
+      "test": "tpch_q02",
+      "file": "tpch/q02.sql",
+      "timeout": 300
+    },
+    {
+      "test": "tpch_q03",
+      "file": "tpch/q03.sql",
+      "timeout": 90,
+      "num_tries": 1
+    },
+    {
+      "test": "tpch_q04",
+      "file": "tpch/q04.sql",
+      "timeout": 300
+    },
+    {
+      "test": "tpch_q05",
+      "file": "tpch/q05.sql",
+      "timeout": 90,
+      "num_tries": 1
+    },
+    {
+      "test": "tpch_q10",
+      "file": "tpch/q10.sql",
+      "timeout": 90,
+      "num_tries": 1
+    },
+    {
+      "test": "tpch_q15",
+      "file": "tpch/q15.sql",
+      "timeout": 300
+    },
+    {
+      "test": "tpch_q17",
+      "file": "tpch/q17.sql",
+      "timeout": 300
+    },
+    {
+      "test": "tpch_mq07",
+      "file": "tpch/mq07.sql",
+      "timeout": 90,
+      "num_tries": 1
+    }
+  ]
+}

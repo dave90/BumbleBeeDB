@@ -1,0 +1,51 @@
+# ORDER BY may reference a SELECT output alias or a computed column, not just base columns.
+# These resolve against the select list (aliases, aggregate results, the underlying column of an
+# alias) and fall back to base-table columns otherwise.
+
+statement ok
+CREATE TABLE t (g INT, v INT, name VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1,10,'a'),(1,20,'a'),(2,5,'b'),(3,30,'c'),(3,30,'c');
+
+# ORDER BY a plain column alias.
+query
+SELECT v AS value FROM t ORDER BY value LIMIT 3;
+----
+5
+10
+20
+
+# ORDER BY an aggregate result alias, then by a bare group-key column.
+query
+SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c DESC, g;
+----
+1 2
+3 2
+2 1
+
+# ORDER BY a SUM alias.
+query
+SELECT g, SUM(v) AS total FROM t GROUP BY g ORDER BY total DESC;
+----
+3 60
+1 30
+2 5
+
+# ORDER BY the underlying column name of an aliased select item (name -> its alias output).
+query
+SELECT name AS n, COUNT(*) AS c FROM t GROUP BY name ORDER BY c DESC, name DESC;
+----
+'c' 2
+'a' 2
+'b' 1
+
+# Non-aggregate: ORDER BY an alias plus a base column that is also selected.
+query
+SELECT g AS grp, v FROM t ORDER BY grp DESC, v;
+----
+3 30
+3 30
+2 5
+1 10
+1 20

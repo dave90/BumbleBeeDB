@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <mutex>  // NOLINT
 #include <utility>
@@ -29,6 +30,9 @@ class ResultCollectorGlobalState : public GlobalSinkState {
  public:
   std::mutex mu_;
   std::vector<std::unique_ptr<DataChunk>> chunks_;
+  /** Chunks as combined, each tagged with its source batch index; Finalize stable-sorts them by
+   * batch into `chunks_`, reconstructing the serial scan order from a parallel pipeline. */
+  std::vector<std::pair<idx_t, std::unique_ptr<DataChunk>>> tagged_;
 
   /** @return The total number of result rows across all chunks. */
   auto RowCount() const -> idx_t {
@@ -43,7 +47,7 @@ class ResultCollectorGlobalState : public GlobalSinkState {
 /** @brief One worker's private buffer of result chunks, moved into the global set at Combine. */
 class ResultCollectorLocalState : public LocalSinkState {
  public:
-  std::vector<std::unique_ptr<DataChunk>> chunks_;
+  std::vector<std::pair<idx_t, std::unique_ptr<DataChunk>>> chunks_;
 };
 
 /**
@@ -81,7 +85,7 @@ class PhysicalResultCollector : public PhysicalOperator {
     auto &ls = static_cast<ResultCollectorLocalState &>(lstate);
     auto owned = input.Clone();
     owned->Normalify();
-    ls.chunks_.push_back(std::move(owned));
+    ls.chunks_.emplace_back(ls.batch_idx_, std::move(owned));
     return SinkResultType::NEED_MORE_INPUT;
   }
 
@@ -90,14 +94,30 @@ class PhysicalResultCollector : public PhysicalOperator {
     auto &ls = static_cast<ResultCollectorLocalState &>(lstate);
     std::lock_guard lock(gs.mu_);
     for (auto &c : ls.chunks_) {
-      gs.chunks_.push_back(std::move(c));  // zero row copies: just move the unique_ptr
+      gs.tagged_.push_back(std::move(c));  // zero row copies: just move the unique_ptr
     }
     ls.chunks_.clear();
   }
 
-  // A result collector never runs in parallel — one ordered stream out. (Order-preservation across a
-  // parallel probe is a future concern; single-task keeps the result deterministic for now.)
-  auto ParallelSink() const -> bool override { return false; }
+  auto Finalize(ClientContext & /*context*/, GlobalSinkState &gstate, idx_t /*stage*/, idx_t /*task_idx*/,
+                idx_t /*task_count*/) const -> SinkFinalizeType override {
+    // One morsel is drained by exactly one task, so chunks sharing a batch index arrived in order
+    // within one local buffer; the stable sort therefore reconstructs the full serial order.
+    auto &gs = static_cast<ResultCollectorGlobalState &>(gstate);
+    std::stable_sort(gs.tagged_.begin(), gs.tagged_.end(),
+                     [](const auto &a, const auto &b) { return a.first < b.first; });
+    gs.chunks_.reserve(gs.tagged_.size());
+    for (auto &t : gs.tagged_) {
+      gs.chunks_.push_back(std::move(t.second));
+    }
+    gs.tagged_.clear();
+    return SinkFinalizeType::READY;
+  }
+
+  // The collector may run in parallel: chunks are tagged with their source batch index and Finalize
+  // restores the serial order. Pipeline::MaxThreads still serializes it when the source cannot
+  // provide batch indexes (SinkOrderDependent + !SourceProvidesBatchIndex).
+  auto SinkOrderDependent() const -> bool override { return true; }
 };
 
 }  // namespace bumblebee

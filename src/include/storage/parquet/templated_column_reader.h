@@ -35,6 +35,27 @@ struct TemplatedParquetValueConversion {
   static auto Null() -> VALUE_TYPE { return NumericLimits<VALUE_TYPE>::Maximum(); }
 };
 
+/**
+ * @brief True when one value's parquet payload is byte-identical to `VALUE_TYPE`, so a run of
+ * defined, unfiltered values can be copied in bulk instead of decoded one at a time.
+ *
+ * The trivial conversion qualifies by construction (same type in and out). Any other conversion
+ * opts in by defining a static `PlainIsBitwise(ColumnReader &)` — DECIMAL does, because its
+ * INT32/INT64 storage already holds little-endian two's complement.
+ *
+ * @param reader The column reader (the storage layout is a property of its schema element).
+ */
+template <class VALUE_TYPE, class VALUE_CONVERSION>
+auto PlainIsBitwise(ColumnReader &reader) -> bool {
+  if constexpr (std::is_same_v<VALUE_CONVERSION, TemplatedParquetValueConversion<VALUE_TYPE>>) {
+    return true;
+  } else if constexpr (requires { VALUE_CONVERSION::PlainIsBitwise(reader); }) {
+    return VALUE_CONVERSION::PlainIsBitwise(reader);
+  } else {
+    return false;
+  }
+}
+
 /** @brief Column reader for fixed-width types whose parquet payload is (convertible to) the
  * in-memory representation. */
 template <class VALUE_TYPE, class VALUE_CONVERSION>
@@ -88,16 +109,15 @@ class TemplatedColumnReader : public ColumnReader {
              idx_t result_offset, Vector &result) override {
     auto *result_ptr = FlatVector::GetData<VALUE_TYPE>(result);
 
-    if constexpr (std::is_same_v<VALUE_CONVERSION, TemplatedParquetValueConversion<VALUE_TYPE>>) {
-      // Fast path for plain fixed-width values: with no NULLs and no filtered rows, the
-      // per-row Read<T> loop is a straight buffer copy. CopyTo/Inc perform the same bounds
-      // check the per-value reads would.
-      if (filter.all() && AllDefined(defines, result_offset, num_values)) {
-        const uint64_t bytes = num_values * sizeof(VALUE_TYPE);
-        plain_data->CopyTo(reinterpret_cast<char *>(result_ptr + result_offset), bytes);
-        plain_data->Inc(bytes);
-        return;
-      }
+    // Fast path for bitwise-identical payloads: with no NULLs and no filtered rows, the per-row
+    // decode loop is a straight buffer copy. CopyTo/Inc perform the same bounds check the
+    // per-value reads would.
+    if (filter.all() && PlainIsBitwise<VALUE_TYPE, VALUE_CONVERSION>(*this) &&
+        AllDefined(defines, result_offset, num_values)) {
+      const uint64_t bytes = num_values * sizeof(VALUE_TYPE);
+      plain_data->CopyTo(reinterpret_cast<char *>(result_ptr + result_offset), bytes);
+      plain_data->Inc(bytes);
+      return;
     }
 
     for (idx_t row_idx = 0; row_idx < num_values; row_idx++) {

@@ -21,6 +21,7 @@
 #include "binder/statement/select_statement.h"
 #include "common/exception.h"
 #include "execution/expressions/abstract_expression.h"
+#include "execution/expressions/cast_expression.h"
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/constant_value_expression.h"
 #include "execution/plans/abstract_plan.h"
@@ -46,6 +47,13 @@ auto Planner::PlanAggCall(const BoundAggCall &agg_call, const std::vector<Abstra
     auto guard = NewContext();
     for (const auto &arg : agg_call.args_) {
       auto [_, ret] = PlanExpression(*arg, children);
+      // A DECIMAL argument carries its value as a scaled integer; the aggregate kernels accumulate
+      // that raw integer in a double and would re-scale it at finalize (SUM/AVG/MIN/MAX come out
+      // 10^scale too large). Cast DECIMAL to DOUBLE up front so every aggregate accumulates the
+      // real value uniformly (matches the ungrouped path, which already reads values as reals).
+      if (ret->GetReturnType().GetType().GetTypeId() == LogicalTypeId::DECIMAL) {
+        ret = std::make_shared<CastExpression>(std::move(ret), LogicalType(LogicalTypeId::DOUBLE));
+      }
       exprs.emplace_back(std::move(ret));
     }
   }
@@ -119,13 +127,8 @@ auto Planner::PlanSelectAgg(const SelectStatement &statement, AbstractPlanNodeRe
 
     agg_types.push_back(agg_type);
     output_col_names.emplace_back(fmt::format("agg#{}", term_idx));
-    // The placeholder resolves to this column of the aggregation node's output; it must carry
-    // the aggregate's real output type (mirrors InferAggSchema): COUNT is INTEGER, SUM/MIN/MAX
-    // keep their argument's type.
-    const bool is_count =
-        agg_type == AggregationType::CountStarAggregate || agg_type == AggregationType::CountAggregate;
     LogicalType agg_result_type =
-        is_count ? LogicalType(LogicalTypeId::INTEGER) : input_exprs.back()->GetReturnType().GetType();
+        AggregationPlanNode::AggResultType(agg_type, input_exprs.back()->GetReturnType().GetType());
     ctx_.expr_in_agg_.emplace_back(std::make_shared<ColumnValueExpression>(
         0, agg_begin_idx + term_idx, Column::Make("<agg_result>", std::move(agg_result_type))));
 

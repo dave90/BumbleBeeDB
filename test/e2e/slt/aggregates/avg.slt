@@ -1,0 +1,46 @@
+# AVG aggregate: DOUBLE result = SUM / COUNT of the non-NULL inputs. NULLs are skipped;
+# a group (or table) with no non-NULL input averages to NULL.
+
+statement ok
+CREATE TABLE t (a INT, g INT, f DOUBLE);
+
+statement ok
+INSERT INTO t VALUES (1,1,1.5),(2,1,2.5),(3,2,3.0),(4,2,NULL),(10,2,10.0);
+
+# Ungrouped average of an integer column: (1+2+3+4+10)/5 = 4.
+query
+SELECT AVG(a) FROM t;
+----
+4
+
+# Grouped: group 1 -> (1+2)/2 = 1.5, group 2 -> (3+4+10)/3 = 5.666...
+query rowsort
+SELECT g, AVG(a) FROM t GROUP BY g;
+----
+1 1.5
+2 5.666666666666667
+
+# AVG skips NULLs: group 2's f is 3.0 and 10.0 (NULL ignored) -> 6.5; group 1 -> 2.0.
+query rowsort
+SELECT g, AVG(f) FROM t GROUP BY g;
+----
+1 2
+2 6.5
+
+# AVG alongside SUM/COUNT in one query (SUM widens to BIGINT, AVG stays DOUBLE).
+query
+SELECT SUM(a), COUNT(*), AVG(a) FROM t;
+----
+20 5 4
+
+# All-NULL input averages to NULL.
+statement ok
+CREATE TABLE u (a INT);
+
+statement ok
+INSERT INTO u VALUES (NULL), (NULL);
+
+query
+SELECT AVG(a) FROM u;
+----
+NULL

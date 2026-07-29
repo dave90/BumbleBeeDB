@@ -58,7 +58,16 @@ class SingleFileDiskManager : public DiskManager {
   /** @brief Ensure the file is large enough to hold `page_id` (grow, doubling capacity, if needed). */
   void EnsureCapacity(page_id_t page_id);
 
-  static auto GetFileSize(const std::string &file_name) -> int;
+  /**
+   * @brief Stat the file's size in bytes.
+   *
+   * Returns a 64-bit size: the database file routinely passes 2 GiB once out-of-core
+   * operators spill into it, and a 32-bit result would wrap negative there — which
+   * ReadPage reads as an I/O error, failing every page read past that point.
+   *
+   * @return int64_t The size in bytes, or -1 if the file cannot be stat'd.
+   */
+  static auto GetFileSize(const std::string &file_name) -> int64_t;
 
   int num_writes_{0};
   int num_deletes_{0};

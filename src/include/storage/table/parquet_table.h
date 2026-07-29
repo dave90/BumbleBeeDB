@@ -20,6 +20,7 @@
 
 #include "catalog/schema.h"
 #include "common/exception.h"
+#include "storage/parquet/parquet_manifest.h"
 #include "storage/table/table_storage.h"
 
 namespace bumblebee {
@@ -42,6 +43,12 @@ class ParquetTable : public TableStorage {
       : path_(std::move(path)), schema_(std::move(schema)) {}
 
   auto GetFormat() const -> StorageFormat override { return StorageFormat::PARQUET; }
+
+  /** @brief Row count from the newest manifest (sum of per-file counts); 0 when no manifest exists. */
+  auto EstimatedRowCount() const -> idx_t override {
+    auto manifest = ParquetManifestIO::ReadLatest(path_);
+    return manifest.has_value() ? manifest->TotalRows() : 0;
+  }
 
   /** @return The folder holding the table's data files. */
   auto GetPath() const -> const std::string & { return path_; }

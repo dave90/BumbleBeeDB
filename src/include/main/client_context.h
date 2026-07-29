@@ -35,6 +35,10 @@ struct ClientConfig {
   bool prefer_external_{false};
   /** Heap pages per parallel-scan morsel; lowering it lets a small table span several morsels (tests). */
   idx_t morsel_pages_{MORSEL_PAGES};
+  /** Local-table group count past which a hash-aggregate sink task switches to per-partition
+   * sub-tables (zero-copy combine hand-off); lowering it lets tests exercise the partitioned
+   * path with small tables. 0 keeps the default. */
+  idx_t agg_partition_threshold_{0};
   /** Target rows per columnar (row-group) morsel. Reserved for the columnar scan path. */
   idx_t morsel_size_{MORSEL_SIZE};
 };

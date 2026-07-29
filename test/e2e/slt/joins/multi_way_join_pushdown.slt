@@ -1,0 +1,89 @@
+# Multi-table joins with single-table WHERE predicates mixed into the join condition.
+# The planner nests these as a stack of cross products and folds the whole WHERE into
+# only the outermost one; recursive filter pushdown must turn EVERY level into a hash
+# join (each equi-condition onto its own join, each single-table filter onto its scan)
+# rather than leaving inner cross products behind. These assert the RESULTS are correct;
+# the plan shape (no NestedLoopJoin survives) is pinned by the optimizer unit tests.
+
+statement ok
+CREATE TABLE customer(c_id INT, region VARCHAR(20), budget INT);
+
+statement ok
+INSERT INTO customer VALUES (1,'east',500),(2,'west',100),(3,'east',900),(4,'north',700);
+
+statement ok
+CREATE TABLE orders(o_id INT, c_id INT, amount INT);
+
+statement ok
+INSERT INTO orders VALUES (10,1,50),(11,1,60),(12,3,90),(13,4,70),(14,2,20);
+
+statement ok
+CREATE TABLE lineitem(l_id INT, o_id INT, qty INT);
+
+statement ok
+INSERT INTO lineitem VALUES (100,10,5),(101,11,6),(102,12,9),(103,13,7),(104,14,2);
+
+# Three-way equi-join with a single-table filter on the first table (budget > 400).
+# c_id 2 (budget 100) is filtered out before the join.
+query rowsort
+SELECT customer.c_id, orders.o_id, lineitem.qty
+FROM customer, orders, lineitem
+WHERE customer.c_id = orders.c_id AND orders.o_id = lineitem.o_id AND customer.budget > 400;
+----
+1 10 5
+1 11 6
+3 12 9
+4 13 7
+
+# Single-table filters on more than one table at once (region on customer, qty on lineitem).
+query rowsort
+SELECT customer.c_id, lineitem.qty
+FROM customer, orders, lineitem
+WHERE customer.c_id = orders.c_id AND orders.o_id = lineitem.o_id
+  AND customer.region = 'east' AND lineitem.qty >= 9;
+----
+3 9
+
+# A range predicate spanning two tables stays a nested-loop condition, while the
+# equi-conditions still become hash joins — the mix must produce the right rows.
+query rowsort
+SELECT customer.c_id, orders.amount, lineitem.qty
+FROM customer, orders, lineitem
+WHERE customer.c_id = orders.c_id AND orders.o_id = lineitem.o_id
+  AND orders.amount > customer.budget - 460;
+----
+1 50 5
+1 60 6
+2 20 2
+
+# Written as explicit INNER JOIN ... ON with a trailing WHERE — same plan, same answer.
+query rowsort
+SELECT customer.region, SUM(lineitem.qty)
+FROM customer
+JOIN orders ON customer.c_id = orders.c_id
+JOIN lineitem ON orders.o_id = lineitem.o_id
+WHERE customer.budget > 400
+GROUP BY customer.region;
+----
+'east' 20
+'north' 7
+
+# Four-table join: add a parts table joined off lineitem, filter on the far table.
+statement ok
+CREATE TABLE parts(l_id INT, weight INT);
+
+statement ok
+INSERT INTO parts VALUES (100,1),(101,2),(102,3),(103,4),(104,5);
+
+query rowsort
+SELECT customer.c_id, parts.weight
+FROM customer, orders, lineitem, parts
+WHERE customer.c_id = orders.c_id
+  AND orders.o_id = lineitem.o_id
+  AND lineitem.l_id = parts.l_id
+  AND customer.budget > 400
+  AND parts.weight < 4;
+----
+1 1
+1 2
+3 3

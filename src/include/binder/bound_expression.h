@@ -48,6 +48,12 @@ enum class ExpressionType : uint8_t {
   ALIAS = 10,
   /** A scalar function call, e.g. `lower(x)`. */
   FUNC_CALL = 11,
+  /** A `[NOT] IN` over a value list, e.g. `x IN (1, 2, 3)`. */
+  IN_EXPR = 12,
+  /** A subquery in expression position, e.g. `(SELECT max(x) FROM t)`. */
+  SUBQUERY = 13,
+  /** A reference to a column of an ENCLOSING query, inside a correlated subquery. */
+  OUTER_COLUMN_REF = 14,
 };
 
 /**
@@ -119,6 +125,15 @@ struct fmt::formatter<bumblebee::ExpressionType> : fmt::formatter<fmt::string_vi
         break;
       case bumblebee::ExpressionType::FUNC_CALL:
         name = "FuncCall";
+        break;
+      case bumblebee::ExpressionType::IN_EXPR:
+        name = "In";
+        break;
+      case bumblebee::ExpressionType::SUBQUERY:
+        name = "Subquery";
+        break;
+      case bumblebee::ExpressionType::OUTER_COLUMN_REF:
+        name = "OuterColumnRef";
         break;
       default:
         name = "Unknown";

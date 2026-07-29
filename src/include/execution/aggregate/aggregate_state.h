@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <string>
 #include <type_traits>
 
 #include "execution/plans/aggregation_plan.h"
@@ -24,8 +25,9 @@ namespace bumblebee {
 /**
  * @brief A running accumulator for one aggregate over one group — the B7 aggregate state.
  *
- * Numeric only for now (accumulates through `long double`, which carries the 64-bit integer range); a
- * string MIN/MAX is a future extension. NULL inputs are ignored except by COUNT(*), matching SQL.
+ * Numerics accumulate through `long double` (which carries the 64-bit integer range); MIN/MAX also
+ * accept a string argument, comparing lexicographically (SQL VARCHAR ordering) and keeping an owned
+ * copy. NULL inputs are ignored except by COUNT(*), matching SQL.
  *
  * Two update paths: `Update(Value)` folds one row (used where rows scatter across group states), and
  * `UpdateVector` folds a whole vector in one columnar pass — a constant collapses to O(1), a flat
@@ -46,8 +48,13 @@ class AggregateAccumulator {
       return;  // COUNT / SUM / MIN / MAX all skip NULLs
     }
     count_++;
+    if (IsStringMinMax(v)) {
+      FoldStr(v.GetString());
+      return;
+    }
     const auto d = v.GetAs<long double>();
     switch (type_) {
+      case AggregationType::AvgAggregate:  // AVG accumulates like SUM; it divides by count only at finalize.
       case AggregationType::SumAggregate:
         sum_ += d;
         break;
@@ -84,9 +91,13 @@ class AggregateAccumulator {
       if (val.IsNull()) {
         return;  // a NULL constant contributes nothing (COUNT(*) was handled above)
       }
-      const auto d = val.GetAs<long double>();
       count_ += static_cast<int64_t>(count);
-      if (type_ == AggregationType::SumAggregate) {
+      if (IsStringMinMax(val)) {
+        FoldStr(val.GetString());  // every row is the same string; one fold captures the min/max
+        return;
+      }
+      const auto d = val.GetAs<long double>();
+      if (type_ == AggregationType::SumAggregate || type_ == AggregationType::AvgAggregate) {
         sum_ += d * static_cast<long double>(count);
       } else if (type_ == AggregationType::MinAggregate) {
         FoldMin(d);
@@ -132,7 +143,9 @@ class AggregateAccumulator {
     count_ += o.count_;
     sum_ += o.sum_;
     if (o.has_acc_) {
-      if (!has_acc_) {
+      if (o.is_string_) {
+        FoldStr(o.str_acc_);  // string MIN/MAX: fold the other's extreme in (sets is_string_/has_acc_)
+      } else if (!has_acc_) {
         acc_ = o.acc_;
       } else if (type_ == AggregationType::MinAggregate) {
         acc_ = o.acc_ < acc_ ? o.acc_ : acc_;
@@ -151,14 +164,40 @@ class AggregateAccumulator {
         return Value(static_cast<int64_t>(count_)).CastAs(out_type);
       case AggregationType::SumAggregate:
         return count_ == 0 ? Value::Null(out_type) : Value(static_cast<double>(sum_)).CastAs(out_type);
+      case AggregationType::AvgAggregate:
+        // AVG = value-sum / count, as DOUBLE; a zero-count (all-NULL) input is NULL.
+        return count_ == 0 ? Value::Null(out_type)
+                           : Value(static_cast<double>(sum_ / static_cast<long double>(count_))).CastAs(out_type);
       case AggregationType::MinAggregate:
       case AggregationType::MaxAggregate:
-        return has_acc_ ? Value(static_cast<double>(acc_)).CastAs(out_type) : Value::Null(out_type);
+        if (!has_acc_) {
+          return Value::Null(out_type);
+        }
+        return is_string_ ? Value(str_acc_).CastAs(out_type) : Value(static_cast<double>(acc_)).CastAs(out_type);
     }
     return Value::Null(out_type);
   }
 
  private:
+  /** @return True when this is MIN/MAX and the argument is a string (the lexicographic path). */
+  auto IsStringMinMax(const Value &v) const -> bool {
+    return (type_ == AggregationType::MinAggregate || type_ == AggregationType::MaxAggregate) &&
+           v.GetPhysicalType() == PhysicalType::STRING;
+  }
+
+  /** @brief Fold one string into the running MIN/MAX, keeping an owned copy of the extreme. */
+  void FoldStr(const std::string &s) {
+    if (!has_acc_) {
+      str_acc_ = s;
+      is_string_ = true;
+      has_acc_ = true;
+      return;
+    }
+    if (type_ == AggregationType::MinAggregate ? (s < str_acc_) : (s > str_acc_)) {
+      str_acc_ = s;
+    }
+  }
+
   void FoldMin(long double d) {
     acc_ = has_acc_ ? (d < acc_ ? d : acc_) : d;
     has_acc_ = true;
@@ -210,6 +249,7 @@ class AggregateAccumulator {
     if (validity.AllValid()) {
       count_ += static_cast<int64_t>(count);
       switch (type_) {
+        case AggregationType::AvgAggregate:  // AVG sums like SUM; the divide happens at finalize.
         case AggregationType::SumAggregate: {
           Acc local{};
           {
@@ -248,6 +288,7 @@ class AggregateAccumulator {
     // NULLs present: skip invalid rows, count the valid ones (COUNT/SUM/MIN/MAX all count non-NULLs).
     idx_t valid = 0;
     switch (type_) {
+      case AggregationType::AvgAggregate:  // AVG sums like SUM; the divide happens at finalize.
       case AggregationType::SumAggregate: {
         Acc local{};
         for (idx_t i = 0; i < count; i++) {
@@ -296,6 +337,9 @@ class AggregateAccumulator {
   long double sum_{0};
   long double acc_{0};
   bool has_acc_{false};
+  /** MIN/MAX over a string keeps its extreme here (owned); `is_string_` selects it over `acc_`. */
+  bool is_string_{false};
+  std::string str_acc_;
 };
 
 }  // namespace bumblebee

@@ -47,6 +47,7 @@ inline auto MakeTestCatalog() -> std::unique_ptr<Catalog> {
                                                Column{"b", kInt}, Column{"c", kInt}}));
   catalog->CreateTable("a", Schema(std::vector{Column{"x", kInt}, Column{"y", kInt}}));
   catalog->CreateTable("b", Schema(std::vector{Column{"x", kInt}, Column{"y", kInt}}));
+  catalog->CreateTable("d", Schema(std::vector{Column{"x", kInt}, Column{"y", kInt}}));
   catalog->CreateTable("c", Schema(std::vector{Column{"x", LogicalType(LogicalTypeId::STRING), 100},
                                                Column{"y", LogicalType(LogicalTypeId::STRING), 100}}));
   catalog->CreateTable("t1_1k", Schema(std::vector{Column{"v1", kInt}, Column{"v2", kInt}}));

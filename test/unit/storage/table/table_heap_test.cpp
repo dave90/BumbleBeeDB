@@ -93,6 +93,32 @@ TEST(TableHeapTest, VectorizedAppendThenScanRoundTrips) {
   EXPECT_FALSE(scan->Next(drained));  // one page, then exhausted
 }
 
+TEST(TableHeapTest, EstimatedRowCountCountsAppendedRows) {
+  MemoryDiskManager dm(256);
+  BufferPoolManager bpm(64, &dm);
+  auto schema = MakeSchema();
+  TableHeap heap(&bpm, schema);
+
+  EXPECT_EQ(heap.EstimatedRowCount(), 0U);  // empty heap
+
+  // Append enough rows to span several pages (so the estimate must walk the page directory).
+  constexpr int kRows = 5000;
+  int written = 0;
+  while (written < kRows) {
+    std::vector<Person> batch;
+    const int n = std::min(500, kRows - written);
+    for (int i = 0; i < n; i++) {
+      batch.push_back({written + i, "person", static_cast<double>(written + i)});
+    }
+    auto chunk = MakeChunk(*schema, batch);
+    Vector rids{LogicalType{LogicalTypeId::BIGINT}};
+    heap.Append(*chunk, rids);
+    written += n;
+  }
+  // The estimate counts slotted-page tuples: exact here (no deletes), spanning many pages.
+  EXPECT_EQ(heap.EstimatedRowCount(), static_cast<idx_t>(kRows));
+}
+
 TEST(TableHeapTest, EmptyTableScanEndsImmediately) {
   MemoryDiskManager dm(256);
   BufferPoolManager bpm(16, &dm);

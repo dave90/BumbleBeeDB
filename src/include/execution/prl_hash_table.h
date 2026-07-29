@@ -76,6 +76,31 @@ class PRLHashTable {
   auto operator=(const PRLHashTable &) -> PRLHashTable & = delete;
 
   /**
+   * @brief One probing task's reusable scratch for `Probe`.
+   *
+   * A probe pipeline calls `Probe` once per chunk — tens of thousands of times over a large scan —
+   * so the candidate batch and the match selections are allocated (and zeroed) here ONCE and reused,
+   * not rebuilt per call. One state per task: the table itself is shared read-only while probing,
+   * this is not.
+   */
+  struct ProbeState {
+    ProbeState();
+
+    /** Candidate build-row addresses awaiting key verification. */
+    std::vector<data_ptr_t> cand_addr_;
+    /** The probe row each candidate came from, parallel to `cand_addr_`. */
+    std::vector<sel_t> cand_row_;
+    /** `cand_addr_` seen as a vector of row pointers, for the batched Match. */
+    Vector cand_rows_vec_;
+    /** `cand_row_` seen as a selection into the probe key columns. */
+    SelectionVector cand_col_sel_;
+    /** The identity selection Match reads its left side through. */
+    SelectionVector identity_;
+    SelectionVector match_sel_;
+    SelectionVector no_match_sel_;
+  };
+
+  /**
    * @brief The selection of rows whose every key column is non-NULL (a NULL key never equi-matches).
    *
    * The shared probe/build-side filter of the equi-joins: SQL `=` treats `NULL = NULL` as unknown, so a
@@ -147,6 +172,12 @@ class PRLHashTable {
    * @param out_rows Out: the matching probe row of each address (appended).
    * @param matched Out (optional): flags indexed by probe row, set to 1 when the row matched anything.
    */
+  void Probe(ProbeState &state, Vector &hashes, DataChunk &keys, const SelectionVector &sel, idx_t count,
+             std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows,
+             std::vector<uint8_t> *matched = nullptr);
+
+  /** @brief `Probe` with a throwaway scratch state. For one-shot callers (tests); a probe loop
+   * should own a `ProbeState` and use the overload above. */
   void Probe(Vector &hashes, DataChunk &keys, const SelectionVector &sel, idx_t count,
              std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows,
              std::vector<uint8_t> *matched = nullptr);
@@ -165,15 +196,25 @@ class PRLHashTable {
   /** @return The number of rows in the table. */
   auto Count() const -> idx_t { return count_; }
 
+  /** @return The current directory capacity (slots). */
+  auto Capacity() const -> idx_t { return capacity_; }
+
   /** @return The row layout (key columns first, then payload columns). */
   auto GetLayout() const -> const RowLayout & { return layout_; }
 
   /** @return The layout column types. */
   auto GetTypes() const -> const std::vector<LogicalType> & { return types_; }
 
- private:
-  /** @brief Grow the directory to `new_capacity` (a power of two) and rehash every entry. */
+  /** @return Every row's key hash in insertion order — the same order `Scan` walks, so window
+   * [offset, offset+n) of a scan pairs with these entries. Saves re-hashing the keys when the
+   * rows leave the table (a high-cardinality aggregate merge re-partitions by this hash). */
+  auto RowHashes() const -> const std::vector<hash_t> & { return row_hashes_; }
+
+  /** @brief Grow the directory to `new_capacity` (a power of two, >= the current capacity) and
+   * rehash every entry. Public so a merge that knows its final group count can presize once. */
   void Resize(idx_t new_capacity);
+
+ private:
 
   /** @brief Bump-allocate `size` bytes for one row. */
   auto AllocateRow(idx_t size) -> data_ptr_t;

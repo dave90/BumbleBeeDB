@@ -29,6 +29,19 @@ auto Pipeline::MaxThreads() const -> idx_t {
       n = 1;
     }
   }
+  if (sink_->SinkOrderDependent()) {
+    // An order-dependent sink reconstructs the serial order from source batch indexes; without
+    // them (or through an operator that picks rows nondeterministically, e.g. a streaming LIMIT)
+    // the order is unrecoverable, so the pipeline stays serial.
+    if (!source_->SourceProvidesBatchIndex()) {
+      n = 1;
+    }
+    for (auto *op : operators_) {
+      if (op->OperatorOrderDependent()) {
+        n = 1;
+      }
+    }
+  }
   if (source_->IsOrderPreserving()) {
     n = 1;  // a Sort source feeding a parallel sink would shuffle the order — keep it serial
   }

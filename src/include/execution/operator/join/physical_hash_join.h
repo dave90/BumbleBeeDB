@@ -58,18 +58,36 @@ class PhysicalHashJoin : public PhysicalOperator {
     key_modifiers_.assign(left_keys_.size(), OrderModifiers(OrderType::ASCENDING));
     children_.push_back(std::move(build));  // child 0 = left input
     children_.push_back(std::move(probe));  // child 1 = right input
+    // Default: every build column is stored and gathered (SetLiveBuildColumns narrows this).
+    const idx_t build_width = children_[BuildChildIdx()]->output_schema_->GetColumnCount();
+    live_build_columns_.resize(build_width);
+    for (idx_t i = 0; i < build_width; i++) {
+      live_build_columns_[i] = i;
+    }
   }
+
+  /** @brief Restrict the stored/gathered build columns to `live` (indexes into the build child's
+   * schema, sorted). The other build outputs surface as constant NULLs nothing reads. */
+  void SetLiveBuildColumns(std::vector<idx_t> live) { live_build_columns_ = std::move(live); }
 
   /** @return True for a LEFT OUTER join (preserves the left/child-0 input). */
   auto IsLeftJoin() const -> bool { return join_type_ == JoinType::LEFT; }
-  /** @return The child index whose rows are hashed into the build table (left for INNER, right for LEFT). */
-  auto BuildChildIdx() const -> idx_t { return IsLeftJoin() ? 1 : 0; }
-  /** @return The child index streamed as the probe (right for INNER, the preserved left for LEFT). */
-  auto ProbeChildIdx() const -> idx_t { return IsLeftJoin() ? 0 : 1; }
+  /** @return True for a SEMI or ANTI join (emit left rows only, at most once each). */
+  auto IsSemiOrAnti() const -> bool { return join_type_ == JoinType::SEMI || join_type_ == JoinType::ANTI; }
+  /** @return True when the left/child-0 input streams as the probe (LEFT, SEMI, ANTI). */
+  auto PreservesLeft() const -> bool { return IsLeftJoin() || IsSemiOrAnti(); }
+  /** @return The child index whose rows are hashed into the build table (left for INNER, else right). */
+  auto BuildChildIdx() const -> idx_t { return PreservesLeft() ? 1 : 0; }
+  /** @return The child index streamed as the probe (right for INNER, the preserved left otherwise). */
+  auto ProbeChildIdx() const -> idx_t { return PreservesLeft() ? 0 : 1; }
   /** @return The equi-join key expressions evaluated over the build rows. */
-  auto BuildKeys() const -> const std::vector<AbstractExpressionRef> & { return IsLeftJoin() ? right_keys_ : left_keys_; }
+  auto BuildKeys() const -> const std::vector<AbstractExpressionRef> & {
+    return PreservesLeft() ? right_keys_ : left_keys_;
+  }
   /** @return The equi-join key expressions evaluated over the probe rows. */
-  auto ProbeKeys() const -> const std::vector<AbstractExpressionRef> & { return IsLeftJoin() ? left_keys_ : right_keys_; }
+  auto ProbeKeys() const -> const std::vector<AbstractExpressionRef> & {
+    return PreservesLeft() ? left_keys_ : right_keys_;
+  }
 
   // ---- sink role (build the hash table) --------------------------------------
   auto IsSink() const -> bool override { return true; }
@@ -92,7 +110,23 @@ class PhysicalHashJoin : public PhysicalOperator {
   void BuildPipelines(Pipeline &current, PipelineBuilder &builder) const override;
 
   auto ParamsToString() const -> std::string override {
-    const char *t = join_type_ == JoinType::INNER ? "Inner" : (join_type_ == JoinType::LEFT ? "Left" : "Outer");
+    const char *t = "Outer";
+    switch (join_type_) {
+      case JoinType::INNER:
+        t = "Inner";
+        break;
+      case JoinType::LEFT:
+        t = "Left";
+        break;
+      case JoinType::SEMI:
+        t = "Semi";
+        break;
+      case JoinType::ANTI:
+        t = "Anti";
+        break;
+      default:
+        break;
+    }
     return "{ type=" + std::string(t) + ", keys=" + std::to_string(left_keys_.size()) + " }";
   }
 
@@ -101,6 +135,11 @@ class PhysicalHashJoin : public PhysicalOperator {
   JoinType join_type_;
   idx_t left_column_count_;
   std::vector<OrderModifiers> key_modifiers_;
+  /** IN / NOT IN NULL semantics for SEMI/ANTI (see HashJoinPlanNode::null_aware_). */
+  bool null_aware_{false};
+  /** The build-child columns stored in the layout and gathered per match (sorted; defaults to all
+   * of them, narrowed by SetLiveBuildColumns from the pruning pass's annotation). */
+  std::vector<idx_t> live_build_columns_;
 };
 
 }  // namespace bumblebee

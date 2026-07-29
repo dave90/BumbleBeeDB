@@ -41,9 +41,17 @@ auto FindPrimaryKeyIndex(Catalog &catalog, const TableInfo &info) -> std::shared
  * inserted/revived rows are written to `out_rids`.
  *
  * `chunk` must be flat and full-width (all table columns, `_id` already filled for an auto key).
+ *
+ * @param keys_are_fresh The caller guarantees no key in `chunk` has ever been in this index, so the
+ *        lookup that classifies duplicate/revive/new cannot possibly hit. TRUE ONLY for an auto
+ *        `_id`, whose values come from `TableInfo::next_id_` — a monotonic, persisted high-water
+ *        mark that is never decremented and never reissued, so a deleted row's id is gone for good.
+ *        It halves the B+tree work per row (one descent to insert, instead of a probe then an
+ *        insert), which is ~6% of a single-row INSERT statement. A user-supplied key (a declared PK,
+ *        or a key-changing UPDATE) must leave this false — there the lookup is the correctness check.
  */
 void InsertOrRevive(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, TableHeap &heap, IndexInfo &pk,
-                    DataChunk &chunk, Vector &out_rids);
+                    DataChunk &chunk, Vector &out_rids, bool keys_are_fresh = false);
 
 /**
  * @brief For each row, whether its primary key differs between `old_chunk` and `new_chunk` (both flat and

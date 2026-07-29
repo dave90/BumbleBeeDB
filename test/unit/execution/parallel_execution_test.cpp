@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -92,6 +93,57 @@ auto RunIntRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
   return out;
 }
 
+/** @brief Append `n` rows of (g = fg(i), s = fs(i)) into `name`'s heap, spanning many pages.
+ *  The chunk types come from the table's own schema, so the VARCHAR column matches exactly. */
+void SeedStringHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fg,
+                    const std::function<std::string(int)> &fs) {
+  auto info = db.catalog_->GetTable(name);
+  auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
+  ASSERT_NE(heap, nullptr);
+  std::vector<LogicalType> types;  // [_id BIGINT, g INT, s VARCHAR]
+  for (uint32_t c = 0; c < info->schema_.GetColumnCount(); c++) {
+    types.push_back(info->schema_.GetColumn(c).GetType());
+  }
+  int written = 0;
+  while (written < n) {
+    idx_t batch = std::min<idx_t>(STANDARD_VECTOR_SIZE, n - written);
+    DataChunk chunk;
+    chunk.Initialize(types);
+    for (idx_t i = 0; i < batch; i++) {
+      int idx = written + static_cast<int>(i);
+      chunk.SetValue(0, i, Value(static_cast<int64_t>(idx)));  // _id
+      chunk.SetValue(1, i, Value(fg(idx)));
+      chunk.SetValue(2, i, Value(fs(idx)));
+    }
+    chunk.SetCardinality(batch);
+    Vector rids{LogicalType{LogicalTypeId::BIGINT}};
+    heap->Append(chunk, rids);
+    written += static_cast<int>(batch);
+  }
+}
+
+/** @brief Run `sql` and collect `num_cols`-wide string rows, stripping the printer's surrounding quotes. */
+auto RunStringRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
+    -> std::vector<std::vector<std::string>> {
+  StringVectorWriter w;
+  db.ExecuteSql(sql, w);
+  std::vector<std::vector<std::string>> out;
+  out.reserve(w.values_.size());
+  for (const auto &row : w.values_) {
+    std::vector<std::string> parsed;
+    parsed.reserve(num_cols);
+    for (int c = 0; c < num_cols; c++) {
+      std::string cell = row[c];
+      if (cell.size() >= 2 && cell.front() == '\'' && cell.back() == '\'') {
+        cell = cell.substr(1, cell.size() - 2);
+      }
+      parsed.push_back(std::move(cell));
+    }
+    out.push_back(std::move(parsed));
+  }
+  return out;
+}
+
 }  // namespace
 
 // Parallel hash join: build + probe run across workers, matches merge into the shared hash table /
@@ -145,6 +197,48 @@ TEST(ParallelExecutionTest, ParallelHashJoinMatchesSerial) {
   }
 }
 
+// Parallel SEMI/ANTI hash join (IN / NOT IN subquery): the subquery side builds across workers, the
+// outer side probes across workers, and each outer row must appear exactly once (SEMI, key present)
+// or exactly once (ANTI, key absent) — duplicates in the build must never duplicate probe rows.
+TEST(ParallelExecutionTest, ParallelSemiAntiJoinMatchesSerial) {
+  const int kA = 2048;
+  const int kB = 2048;
+  auto key_a = [&](int i) { return i % 256; };  // outer keys 0..255
+  auto val_a = [&](int i) { return i; };
+  auto key_b = [&](int i) { return i % 128; };  // subquery holds only 0..127, each many times over
+  auto val_b = [&](int i) { return i; };
+
+  std::multiset<int> expected_semi;
+  std::multiset<int> expected_anti;
+  for (int i = 0; i < kA; i++) {
+    (key_a(i) < 128 ? expected_semi : expected_anti).insert(val_a(i));
+  }
+
+  BumbleBeeInstance db;
+  ConfigureParallel(db);
+  NoopWriter noop;
+  ASSERT_TRUE(db.ExecuteSql("CREATE TABLE a(k INT, v INT);", noop));
+  ASSERT_TRUE(db.ExecuteSql("CREATE TABLE b(k INT, v INT);", noop));
+  SeedHeap(db, "a", kA, key_a, val_a);
+  SeedHeap(db, "b", kB, key_b, val_b);
+
+  for (int rep = 0; rep < 6; rep++) {
+    auto semi_rows = RunIntRows(db, "SELECT a.v FROM a WHERE a.k IN (SELECT b.k FROM b);", 1);
+    std::multiset<int> semi;
+    for (const auto &r : semi_rows) {
+      semi.insert(r[0]);
+    }
+    ASSERT_EQ(semi, expected_semi) << "semi mismatch on repeat " << rep;
+
+    auto anti_rows = RunIntRows(db, "SELECT a.v FROM a WHERE a.k NOT IN (SELECT b.k FROM b);", 1);
+    std::multiset<int> anti;
+    for (const auto &r : anti_rows) {
+      anti.insert(r[0]);
+    }
+    ASSERT_EQ(anti, expected_anti) << "anti mismatch on repeat " << rep;
+  }
+}
+
 // Parallel hash aggregate: each worker builds partial groups that merge into the global table. Per-group
 // COUNT/SUM must match the serial aggregation on every repeat.
 TEST(ParallelExecutionTest, ParallelHashAggregateMatchesSerial) {
@@ -176,6 +270,49 @@ TEST(ParallelExecutionTest, ParallelHashAggregateMatchesSerial) {
   }
 }
 
+// Parallel grouped MIN/MAX over VARCHAR: each worker keeps its group extremes in its own off-row
+// string heap, and Combine ships them across the merge boundary as real strings. Per-group MIN/MAX
+// must match the serial lexicographic aggregation on every repeat (TSan proves the per-task heaps
+// and str_vals_ are never shared).
+TEST(ParallelExecutionTest, ParallelGroupedStringMinMaxMatchesSerial) {
+  const int kRows = 6000;
+  const int kGroups = 128;
+  auto grp = [&](int i) { return i % kGroups; };
+  // Zero-padded so lexicographic order == numeric order; scattered so extremes land on varied rows.
+  auto sval = [&](int i) {
+    unsigned v = static_cast<unsigned>(i) * 2654435761u % 100000u;
+    std::string s = std::to_string(v);
+    return std::string(5 - s.size(), '0') + s;
+  };
+
+  std::map<int, std::pair<std::string, std::string>> expected;  // g -> (min, max)
+  for (int i = 0; i < kRows; i++) {
+    std::string s = sval(i);
+    auto it = expected.find(grp(i));
+    if (it == expected.end()) {
+      expected[grp(i)] = {s, s};
+    } else {
+      it->second.first = std::min(it->second.first, s);
+      it->second.second = std::max(it->second.second, s);
+    }
+  }
+
+  BumbleBeeInstance db;
+  ConfigureParallel(db);
+  NoopWriter noop;
+  ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(g INT, s VARCHAR);", noop));
+  SeedStringHeap(db, "t", kRows, grp, sval);
+
+  for (int rep = 0; rep < 6; rep++) {
+    auto rows = RunStringRows(db, "SELECT g, MIN(s), MAX(s) FROM t GROUP BY g;", 3);
+    std::map<int, std::pair<std::string, std::string>> got;
+    for (const auto &r : rows) {
+      got[std::stoi(r[0])] = {r[1], r[2]};
+    }
+    ASSERT_EQ(got, expected) << "mismatch on repeat " << rep;
+  }
+}
+
 // Parallel ungrouped aggregate: workers combine partial COUNT/SUM into one global scalar.
 TEST(ParallelExecutionTest, ParallelUngroupedAggregateMatchesSerial) {
   const int kRows = 6000;
@@ -197,6 +334,100 @@ TEST(ParallelExecutionTest, ParallelUngroupedAggregateMatchesSerial) {
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0][0], kRows) << "count mismatch on repeat " << rep;
     EXPECT_EQ(rows[0][1], expected_sum) << "sum mismatch on repeat " << rep;
+  }
+}
+
+// High-cardinality aggregate: the lowered partitioning threshold pushes every sink task onto the
+// adaptive-partitioning path, so this exercises the repartition scan, the partitioned insert
+// path, the whole-table Combine hand-off, and the source's adopt-and-merge — none of which the
+// small aggregates above ever reach. Totals must still be exact on every repeat.
+TEST(ParallelExecutionTest, ParallelHighCardinalityAggregateMatchesSerial) {
+  const int kRows = 600000;  // every row its own group; ~75k groups per worker
+
+  BumbleBeeInstance db;
+  ConfigureParallel(db);
+  db.agg_partition_threshold_ = 10000;  // far below each task's group count: all tasks partition
+  NoopWriter noop;
+  ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(k INT, v INT);", noop));
+  // Every row its own group; v = k % 97 gives a checkable SUM.
+  SeedHeap(db, "t", kRows, [](int i) { return i; }, [](int i) { return i % 97; });
+
+  long expected_sum = 0;
+  for (int i = 0; i < kRows; i++) {
+    expected_sum += i % 97;
+  }
+
+  for (int rep = 0; rep < 3; rep++) {
+    // The outer aggregate folds the huge GROUP BY's output, so a lost or double-counted group
+    // shows up in all three columns.
+    auto rows = RunIntRows(db,
+                           "SELECT COUNT(*), SUM(c), SUM(s) FROM "
+                           "(SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k);",
+                           3);
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows[0][0], kRows) << "group count mismatch on repeat " << rep;
+    EXPECT_EQ(rows[0][1], kRows) << "per-group counts mismatch on repeat " << rep;
+    EXPECT_EQ(rows[0][2], expected_sum) << "per-group sums mismatch on repeat " << rep;
+  }
+}
+
+// String MIN/MAX across the adaptive partitioning boundary: the lowered threshold forces the
+// partitioned path, so the string extremes must survive the repartition scan (index -> transport
+// VARCHAR -> re-fold) and the source's adopt-and-merge.
+TEST(ParallelExecutionTest, HighCardinalityStringMinMaxSurvivesRepartition) {
+  const int kRows = 300000;
+  auto grp = [](int i) { return i; };  // every row its own group
+  auto sval = [](int i) {
+    unsigned v = static_cast<unsigned>(i) * 2654435761u % 100000u;
+    std::string s = std::to_string(v);
+    return std::string(5 - s.size(), '0') + s;
+  };
+
+  BumbleBeeInstance db;
+  ConfigureParallel(db);
+  db.agg_partition_threshold_ = 10000;  // force the partitioned path
+  NoopWriter noop;
+  ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(g INT, s VARCHAR);", noop));
+  SeedStringHeap(db, "t", kRows, grp, sval);
+
+  // Every group has exactly one row, so MIN(s) == the row's value; fold the check into the group
+  // count plus the numeric extremes of the recovered strings.
+  auto rows = RunIntRows(
+      db, "SELECT COUNT(*), MIN(CAST(m AS INT)), MAX(CAST(m AS INT)) FROM (SELECT g, MIN(s) AS m FROM t GROUP BY g);",
+      3);
+  int expected_min = std::numeric_limits<int>::max();
+  int expected_max = 0;
+  for (int i = 0; i < kRows; i++) {
+    const int v = static_cast<int>(static_cast<unsigned>(i) * 2654435761u % 100000u);
+    expected_min = std::min(expected_min, v);
+    expected_max = std::max(expected_max, v);
+  }
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows[0][0], kRows);
+  EXPECT_EQ(rows[0][1], expected_min);
+  EXPECT_EQ(rows[0][2], expected_max);
+}
+
+// Parallel result collection: the final pipeline (scan -> collector) now runs with many workers, each
+// tagging its chunks with the source morsel's batch index; the collector's Finalize sorts by it. The
+// row order of a bare SELECT must therefore equal the serial scan (= insertion) order on every repeat —
+// a racy or unsorted collector shows up as a permuted result.
+TEST(ParallelExecutionTest, ParallelScanCollectorPreservesSerialOrder) {
+  const int kRows = 6000;
+
+  BumbleBeeInstance db;
+  ConfigureParallel(db);
+  NoopWriter noop;
+  ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(k INT, v INT);", noop));
+  SeedHeap(db, "t", kRows, [](int i) { return i; }, [](int i) { return i * 3; });
+
+  for (int rep = 0; rep < 6; rep++) {
+    auto rows = RunIntRows(db, "SELECT k, v FROM t;", 2);
+    ASSERT_EQ(rows.size(), static_cast<size_t>(kRows)) << "wrong row count on repeat " << rep;
+    for (int i = 0; i < kRows; i++) {
+      ASSERT_EQ(rows[i][0], i) << "row out of serial scan order on repeat " << rep;
+      ASSERT_EQ(rows[i][1], i * 3) << "row out of serial scan order on repeat " << rep;
+    }
   }
 }
 

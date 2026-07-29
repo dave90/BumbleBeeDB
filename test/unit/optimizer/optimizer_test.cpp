@@ -10,8 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <functional>
+
 #include "optimizer/optimizer.h"
 
+#include "execution/plans/filter_plan.h"
 #include "execution/plans/hash_join_plan.h"
 #include "execution/plans/nested_loop_join_plan.h"
 #include "execution/plans/seq_scan_plan.h"
@@ -297,6 +300,102 @@ TEST(OptimizerTest, FilterPushDownLeavesOuterJoinWhereFilterAlone) {
   EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join->GetChildAt(1)).filter_predicate_, nullptr);
 }
 
+TEST(OptimizerTest, FilterPushDownTurnsEveryLevelOfAMultiTableJoinIntoAHashJoin) {
+  auto catalog = MakeTestCatalog();
+  // The regression this rule exists to prevent: the planner nests the three tables as
+  // (a JOIN b) JOIN d cross products, and MergeFilterNLJ folds the WHERE only into the
+  // outermost one — so without recursive pushdown the inner (a, b) join stays a full
+  // cross product with a Filter on top. Every level must become a hash join instead.
+  auto plan =
+      TryOptimize(*catalog, "SELECT * FROM a, b, d WHERE a.x = b.x AND b.y = d.y AND a.y > 10");
+
+  // Every level is a hash join and no cross product survives — the invariant this guards. (The
+  // cost-based join-order pass now picks the bushy shape and tops the region with a projection that
+  // restores column order, so we assert the invariant rather than a fixed left-deep shape.)
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::HashJoin), 2U);
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::NestedLoopJoin), 0U);
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::Filter), 0U);
+
+  // The single-table `a.y > 10` still reaches a scan, wherever `a` ends up in the reordered tree.
+  std::function<const SeqScanPlanNode *(const AbstractPlanNodeRef &)> find_filtered_scan =
+      [&](const AbstractPlanNodeRef &n) -> const SeqScanPlanNode * {
+    if (n->GetType() == PlanType::SeqScan) {
+      const auto &scan = dynamic_cast<const SeqScanPlanNode &>(*n);
+      if (scan.filter_predicate_ != nullptr && scan.filter_predicate_->ToString() == "(#0.1>10)") {
+        return &scan;
+      }
+    }
+    for (const auto &child : n->GetChildren()) {
+      if (const auto *found = find_filtered_scan(child); found != nullptr) {
+        return found;
+      }
+    }
+    return nullptr;
+  };
+  EXPECT_NE(find_filtered_scan(plan), nullptr) << "the a.y > 10 predicate did not reach a scan";
+}
+
+TEST(OptimizerTest, TwoTableJoinBuildsOnTheSmallerSide) {
+  auto catalog = MakeTestCatalog();
+  // The physical INNER hash join always builds child 0, and the planner emits FROM order — so
+  // `FROM t2_10k, t1_1k` would build a 10k-row hash table to probe 1k rows. The join-order pass
+  // must swap the smaller estimated side into the build slot (and restore the column order with a
+  // projection on top).
+  auto plan = TryOptimize(*catalog, "SELECT * FROM t2_10k, t1_1k WHERE v3 = v1");
+
+  const auto join_node = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(join_node, nullptr);
+  const auto &join = dynamic_cast<const HashJoinPlanNode &>(*join_node);
+  ASSERT_EQ(join.GetLeftPlan()->GetType(), PlanType::SeqScan);
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join.GetLeftPlan()).table_name_, "t1_1k")
+      << "the smaller side must be child 0, the build side";
+
+  // The FROM order that already builds on the smaller side is left exactly as it was.
+  auto untouched = TryOptimize(*catalog, "SELECT * FROM t1_1k, t2_10k WHERE v1 = v3");
+  const auto j2 = FindPlanNode(untouched, PlanType::HashJoin);
+  ASSERT_NE(j2, nullptr);
+  const auto &join2 = dynamic_cast<const HashJoinPlanNode &>(*j2);
+  ASSERT_EQ(join2.GetLeftPlan()->GetType(), PlanType::SeqScan);
+  EXPECT_EQ(dynamic_cast<const SeqScanPlanNode &>(*join2.GetLeftPlan()).table_name_, "t1_1k");
+}
+
+TEST(OptimizerTest, ColumnPruningAnnotatesTheJoinBuildSide) {
+  auto catalog = MakeTestCatalog();
+  // Only b.y is read from the build side above the join (v3=b.x is a key, stored in its own layout
+  // slot), so the annotation must carry exactly that column — the physical join then stores and
+  // gathers one column instead of the build child's full width.
+  auto plan = TryOptimize(*catalog, "SELECT a.x, b.y FROM a, b WHERE a.x = b.x");
+  const auto join_node = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(join_node, nullptr);
+  const auto &join = dynamic_cast<const HashJoinPlanNode &>(*join_node);
+  ASSERT_TRUE(join.build_live_annotated_);
+  // The build side is whichever child the physical convention hashes (left for INNER); its live
+  // set holds exactly the one payload column the SELECT reads from that side.
+  EXPECT_EQ(join.build_live_columns_.size(), 1U);
+}
+
+TEST(OptimizerTest, FilterPushDownDoesNotCrossAnOuterJoin) {
+  auto catalog = MakeTestCatalog();
+  // The inner join to `d` must become a hash join, but the WHERE predicate on the
+  // LEFT join's output must NOT be pushed into the LEFT join — it runs after
+  // null-padding. It settles as a Filter directly above the preserved LEFT join.
+  auto plan = TryOptimize(
+      *catalog, "SELECT * FROM (a LEFT JOIN b ON a.x = b.x), d WHERE a.x = d.x AND a.y > 10");
+
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::HashJoin), 2U);
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::NestedLoopJoin), 0U);
+  // Exactly one Filter survives — the `a.y > 10` sitting above the LEFT join.
+  EXPECT_EQ(CountPlanNodes(plan, PlanType::Filter), 1U);
+
+  auto left_join = FindPlanNode(plan, PlanType::HashJoin);
+  ASSERT_NE(left_join, nullptr);
+  // Neither scan under the LEFT join absorbed the WHERE predicate.
+  const auto &filter = dynamic_cast<const FilterPlanNode &>(*FindPlanNode(plan, PlanType::Filter));
+  EXPECT_EQ(filter.GetChildAt(0)->GetType(), PlanType::HashJoin);
+  const auto &left = dynamic_cast<const HashJoinPlanNode &>(*filter.GetChildAt(0));
+  EXPECT_EQ(left.GetJoinType(), JoinType::LEFT);
+}
+
 TEST(OptimizerTest, FilterPushDownLeavesAPureJoinPredicateAlone) {
   auto catalog = MakeTestCatalog();
   auto plan = TryOptimize(*catalog, "SELECT * FROM a, b WHERE a.x = b.x");
@@ -320,6 +419,36 @@ TEST(OptimizerTest, ColumnPruningIsStillAStub) {
   ASSERT_NE(scan, nullptr);
   EXPECT_EQ(scan->OutputSchema().GetColumnCount(), 5U)
       << "column pruning appears to be implemented; update this test";
+}
+
+// ---------------------------------------------------------------------------
+// Pass skipping: a rewrite whose trigger node is absent walks AND rebuilds the tree for nothing,
+// which is real time on the small statements a DML workload is made of. Skipping it must not
+// change any plan — these pin the shapes that DO need each group of passes.
+// ---------------------------------------------------------------------------
+
+TEST(OptimizerTest, SkippingInapplicablePassesLeavesPlansUnchanged) {
+  auto catalog = MakeTestCatalog();
+  // A join query still gets the whole join/filter group: cross product -> hash join, filter merged.
+  auto join_plan = TryOptimize(*catalog, "SELECT * FROM a, b WHERE a.x = b.y");
+  EXPECT_EQ(CountPlanNodes(join_plan, PlanType::HashJoin), 1U);
+  EXPECT_EQ(CountPlanNodes(join_plan, PlanType::NestedLoopJoin), 0U);
+
+  // A filter with no join still reaches the scan.
+  auto filter_plan = TryOptimize(*catalog, "SELECT x FROM y WHERE z = 1");
+  auto scan = FindPlanNode(filter_plan, PlanType::SeqScan);
+  ASSERT_NE(scan, nullptr);
+  EXPECT_NE(dynamic_cast<const SeqScanPlanNode &>(*scan).filter_predicate_, nullptr);
+
+  // ORDER BY + LIMIT still collapses to TopN.
+  auto topn_plan = TryOptimize(*catalog, "SELECT x FROM y ORDER BY x LIMIT 3");
+  EXPECT_EQ(CountPlanNodes(topn_plan, PlanType::TopN), 1U);
+  EXPECT_EQ(CountPlanNodes(topn_plan, PlanType::Sort), 0U);
+
+  // And a plan with none of those trigger nodes (INSERT ... VALUES) survives with its shape intact.
+  auto insert_plan = TryOptimize(*catalog, "INSERT INTO a VALUES (1, 2)");
+  EXPECT_EQ(CountPlanNodes(insert_plan, PlanType::Insert), 1U);
+  EXPECT_EQ(CountPlanNodes(insert_plan, PlanType::Values), 1U);
 }
 
 }  // namespace bumblebee

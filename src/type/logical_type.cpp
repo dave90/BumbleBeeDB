@@ -366,8 +366,17 @@ auto LogicalType::CommonType(const LogicalType &lhs, const LogicalType &rhs) -> 
 
   const auto has = [&](LogicalTypeId id) { return lhs.type_ == id || rhs.type_ == id; };
 
-  // A string absorbs anything: comparing a number against a string casts the number.
+  // A temporal type absorbs a string: '1995-01-01' compared to a DATE column coerces the LITERAL
+  // to DATE (one strict cast) — the other direction would format every DATE of the column into a
+  // string per row just to compare lexicographically.
   if (has(LogicalTypeId::STRING)) {
+    if (has(LogicalTypeId::DATE)) {
+      return LogicalTypeId::DATE;
+    }
+    if (has(LogicalTypeId::TIMESTAMP)) {
+      return LogicalTypeId::TIMESTAMP;
+    }
+    // Otherwise the string absorbs: comparing a number against a string casts the number.
     return LogicalTypeId::STRING;
   }
   // Floating point absorbs the integers and DECIMAL.

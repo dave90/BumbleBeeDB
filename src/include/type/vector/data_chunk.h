@@ -187,10 +187,19 @@ class DataChunk {
   void Cast(DataChunk &result);
 
  private:
+  /** @brief Remember each column's freshly-allocated buffer for reuse by Reset(). */
+  void CacheBuffers();
+
   /** The number of rows held. */
   idx_t count_;
   /** The number of rows that fit. */
   idx_t capacity_;
+  /** Each column's originally-allocated flat buffer (and its physical type), kept so Reset()
+   * can re-point the column at it instead of freeing + re-allocating every buffer on every
+   * chunk iteration. A buffer still referenced by someone else is left to them and replaced
+   * with a fresh allocation. Empty (e.g. after InitializeEmpty) until the first Reset(). */
+  std::vector<PhysicalType> cache_types_;
+  std::vector<vector_data_mngr_ptr_t> cache_mngrs_;
 };
 
 using data_chunk_ptr_t = std::unique_ptr<DataChunk>;

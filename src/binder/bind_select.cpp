@@ -35,7 +35,10 @@
 #include "binder/expressions/bound_column_ref.h"
 #include "binder/expressions/bound_constant.h"
 #include "binder/expressions/bound_func_call.h"
+#include "binder/expressions/bound_in_expr.h"
+#include "binder/expressions/bound_outer_column_ref.h"
 #include "binder/expressions/bound_star.h"
+#include "binder/expressions/bound_subquery_expr.h"
 #include "binder/expressions/bound_type_cast.h"
 #include "binder/expressions/bound_unary_op.h"
 #include "binder/statement/explain_statement.h"
@@ -197,7 +200,7 @@ auto Binder::BindSelect(duckdb_libpgquery::PGSelectStmt *pg_stmt) -> std::unique
   // Bind the GROUP BY clause.
   auto group_by = std::vector<std::unique_ptr<BoundExpression>>{};
   if (pg_stmt->groupClause != nullptr) {
-    group_by = BindGroupBy(pg_stmt->groupClause);
+    group_by = BindGroupBy(pg_stmt->groupClause, select_list);
   }
 
   // Bind the HAVING clause.
@@ -221,7 +224,7 @@ auto Binder::BindSelect(duckdb_libpgquery::PGSelectStmt *pg_stmt) -> std::unique
   // Bind the ORDER BY clause.
   auto sort = std::vector<std::unique_ptr<BoundOrderBy>>{};
   if (pg_stmt->sortClause != nullptr) {
-    sort = BindSort(pg_stmt->sortClause);
+    sort = BindSort(pg_stmt->sortClause, select_list);
   }
 
   return std::make_unique<SelectStatement>(std::move(table), std::move(select_list), std::move(where),
@@ -486,10 +489,20 @@ auto Binder::BindColumnRef(duckdb_libpgquery::PGColumnRef *node) -> std::unique_
       for (auto field = fields->head; field != nullptr; field = field->next) {
         column_names.emplace_back(reinterpret_cast<duckdb_libpgquery::PGValue *>(field->data.ptr_value)->val.str);
       }
+      // The current query's FROM always wins; only a name it cannot resolve may fall back to an
+      // enclosing query's scope (correlation, opened by BindSubLink).
+      if (scope_ != nullptr && scope_->type_ != TableReferenceType::EMPTY) {
+        if (auto expr = ResolveColumnInternal(*scope_, column_names); expr != nullptr) {
+          return expr;
+        }
+      }
+      if (auto outer = ResolveOuterColumn(column_names); outer != nullptr) {
+        return outer;
+      }
       if (scope_ == nullptr) {
         throw BinderException(fmt::format("column {} not found: no table in scope", fmt::join(column_names, ".")));
       }
-      return ResolveColumn(*scope_, column_names);
+      throw BinderException(fmt::format("column {} not found", fmt::join(column_names, ".")));
     }
     case duckdb_libpgquery::T_PGAStar:
       return BindStar(reinterpret_cast<duckdb_libpgquery::PGAStar *>(head_node));
@@ -530,7 +543,7 @@ auto Binder::BindFuncCall(duckdb_libpgquery::PGFuncCall *root) -> std::unique_pt
   }
 
   if (function_name == "min" || function_name == "max" || function_name == "first" || function_name == "last" ||
-      function_name == "sum" || function_name == "count") {
+      function_name == "sum" || function_name == "count" || function_name == "avg") {
     // `count(*)` has no arguments, and counts rows rather than values.
     if (function_name == "count" && children.empty()) {
       function_name = "count_star";
@@ -703,6 +716,26 @@ auto Binder::ResolveColumnInternal(const BoundTableRef &table_ref, const std::ve
   }
 }
 
+auto Binder::ResolveOuterColumn(const std::vector<std::string> &col_name) -> std::unique_ptr<BoundExpression> {
+  for (size_t i = outer_scopes_.size(); i > 0; i--) {
+    const auto *scope = outer_scopes_[i - 1];
+    if (scope == nullptr || scope->type_ == TableReferenceType::EMPTY) {
+      continue;  // an enclosing SELECT without FROM has nothing to offer
+    }
+    auto resolved = ResolveColumnInternal(*scope, col_name);
+    if (resolved == nullptr) {
+      continue;
+    }
+    outer_refs_bound_++;
+    const size_t depth = outer_scopes_.size() - (i - 1);
+    auto *column_ref = dynamic_cast<BoundColumnRef *>(resolved.get());
+    BUMBLEBEE_ASSERT(column_ref != nullptr, "outer resolution must yield a column ref");
+    resolved.release();
+    return std::make_unique<BoundOuterColumnRef>(std::unique_ptr<BoundColumnRef>(column_ref), depth);
+  }
+  return nullptr;
+}
+
 auto Binder::ResolveColumn(const BoundTableRef &scope, const std::vector<std::string> &col_name)
     -> std::unique_ptr<BoundExpression> {
   BUMBLEBEE_ASSERT(!scope.IsInvalid(), "invalid scope");
@@ -717,8 +750,63 @@ auto Binder::BindWhere(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<Bound
   return BindExpression(root);
 }
 
-auto Binder::BindGroupBy(duckdb_libpgquery::PGList *list) -> std::vector<std::unique_ptr<BoundExpression>> {
-  return BindExpressionList(list);
+auto Binder::BindGroupBy(duckdb_libpgquery::PGList *list,
+                         const std::vector<std::unique_ptr<BoundExpression>> &select_list)
+    -> std::vector<std::unique_ptr<BoundExpression>> {
+  std::vector<std::unique_ptr<BoundExpression>> exprs;
+  for (auto node = list->head; node != nullptr; node = node->next) {
+    auto *pg_node = static_cast<duckdb_libpgquery::PGNode *>(node->data.ptr_value);
+    try {
+      auto bound = BindExpression(pg_node);
+      // `GROUP BY supplier_no` where supplier_no is `l_suppkey AS supplier_no`: this query's OWN
+      // columns win (hence BindExpression first), but a SELECT alias beats a column that only
+      // resolved through an ENCLOSING query's scope — grouping a subquery on an outer column is
+      // never what the alias-shaped query means (the TPC-H q15 view inside its scalar subquery).
+      if (bound->type_ == ExpressionType::OUTER_COLUMN_REF) {
+        if (auto resolved = ResolveGroupByAlias(select_list, pg_node); resolved != nullptr) {
+          outer_refs_bound_--;  // the discarded outer ref must not mark the subquery correlated
+          exprs.emplace_back(std::move(resolved));
+          continue;
+        }
+      }
+      exprs.emplace_back(std::move(bound));
+    } catch (const BinderException &) {
+      // No column of this or any enclosing query: a bare name may still be a SELECT alias.
+      // GROUP BY runs on the aggregation's INPUT, so the alias resolves to its UNDERLYING column
+      // (not the projection output the way ORDER BY does) — which is also why only an aliased
+      // column qualifies: a general aliased expression has no input column to group on.
+      auto resolved = ResolveGroupByAlias(select_list, pg_node);
+      if (resolved == nullptr) {
+        throw;
+      }
+      exprs.emplace_back(std::move(resolved));
+    }
+  }
+  return exprs;
+}
+
+auto Binder::ResolveGroupByAlias(const std::vector<std::unique_ptr<BoundExpression>> &select_list,
+                                 duckdb_libpgquery::PGNode *node) -> std::unique_ptr<BoundExpression> {
+  if (node->type != duckdb_libpgquery::T_PGColumnRef) {
+    return nullptr;
+  }
+  auto *column_ref = reinterpret_cast<duckdb_libpgquery::PGColumnRef *>(node);
+  auto *head_node = static_cast<duckdb_libpgquery::PGNode *>(column_ref->fields->head->data.ptr_value);
+  if (column_ref->fields->length != 1 || head_node->type != duckdb_libpgquery::T_PGString) {
+    return nullptr;  // only a bare, unqualified name can be an alias
+  }
+  const auto name =
+      StringUtil::Lower(reinterpret_cast<duckdb_libpgquery::PGValue *>(head_node)->val.str);
+  for (const auto &item : select_list) {
+    if (item->type_ != ExpressionType::ALIAS) {
+      continue;
+    }
+    const auto &alias = dynamic_cast<const BoundAlias &>(*item);
+    if (StringUtil::Lower(alias.alias_) == name && alias.child_->type_ == ExpressionType::COLUMN_REF) {
+      return std::make_unique<BoundColumnRef>(dynamic_cast<const BoundColumnRef &>(*alias.child_).col_name_);
+    }
+  }
+  return nullptr;
 }
 
 auto Binder::BindHaving(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<BoundExpression> {
@@ -729,7 +817,24 @@ auto Binder::BindAExpr(duckdb_libpgquery::PGAExpr *root) -> std::unique_ptr<Boun
   BUMBLEBEE_ASSERT(root != nullptr, "nullptr");
   auto name = std::string(reinterpret_cast<duckdb_libpgquery::PGValue *>(root->name->head->data.ptr_value)->val.str);
 
-  if (root->kind != duckdb_libpgquery::PG_AEXPR_OP) {
+  // `x [NOT] IN (value list)`: libpg_query encodes the polarity in the operator name ("=" for IN,
+  // "<>" for NOT IN) and hands the list through `rexpr`. `x IN (SELECT ...)` never gets here — it
+  // parses as a SubLink, not an AExpr.
+  if (root->kind == duckdb_libpgquery::PG_AEXPR_IN) {
+    if (root->lexpr == nullptr || root->rexpr == nullptr || root->rexpr->type != duckdb_libpgquery::T_PGList) {
+      throw NotImplementedException("IN expects a value list on its right side");
+    }
+    auto child = BindExpression(root->lexpr);
+    auto list = BindExpressionList(reinterpret_cast<duckdb_libpgquery::PGList *>(root->rexpr));
+    if (list.empty()) {
+      throw BinderException("IN list cannot be empty");
+    }
+    return std::make_unique<BoundInExpr>(std::move(child), std::move(list), /*negated=*/name == "<>");
+  }
+
+  // PG_AEXPR_OP is a normal operator (=, <, +, ...); PG_AEXPR_LIKE is [NOT] LIKE, whose operator
+  // name libpg_query sets to "~~" / "!~~" and which the planner lowers to a LikeExpression.
+  if (root->kind != duckdb_libpgquery::PG_AEXPR_OP && root->kind != duckdb_libpgquery::PG_AEXPR_LIKE) {
     throw NotImplementedException("unsupported op in AExpr");
   }
 
@@ -750,6 +855,55 @@ auto Binder::BindAExpr(duckdb_libpgquery::PGAExpr *root) -> std::unique_ptr<Boun
     return std::make_unique<BoundUnaryOp>(name, std::move(right_expr));
   }
   throw BinderException("unsupported AExpr: left == null while right != null");
+}
+
+auto Binder::BindSubLink(duckdb_libpgquery::PGSubLink *root) -> std::unique_ptr<BoundExpression> {
+  BUMBLEBEE_ASSERT(root != nullptr, "nullptr");
+
+  // The tested value of `x IN (SELECT ...)` belongs to the OUTER query: bind it before entering
+  // the subquery's scope.
+  std::unique_ptr<BoundExpression> testexpr = nullptr;
+  SubqueryKind kind;
+  switch (root->subLinkType) {
+    case duckdb_libpgquery::PG_EXPR_SUBLINK:
+      kind = SubqueryKind::SCALAR;
+      break;
+    case duckdb_libpgquery::PG_EXISTS_SUBLINK:
+      kind = SubqueryKind::EXISTS;
+      break;
+    case duckdb_libpgquery::PG_ANY_SUBLINK: {
+      // `x IN (SELECT ...)` is `x = ANY (SELECT ...)`; any other combining operator (> ANY, ...)
+      // is out of scope. An absent operName means "=".
+      if (root->operName != nullptr) {
+        const auto op = std::string(
+            reinterpret_cast<duckdb_libpgquery::PGValue *>(root->operName->head->data.ptr_value)->val.str);
+        if (op != "=") {
+          throw NotImplementedException(fmt::format("{} ANY (SELECT ...) is not supported (only IN)", op));
+        }
+      }
+      kind = SubqueryKind::ANY;
+      testexpr = BindExpression(root->testexpr);
+      break;
+    }
+    default:
+      throw NotImplementedException("this subquery form is not supported (ALL / row-compare)");
+  }
+
+  // The subquery binds in a fresh scope with the current FROM pushed as its outer scope: a name
+  // the subquery cannot resolve itself falls back there and binds as a correlated outer ref.
+  const auto outer_refs_before = outer_refs_bound_;
+  auto subquery = [&] {
+    OuterScopeGuard outer_guard(&outer_scopes_, scope_);
+    return BindSelect(reinterpret_cast<duckdb_libpgquery::PGSelectStmt *>(root->subselect));
+  }();
+  if (kind != SubqueryKind::EXISTS && subquery->select_list_.size() != 1) {
+    throw BinderException(kind == SubqueryKind::SCALAR ? "scalar subquery must return exactly one column"
+                                                       : "IN subquery must return exactly one column");
+  }
+  auto bound = std::make_unique<BoundSubqueryExpr>(std::move(subquery), kind, std::move(testexpr),
+                                                   /*negated=*/false);
+  bound->correlated_ = outer_refs_bound_ != outer_refs_before;
+  return bound;
 }
 
 auto Binder::BindBoolExpr(duckdb_libpgquery::PGBoolExpr *root) -> std::unique_ptr<BoundExpression> {
@@ -773,6 +927,15 @@ auto Binder::BindBoolExpr(duckdb_libpgquery::PGBoolExpr *root) -> std::unique_pt
       auto exprs = BindExpressionList(root->args);
       if (exprs.size() != 1) {
         throw BinderException("NOT should have 1 arg");
+      }
+      // `x NOT IN (SELECT ...)` / `NOT EXISTS (...)` parse as NOT wrapping the sublink; fold the
+      // negation into the subquery node, whose join flattening carries it as the ANTI join type.
+      if (exprs[0]->type_ == ExpressionType::SUBQUERY) {
+        auto &subquery = dynamic_cast<BoundSubqueryExpr &>(*exprs[0]);
+        if (subquery.kind_ == SubqueryKind::ANY || subquery.kind_ == SubqueryKind::EXISTS) {
+          subquery.negated_ = !subquery.negated_;
+          return std::move(exprs[0]);
+        }
       }
       return std::make_unique<BoundUnaryOp>("not", std::move(exprs[0]));
     }
@@ -806,6 +969,8 @@ auto Binder::BindExpression(duckdb_libpgquery::PGNode *node) -> std::unique_ptr<
       const bool negated = null_test->nulltesttype == duckdb_libpgquery::IS_NOT_NULL;
       return std::make_unique<BoundUnaryOp>(negated ? "is_not_null" : "is_null", std::move(arg));
     }
+    case duckdb_libpgquery::T_PGSubLink:
+      return BindSubLink(reinterpret_cast<duckdb_libpgquery::PGSubLink *>(node));
     default:
       break;
   }
@@ -864,7 +1029,42 @@ auto Binder::BindExplain(duckdb_libpgquery::PGExplainStmt *stmt) -> std::unique_
 // Copyright 2018-2022 Stichting DuckDB Foundation.
 //===----------------------------------------------------------------------===//
 
-auto Binder::BindSort(duckdb_libpgquery::PGList *list) -> std::vector<std::unique_ptr<BoundOrderBy>> {
+auto Binder::ResolveOrderByFromSelectList(const std::vector<std::unique_ptr<BoundExpression>> &select_list,
+                                          const std::string &name) -> std::unique_ptr<BoundExpression> {
+  const auto lname = StringUtil::Lower(name);
+  for (const auto &item : select_list) {
+    // The names ORDER BY may use to reach this item, and the reference that resolves to its output
+    // column (which must reproduce exactly how the projection above named that column).
+    std::vector<std::string> candidates;
+    std::vector<std::string> output_ref;
+    if (item->type_ == ExpressionType::ALIAS) {
+      const auto &alias = dynamic_cast<const BoundAlias &>(*item);
+      output_ref = {alias.alias_};  // the projection names the column by its alias
+      candidates.push_back(alias.alias_);
+      // `col AS x` can also be ordered by the underlying column name.
+      if (alias.child_->type_ == ExpressionType::COLUMN_REF) {
+        candidates.push_back(dynamic_cast<const BoundColumnRef &>(*alias.child_).col_name_.back());
+      }
+    } else if (item->type_ == ExpressionType::COLUMN_REF) {
+      // A bare column keeps its (possibly table-qualified) name through the projection, so the
+      // ORDER BY reference must carry the same full name; ORDER BY matches on the bare column name.
+      output_ref = dynamic_cast<const BoundColumnRef &>(*item).col_name_;
+      candidates.push_back(output_ref.back());
+    } else {
+      continue;  // an unaliased expression/aggregate has no stable name to match
+    }
+    for (const auto &candidate : candidates) {
+      if (StringUtil::Lower(candidate) == lname) {
+        return std::make_unique<BoundColumnRef>(output_ref);
+      }
+    }
+  }
+  return nullptr;
+}
+
+auto Binder::BindSort(duckdb_libpgquery::PGList *list,
+                      const std::vector<std::unique_ptr<BoundExpression>> &select_list)
+    -> std::vector<std::unique_ptr<BoundOrderBy>> {
   auto order_by = std::vector<std::unique_ptr<BoundOrderBy>>{};
 
   for (auto node = list->head; node != nullptr; node = node->next) {
@@ -897,7 +1097,23 @@ auto Binder::BindSort(duckdb_libpgquery::PGList *list) -> std::vector<std::uniqu
       throw NotImplementedException("unimplemented nulls order type");
     }
 
-    order_by.emplace_back(std::make_unique<BoundOrderBy>(type, null_order, BindExpression(sort->node)));
+    // An unqualified ORDER BY name may refer to a SELECT output alias / computed column that is not
+    // a base-table column (e.g. `ORDER BY count` for `COUNT(*) AS count`). Try the select list
+    // first; fall back to binding against the base tables (bare columns, expressions, qualified refs).
+    std::unique_ptr<BoundExpression> expr;
+    if (sort->node->type == duckdb_libpgquery::T_PGColumnRef) {
+      auto *fields = reinterpret_cast<duckdb_libpgquery::PGColumnRef *>(sort->node)->fields;
+      auto *head = static_cast<duckdb_libpgquery::PGNode *>(fields->head->data.ptr_value);
+      if (fields->length == 1 && head->type == duckdb_libpgquery::T_PGString) {
+        expr = ResolveOrderByFromSelectList(
+            select_list, reinterpret_cast<duckdb_libpgquery::PGValue *>(fields->head->data.ptr_value)->val.str);
+      }
+    }
+    if (expr == nullptr) {
+      expr = BindExpression(sort->node);
+    }
+
+    order_by.emplace_back(std::make_unique<BoundOrderBy>(type, null_order, std::move(expr)));
   }
   return order_by;
 }

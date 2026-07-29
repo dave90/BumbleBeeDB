@@ -1,0 +1,78 @@
+{
+  "engine": "sqlite",
+  "compare": false,
+  "db": "data/db/sqlite_dml.db",
+  "reset_db": true,
+  "setup": [
+    "data/setup/sqlite_dml.sql"
+  ],
+  "setup_cmd": "${SQLITE_BIN:-sqlite3} $DB < $FILE",
+  "run_cmd": "${SQLITE_BIN:-sqlite3} $DB < $FILE",
+  "stdin_cmd": "${SQLITE_BIN:-sqlite3} $DB < $FILE",
+  "query_dir": "data/dml",
+  "previous_comparison": true,
+  "tests": [
+    {
+      "test": "dml_load",
+      "file": "load.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_update_pred",
+      "file": "update_pred.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_point_range",
+      "file": "point_range.sql",
+      "num_tries": 3
+    },
+    {
+      "test": "dml_point_in",
+      "file": "point_in.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_delete_pred",
+      "file": "delete_pred.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_txn_autocommit",
+      "file": "txn_autocommit.sql",
+      "num_tries": 1,
+      "driver": "stdin"
+    },
+    {
+      "test": "dml_txn_single",
+      "file": "txn_single.sql",
+      "num_tries": 1,
+      "driver": "stdin"
+    },
+    {
+      "test": "dml_insert_join",
+      "file": "insert_join.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_update_join",
+      "file": "update_join.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_delete_join",
+      "file": "delete_join.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_update_join_in",
+      "file": "update_join_in.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_delete_join_in",
+      "file": "delete_join_in.sql",
+      "num_tries": 1
+    }
+  ]
+}

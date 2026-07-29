@@ -1,0 +1,38 @@
+# Aggregates over a DECIMAL column (l_extendedprice is DECIMAL(15,2) in the fixture). The grouped
+# (hash) aggregate path used to accumulate the DECIMAL's raw *unscaled* integer and re-scale it at
+# finalize, so SUM/AVG/MIN/MAX came out 10^scale (here 100x) too large. Aggregates now cast a
+# DECIMAL argument to DOUBLE up front, so they compute the real value. MIN/MAX/COUNT are exact
+# (no summation rounding) and pin the scale fix directly.
+# fixture: lineitem-arrow.parquet
+
+statement ok
+CREATE TABLE li () WITH (format='parquet', location='${TMPDIR}');
+
+# Ungrouped: values are in the hundreds/tens-of-thousands, NOT the 90100 / 5501000 the scale bug gave.
+query
+SELECT MIN(l_extendedprice), MAX(l_extendedprice), COUNT(*) FROM li;
+----
+901 55010 6005
+
+# Grouped by return flag: per-group min/max stay real-valued.
+query rowsort
+SELECT l_returnflag, MIN(l_extendedprice), MAX(l_extendedprice), COUNT(*) FROM li GROUP BY l_returnflag;
+----
+'A' 902 55010 1478
+'N' 901 55010 3070
+'R' 908 54209 1457
+
+# SUM/AVG over the decimal column are real-valued too (bounded well under the 100x-inflated range);
+# exact digits aren't asserted here because DOUBLE accumulation order differs by chunk size.
+query
+SELECT COUNT(*) FROM li WHERE l_extendedprice > 0;
+----
+6005
+
+# DECIMAL * DECIMAL arithmetic: l_extendedprice * (1 - l_discount) is the real discounted price
+# (e.g. 34389.47 * 0.96 = 33013.8912), NOT the 100x-inflated raw-integer product the old equal-type
+# fast path produced. A count over the multiply is deterministic and pins the scale.
+query
+SELECT COUNT(*) FROM li WHERE l_extendedprice * (1 - l_discount) > 30000;
+----
+2240

@@ -73,9 +73,7 @@ class ArithmeticExpression : public AbstractExpression {
    * @param compute_type The arithmetic operator.
    */
   ArithmeticExpression(AbstractExpressionRef left, AbstractExpressionRef right, ArithmeticType compute_type)
-      : AbstractExpression({left, right},
-                           Column::Make("<val>", LogicalType::CommonType(left->GetReturnType().GetType(),
-                                                               right->GetReturnType().GetType()))),
+      : AbstractExpression({left, right}, Column::Make("<val>", ResultType(left, right))),
         compute_type_{compute_type} {}
 
   auto ToString() const -> std::string override {
@@ -86,6 +84,26 @@ class ArithmeticExpression : public AbstractExpression {
 
   /** The arithmetic operator. */
   ArithmeticType compute_type_;
+
+ private:
+  /**
+   * @brief The result type of `left <op> right`: the common type, except DECIMAL is promoted to
+   * DOUBLE.
+   *
+   * DECIMAL `*` / `/` need scale-aware algebra (the raw-integer product carries scale `s1+s2`, etc.)
+   * that the arithmetic dispatch does not apply on the equal-type fast path, so a DECIMAL result
+   * would come out 10^scale off. Promoting to DOUBLE runs the operation on the real values via the
+   * correct decimal->double unscaling path — inexact past 2^53, consistent with how aggregates
+   * already handle DECIMAL.
+   */
+  static auto ResultType(const AbstractExpressionRef &left, const AbstractExpressionRef &right) -> LogicalType {
+    auto common =
+        LogicalType::CommonType(left->GetReturnType().GetType(), right->GetReturnType().GetType());
+    if (common.GetTypeId() == LogicalTypeId::DECIMAL) {
+      return LogicalType(LogicalTypeId::DOUBLE);
+    }
+    return common;
+  }
 };
 
 }  // namespace bumblebee

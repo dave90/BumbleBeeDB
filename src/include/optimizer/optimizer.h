@@ -21,6 +21,7 @@
 #include "catalog/catalog.h"
 #include "execution/expressions/abstract_expression.h"
 #include "execution/plans/abstract_plan.h"
+#include "optimizer/join_order/greedy_join_order.h"
 
 namespace bumblebee {
 
@@ -58,8 +59,32 @@ class Optimizer {
   /** Push the single-table conjuncts of a join predicate down below the join. */
   auto OptimizeFilterPushDown(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef;
 
+  /**
+   * @brief Recursively distribute `pending` conjuncts into `node`'s subtree.
+   *
+   * The workhorse of FilterPushDown: at each inner join it sends single-table
+   * conjuncts down the matching input and keeps the two-input conjuncts on the join,
+   * descending through nested cross products so every level of a multi-table join
+   * becomes an equi-join. See the definition for the full contract.
+   *
+   * @param node The subtree to push into.
+   * @param pending Conjuncts, in `node`'s flat output schema, that must hold at or
+   *   below `node`.
+   * @return AbstractPlanNodeRef The rewritten subtree.
+   */
+  auto FilterPushDownInto(const AbstractPlanNodeRef &node, const std::vector<AbstractExpressionRef> &pending)
+      -> AbstractPlanNodeRef;
+
   /** Turn a NestedLoopJoin whose predicate is a conjunction of equalities into a HashJoin. */
   auto OptimizeNLJAsHashJoin(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef;
+
+  /**
+   * @brief Cost-based join reordering: reorder each 3+-table inner-join region (a Filter over a
+   * cross-product chain) using `join_order_`, emitting a bushy tree of inner joins with predicates
+   * placed on their joins and the smaller side built. Runs before MergeFilterNLJ/NLJAsHashJoin, which
+   * then lower the emitted inner joins to hash joins. Regions of ≤2 tables are left untouched.
+   */
+  auto OptimizeJoinOrder(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef;
 
   /** Drop a Filter whose predicate is the constant `true`. */
   auto OptimizeEliminateTrueFilter(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef;
@@ -106,6 +131,9 @@ class Optimizer {
 
   /** The catalog. It must outlive the optimizer. */
   const Catalog &catalog_;
+
+  /** The swappable join-order search (GOO today; a DPccp enumerator could replace it). */
+  std::unique_ptr<JoinOrderAlgorithm> join_order_ = std::make_unique<GreedyJoinOrder>();
 };
 
 }  // namespace bumblebee

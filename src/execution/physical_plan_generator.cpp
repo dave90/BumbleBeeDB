@@ -90,6 +90,10 @@ auto PhysicalPlanGenerator::CreatePlan(const AbstractPlanNodeRef &plan) -> std::
 
 namespace {
 
+/** @brief Coerce each equi-key pair to one common type. Defined further down, next to the ordinary
+ * hash-join lowering that shares it; declared here for the DML lowering above it. */
+void CoerceJoinKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<AbstractExpressionRef> &right_keys);
+
 /** @brief `base` with a trailing BIGINT RID column appended (the scan-emitted row identifier). */
 auto AppendRidColumn(const SchemaRef &base) -> SchemaRef {
   std::vector<Column> cols = base->GetColumns();
@@ -128,6 +132,31 @@ auto PhysicalPlanGenerator::LowerDmlChild(const AbstractPlanNodeRef &child, idx_
     auto rid_schema = scan_op->output_schema_;  // carries the RID column
     return std::make_unique<PhysicalFilter>(rid_schema, filter.GetPredicate(), std::move(scan_op));
   }
+  if (child->GetType() == PlanType::HashJoin) {
+    // `WHERE k [NOT] IN (SELECT ...)` / `[NOT] EXISTS`: the planner flattened it to a SEMI/ANTI join
+    // over the scan. Only those two join types can sit under a write: they emit each qualifying LEFT
+    // row exactly once (so no row is written twice) and their output schema IS the left child's, so
+    // the trailing __rid column rides through and the left key indexes stay valid — RID is appended
+    // last. An INNER or LEFT join would multiply or NULL-extend the rows to be written.
+    const auto &hj = dynamic_cast<const HashJoinPlanNode &>(*child);
+    if (hj.GetJoinType() != JoinType::SEMI && hj.GetJoinType() != JoinType::ANTI) {
+      throw NotImplementedException("UPDATE/DELETE source must be a table scan (optionally filtered)");
+    }
+    auto left = LowerDmlChild(hj.GetLeftPlan(), rid_column);  // the rid-emitting side
+    auto right = CreatePlan(hj.GetRightPlan());
+    auto rid_schema = left->output_schema_;
+    auto left_keys = hj.LeftJoinKeyExpressions();
+    auto right_keys = hj.RightJoinKeyExpressions();
+    CoerceJoinKeys(left_keys, right_keys);
+    auto hash_join =
+        std::make_unique<PhysicalHashJoin>(rid_schema, left_keys, right_keys, hj.GetJoinType(),
+                                           rid_schema->GetColumnCount(), std::move(left), std::move(right));
+    hash_join->null_aware_ = hj.null_aware_;
+    if (hj.build_live_annotated_) {
+      hash_join->SetLiveBuildColumns(hj.build_live_columns_);
+    }
+    return hash_join;
+  }
   throw NotImplementedException("UPDATE/DELETE source must be a table scan (optionally filtered)");
 }
 
@@ -153,14 +182,17 @@ auto PhysicalPlanGenerator::CreateSeqScan(const AbstractPlanNodeRef &plan) -> st
   const auto &scan = dynamic_cast<const SeqScanPlanNode &>(*plan);
   std::unique_ptr<PhysicalOperator> op;
   if (TableStorageFormat(scan.GetTableOid()) == StorageFormat::PARQUET) {
-    op = std::make_unique<PhysicalParquetScan>(plan->output_schema_, scan.GetTableOid(), scan.table_name_,
-                                               plan->output_schema_->GetColumnCount(), /*emit_rids=*/false,
-                                               scan.filter_predicate_, scan.pruned_columns_);
-  } else {
-    op = std::make_unique<PhysicalTableScan>(plan->output_schema_, scan.GetTableOid(), scan.table_name_,
-                                             plan->output_schema_->GetColumnCount(), ScanPredicate{},
-                                             scan.pruned_columns_);
+    // The parquet scan applies the folded WHERE itself: row groups are pruned against their
+    // min/max statistics, and the surviving rows are filtered during the decode (filter columns
+    // are read first; the other columns skip the rows the predicate rejected). No Filter operator
+    // is planned above it.
+    return std::make_unique<PhysicalParquetScan>(plan->output_schema_, scan.GetTableOid(), scan.table_name_,
+                                                 plan->output_schema_->GetColumnCount(), /*emit_rids=*/false,
+                                                 scan.filter_predicate_, scan.pruned_columns_);
   }
+  op = std::make_unique<PhysicalTableScan>(plan->output_schema_, scan.GetTableOid(), scan.table_name_,
+                                           plan->output_schema_->GetColumnCount(), ScanPredicate{},
+                                           scan.pruned_columns_);
   // The optimizer folds a WHERE into the scan node. Until the row-at-a-time ScanPredicate compiler
   // lands, realize it as a streaming filter above the scan (correct, just not pushed into the gather).
   if (scan.filter_predicate_ != nullptr) {
@@ -272,13 +304,21 @@ auto PhysicalPlanGenerator::CreateHashJoin(const AbstractPlanNodeRef &plan) -> s
   std::unique_ptr<PhysicalOperator> op;
   // Both variants pick their build/probe side from the join type internally (the preserved side of a
   // LEFT join always streams as the probe), so INNER and LEFT may both lower — or be re-lowered on a
-  // build overflow — to the external variant.
-  if (UseExternal(plan)) {
+  // build overflow — to the external variant. SEMI/ANTI have no external variant yet: they always
+  // lower in-memory, so a build overflow there surfaces the MemoryLimitException instead of retrying.
+  const bool semi_or_anti = hj.GetJoinType() == JoinType::SEMI || hj.GetJoinType() == JoinType::ANTI;
+  if (UseExternal(plan) && !semi_or_anti) {
     op = std::make_unique<PhysicalGraceHashJoin>(plan->output_schema_, left_keys, right_keys, hj.GetJoinType(),
                                                  left_cols, std::move(left), std::move(right));
   } else {
-    op = std::make_unique<PhysicalHashJoin>(plan->output_schema_, left_keys, right_keys, hj.GetJoinType(),
-                                            left_cols, std::move(left), std::move(right));
+    auto hash_join = std::make_unique<PhysicalHashJoin>(plan->output_schema_, left_keys, right_keys,
+                                                        hj.GetJoinType(), left_cols, std::move(left),
+                                                        std::move(right));
+    hash_join->null_aware_ = hj.null_aware_;
+    if (hj.build_live_annotated_) {
+      hash_join->SetLiveBuildColumns(hj.build_live_columns_);
+    }
+    op = std::move(hash_join);
   }
   op->logical_source_ = plan.get();  // so a build overflow can name this node for the retry
   return op;

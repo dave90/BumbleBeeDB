@@ -13,6 +13,7 @@
 #include "execution/expression_executor.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "catalog/column.h"
@@ -21,7 +22,9 @@
 #include "execution/expressions/column_value_expression.h"
 #include "execution/expressions/comparison_expression.h"
 #include "execution/expressions/constant_value_expression.h"
+#include "execution/expressions/in_expression.h"
 #include "execution/expressions/is_null_expression.h"
+#include "execution/expressions/like_expression.h"
 #include "execution/expressions/logic_expression.h"
 #include "gtest/gtest.h"
 #include "type/logical_type.h"
@@ -94,6 +97,181 @@ TEST(ExpressionExecutorTest, ArithmeticAddColumns) {
   EXPECT_EQ(out.GetValue(0).GetAs<int>(), 11);
   EXPECT_EQ(out.GetValue(1).GetAs<int>(), 22);
   EXPECT_EQ(out.GetValue(2).GetAs<int>(), 33);
+}
+
+// A 1-column STRING chunk from literals.
+auto MakeStringChunk(const std::vector<std::string> &vals) -> DataChunk {
+  DataChunk chunk;
+  chunk.Initialize(std::vector<LogicalType>{LogicalType(LogicalTypeId::STRING)});
+  for (idx_t i = 0; i < vals.size(); i++) {
+    chunk.SetValue(0, i, Value(vals[i]));
+  }
+  chunk.SetCardinality(vals.size());
+  return chunk;
+}
+
+auto StrCol() -> AbstractExpressionRef {
+  return std::make_shared<ColumnValueExpression>(0, 0, Column::Make("s", LogicalType(LogicalTypeId::STRING)));
+}
+auto Pattern(const std::string &p) -> AbstractExpressionRef {
+  return std::make_shared<ConstantValueExpression>(Value(p));
+}
+
+TEST(ExpressionExecutorTest, LikeSelectsWildcardMatches) {
+  auto chunk = MakeStringChunk({"google.com", "www.google.co", "bing", "MED BOX"});
+  auto pred = std::make_shared<LikeExpression>(StrCol(), Pattern("%google%"), /*negated=*/false);
+
+  ExpressionExecutor exec(*pred);
+  SelectionVector sel(chunk.GetSize());
+  idx_t n = exec.Select(chunk, sel);
+
+  ASSERT_EQ(n, 2);
+  EXPECT_EQ(sel.GetIndex(0), 0);
+  EXPECT_EQ(sel.GetIndex(1), 1);
+}
+
+TEST(ExpressionExecutorTest, LikeUnderscoreAndAnchorsAndNotLike) {
+  auto chunk = MakeStringChunk({"cat", "coat", "MED BOX"});
+  // `c_t` = c + exactly one char + t -> "cat" only ("coat" is one char too long).
+  auto underscore = std::make_shared<LikeExpression>(StrCol(), Pattern("c_t"), false);
+  ExpressionExecutor e1(*underscore);
+  SelectionVector s1(chunk.GetSize());
+  ASSERT_EQ(e1.Select(chunk, s1), 1);
+  EXPECT_EQ(s1.GetIndex(0), 0);  // "cat"
+
+  // Suffix anchor.
+  auto anchor = std::make_shared<LikeExpression>(StrCol(), Pattern("%BOX"), false);
+  ExpressionExecutor e2(*anchor);
+  SelectionVector s2(chunk.GetSize());
+  ASSERT_EQ(e2.Select(chunk, s2), 1);
+  EXPECT_EQ(s2.GetIndex(0), 2);  // "MED BOX"
+
+  // NOT LIKE inverts: everything not starting with 'c'.
+  auto not_like = std::make_shared<LikeExpression>(StrCol(), Pattern("c%"), /*negated=*/true);
+  ExpressionExecutor e3(*not_like);
+  SelectionVector s3(chunk.GetSize());
+  ASSERT_EQ(e3.Select(chunk, s3), 1);
+  EXPECT_EQ(s3.GetIndex(0), 2);  // "MED BOX"
+}
+
+// A literal '%' in the DATA aligned with the pattern's '%' must not be consumed as a literal
+// (regression for the wildcard/literal precedence bug that broke LIKE over %-escaped URLs).
+TEST(ExpressionExecutorTest, LikePercentInDataMatchesWildcard) {
+  auto chunk = MakeStringChunk({"http%26rleurl", "httpXXrleurl", "ab"});
+  // "____%" = at least 4 chars; all three of these differ only in length -> first two match.
+  auto len4 = std::make_shared<LikeExpression>(StrCol(), Pattern("____%"), false);
+  ExpressionExecutor e1(*len4);
+  SelectionVector s1(chunk.GetSize());
+  ASSERT_EQ(e1.Select(chunk, s1), 2);
+  EXPECT_EQ(s1.GetIndex(0), 0);  // "http%26rleurl" (% at offset 4)
+  EXPECT_EQ(s1.GetIndex(1), 1);  // "httpXXrleurl"
+
+  // A wildcard right after a literal that IS '%' in the data.
+  auto contains = std::make_shared<LikeExpression>(StrCol(), Pattern("http%rleurl"), false);
+  ExpressionExecutor e2(*contains);
+  SelectionVector s2(chunk.GetSize());
+  ASSERT_EQ(e2.Select(chunk, s2), 2);  // both http... rows: "http" + <anything> + "rleurl"
+}
+
+TEST(ExpressionExecutorTest, InSelectsListMembers) {
+  auto chunk = MakeChunk({1, 2, 3, 4, 5}, {0, 0, 0, 0, 0});
+  auto in = std::make_shared<InExpression>(std::vector<AbstractExpressionRef>{Col(0), Const(1), Const(3)},
+                                           /*negated=*/false);
+  ExpressionExecutor e1(*in);
+  SelectionVector s1(chunk.GetSize());
+  ASSERT_EQ(e1.Select(chunk, s1), 2);
+  EXPECT_EQ(s1.GetIndex(0), 0);  // value 1
+  EXPECT_EQ(s1.GetIndex(1), 2);  // value 3
+
+  // With no NULLs anywhere, NOT IN selects the exact complement.
+  auto not_in = std::make_shared<InExpression>(std::vector<AbstractExpressionRef>{Col(0), Const(1), Const(3)},
+                                               /*negated=*/true);
+  ExpressionExecutor e2(*not_in);
+  SelectionVector s2(chunk.GetSize());
+  ASSERT_EQ(e2.Select(chunk, s2), 3);
+  EXPECT_EQ(s2.GetIndex(0), 1);
+  EXPECT_EQ(s2.GetIndex(1), 3);
+  EXPECT_EQ(s2.GetIndex(2), 4);
+}
+
+// A 1-column INT chunk where nullopt becomes SQL NULL.
+auto MakeNullableIntChunk(const std::vector<std::optional<int>> &vals) -> DataChunk {
+  DataChunk chunk;
+  chunk.Initialize(std::vector<LogicalType>{kInt});
+  for (idx_t i = 0; i < vals.size(); i++) {
+    chunk.SetValue(0, i, vals[i].has_value() ? Value(*vals[i]) : Value::Null(kInt));
+  }
+  chunk.SetCardinality(vals.size());
+  return chunk;
+}
+
+// SQL three-valued logic folded to 0/1: a non-match that involved a NULL is NULL in SQL, which
+// must select nothing for BOTH polarities — the reason NOT IN cannot be an outer NOT over IN.
+TEST(ExpressionExecutorTest, InNullSemantics) {
+  auto chunk = MakeNullableIntChunk({1, 2, std::nullopt});
+  auto null_const = std::make_shared<ConstantValueExpression>(Value::Null(kInt));
+
+  // v IN (1, NULL): only the match survives; NULL-poisoned non-matches select nothing.
+  auto in = std::make_shared<InExpression>(std::vector<AbstractExpressionRef>{Col(0), Const(1), null_const},
+                                           /*negated=*/false);
+  ExpressionExecutor e1(*in);
+  SelectionVector s1(chunk.GetSize());
+  ASSERT_EQ(e1.Select(chunk, s1), 1);
+  EXPECT_EQ(s1.GetIndex(0), 0);
+
+  // v NOT IN (1, NULL): the NULL in the list poisons every non-match -> empty (the classic).
+  auto not_in_null = std::make_shared<InExpression>(std::vector<AbstractExpressionRef>{Col(0), Const(1), null_const},
+                                                    /*negated=*/true);
+  ExpressionExecutor e2(*not_in_null);
+  SelectionVector s2(chunk.GetSize());
+  ASSERT_EQ(e2.Select(chunk, s2), 0);
+
+  // v NOT IN (1): a NULL tested value never qualifies; the clean non-match does.
+  auto not_in = std::make_shared<InExpression>(std::vector<AbstractExpressionRef>{Col(0), Const(1)},
+                                               /*negated=*/true);
+  ExpressionExecutor e3(*not_in);
+  SelectionVector s3(chunk.GetSize());
+  ASSERT_EQ(e3.Select(chunk, s3), 1);
+  EXPECT_EQ(s3.GetIndex(0), 1);  // value 2
+}
+
+// An all-constant integer list is sorted once and answered by binary search. The prepared list is
+// cached on the executor, so it has to survive being reused across chunks, and it has to agree with
+// the general kernel on the awkward inputs: unsorted, duplicated and negative elements.
+TEST(ExpressionExecutorTest, InPreparedListMatchesGeneralKernel) {
+  std::vector<AbstractExpressionRef> children{Col(0)};
+  for (const int v : {7, -3, 7, 0, 4, -3}) {  // unsorted, duplicated, negative
+    children.push_back(Const(v));
+  }
+  auto in = std::make_shared<InExpression>(children, /*negated=*/false);
+  ExpressionExecutor exec(*in);
+
+  auto first = MakeChunk({-3, 1, 4, 7, 5}, {0, 0, 0, 0, 0});
+  SelectionVector s1(first.GetSize());
+  ASSERT_EQ(exec.Select(first, s1), 3);
+  EXPECT_EQ(s1.GetIndex(0), 0);  // -3
+  EXPECT_EQ(s1.GetIndex(1), 2);  // 4
+  EXPECT_EQ(s1.GetIndex(2), 3);  // 7
+
+  // The SAME executor over a second chunk reuses the prepared list.
+  auto second = MakeChunk({0, 6, -4, 7, 2}, {0, 0, 0, 0, 0});
+  SelectionVector s2(second.GetSize());
+  ASSERT_EQ(exec.Select(second, s2), 2);
+  EXPECT_EQ(s2.GetIndex(0), 0);  // 0
+  EXPECT_EQ(s2.GetIndex(1), 3);  // 7
+}
+
+// A list element that is not a constant cannot be prepared: the general kernel must still run it.
+TEST(ExpressionExecutorTest, InWithNonConstantElementFallsBack) {
+  // Column 0 is the tested value, column 1 supplies a per-row list element.
+  auto chunk = MakeChunk({1, 2, 3}, {9, 2, 9});
+  auto in = std::make_shared<InExpression>(std::vector<AbstractExpressionRef>{Col(0), Const(1), Col(1)},
+                                           /*negated=*/false);
+  ExpressionExecutor exec(*in);
+  SelectionVector sel(chunk.GetSize());
+  ASSERT_EQ(exec.Select(chunk, sel), 2);
+  EXPECT_EQ(sel.GetIndex(0), 0);  // 1 IN (1, 9)
+  EXPECT_EQ(sel.GetIndex(1), 1);  // 2 IN (1, 2) — matches the row's own second column
 }
 
 TEST(ExpressionExecutorTest, ProjectionReordersColumnsZeroCopy) {

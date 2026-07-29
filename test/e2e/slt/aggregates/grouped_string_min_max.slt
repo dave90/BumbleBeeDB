@@ -1,0 +1,79 @@
+# Grouped MIN / MAX over a VARCHAR argument: lexicographic ordering per group, NULLs skipped by the
+# extreme but still counted by COUNT(*). The hash-aggregate keeps each group's running extreme off
+# the fixed-width row (an index into a per-table string heap), so a longer extreme can replace a
+# shorter one — the case an in-row payload could not hold.
+
+statement ok
+CREATE TABLE t(g VARCHAR, u VARCHAR);
+
+statement ok
+INSERT INTO t VALUES
+  ('a','zzz'),('a','mmm'),('a','aaa'),
+  ('b','hello'),('b','world'),('b',NULL),
+  ('c',NULL);
+
+# Per-group extremes: 'a' spans aaa..zzz, 'b' skips its NULL for MIN/MAX but counts it, 'c' is
+# all-NULL so both extremes are NULL while COUNT(*) is 1.
+query rowsort
+SELECT g, MIN(u) AS mn, MAX(u) AS mx, COUNT(*) AS c FROM t GROUP BY g;
+----
+'a' 'aaa' 'zzz' 3
+'b' 'hello' 'world' 3
+'c' NULL NULL 1
+
+# The extreme can GROW: within one group the stored MAX is replaced by a strictly longer string.
+statement ok
+CREATE TABLE grow(g INT, s VARCHAR);
+
+statement ok
+INSERT INTO grow VALUES (1,'a'),(1,'bb'),(1,'cccc'),(1,'ddddddd'),(2,'zzzzzzzz'),(2,'y');
+
+query rowsort
+SELECT g, MIN(s), MAX(s) FROM grow GROUP BY g;
+----
+1 'a' 'ddddddd'
+2 'y' 'zzzzzzzz'
+
+# Byte-order case sensitivity carries into the grouped path (uppercase precedes lowercase).
+statement ok
+CREATE TABLE c(k INT, s VARCHAR);
+
+statement ok
+INSERT INTO c VALUES (1,'Zebra'),(1,'apple'),(1,'Apple'),(2,'banana'),(2,'Banana');
+
+query rowsort
+SELECT k, MIN(s), MAX(s) FROM c GROUP BY k;
+----
+1 'Apple' 'apple'
+2 'Banana' 'banana'
+
+# Grouped MIN/MAX over strings alongside a numeric aggregate in the same query (mixed state widths).
+query rowsort
+SELECT g, MIN(u), COUNT(u) FROM t GROUP BY g;
+----
+'a' 'aaa' 3
+'b' 'hello' 2
+'c' NULL 0
+
+# Many distinct groups, each with a single value, exercised across chunk boundaries (small-vector).
+statement ok
+CREATE TABLE many(g VARCHAR, s VARCHAR);
+
+statement ok
+INSERT INTO many VALUES
+  ('g0','m'),('g1','a'),('g2','z'),('g3','b'),('g4','y'),
+  ('g5','c'),('g6','x'),('g7','d'),('g8','w'),('g9','e');
+
+query rowsort
+SELECT g, MIN(s), MAX(s) FROM many GROUP BY g;
+----
+'g0' 'm' 'm'
+'g1' 'a' 'a'
+'g2' 'z' 'z'
+'g3' 'b' 'b'
+'g4' 'y' 'y'
+'g5' 'c' 'c'
+'g6' 'x' 'x'
+'g7' 'd' 'd'
+'g8' 'w' 'w'
+'g9' 'e' 'e'

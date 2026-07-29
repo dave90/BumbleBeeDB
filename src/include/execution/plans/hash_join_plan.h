@@ -84,8 +84,24 @@ class HashJoinPlanNode : public AbstractPlanNode {
   std::vector<AbstractExpressionRef> left_key_expressions_;
   /** The join keys on the right, positionally matched to the left's. */
   std::vector<AbstractExpressionRef> right_key_expressions_;
-  /** The join type. */
+  /** The join type. SEMI/ANTI emit left rows only (output schema = left schema). */
   JoinType join_type_;
+  /**
+   * IN / NOT IN three-valued NULL semantics (SEMI/ANTI only): a NULL probe key never qualifies,
+   * and a NULL key anywhere in the build side makes NOT IN (ANTI) emit nothing at all. Plain
+   * EXISTS / NOT EXISTS joins leave this false: there a NULL key row simply never matches.
+   */
+  bool null_aware_{false};
+  /**
+   * Build-side columns some ancestor actually reads (set by OptimizeColumnPruning when
+   * `build_live_annotated_`; possibly empty — a SEMI/ANTI join, or a query reading only probe
+   * columns, stores nothing beyond the keys). The physical join stores and gathers only these —
+   * the other build outputs surface as constant NULLs nothing reads, exactly the scans'
+   * convention. Indexes are into the BUILD child's schema (child 0 for INNER, the non-preserved
+   * child 1 for LEFT). Un-annotated plans (hand-built, un-optimized) keep the full layout.
+   */
+  std::vector<idx_t> build_live_columns_;
+  bool build_live_annotated_{false};
 
  protected:
   auto PlanNodeToString() const -> std::string override;

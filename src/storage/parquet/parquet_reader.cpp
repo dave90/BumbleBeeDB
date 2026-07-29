@@ -12,6 +12,7 @@
 
 #include "storage/parquet/parquet_reader.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -312,6 +313,17 @@ void ParquetReader::InitializeScan(ParquetReaderScanState &state, std::vector<id
 
   state.define_buf_.Resize(allocator_, STANDARD_VECTOR_SIZE);
   state.repeat_buf_.Resize(allocator_, STANDARD_VECTOR_SIZE);
+
+  // The columns a retry loop must reset between batches: exactly the ones the readers write.
+  // Columns with no file column behind them (pruned / synthetic row ids) are never touched by a
+  // read, so resetting them per empty batch would only churn — a pushed-down selective filter
+  // hits this loop for nearly every batch.
+  state.reset_columns_.clear();
+  for (idx_t i = 0; i < state.column_ids_.size(); i++) {
+    if (state.column_ids_[i] != COLUMN_IDENTIFIER_ROW_ID) {
+      state.reset_columns_.push_back(i);
+    }
+  }
 }
 
 void ParquetReader::Scan(ParquetReaderScanState &state, DataChunk &result) {
@@ -319,7 +331,7 @@ void ParquetReader::Scan(ParquetReaderScanState &state, DataChunk &result) {
     if (result.GetSize() > 0) {
       break;
     }
-    result.Reset();
+    result.Reset(state.reset_columns_);
   }
 }
 
@@ -359,7 +371,6 @@ auto ParquetReader::ScanInternal(ParquetReaderScanState &state, DataChunk &resul
     return false;  // end of last group, we are done
   }
 
-  // No filter pushdown yet: decode every row of every requested column.
   parquet_filter_t filter_mask;
   filter_mask.set();
 
@@ -371,16 +382,51 @@ auto ParquetReader::ScanInternal(ParquetReaderScanState &state, DataChunk &resul
 
   auto *root_reader = static_cast<StructColumnReader *>(state.root_reader_.get());
 
+  // Filter pushdown: decode the predicate's columns first and let the callback clear the mask
+  // bit of every failing row, so the remaining columns skip conversion for those rows.
+  const bool pushdown = state.row_filter_ != nullptr;
+  if (pushdown) {
+    for (const auto out_col_idx : state.filter_columns_) {
+      root_reader->GetChildReader(state.column_ids_[out_col_idx])
+          ->Read(result.GetSize(), filter_mask, define_ptr, repeat_ptr, result.data_[out_col_idx]);
+    }
+    state.row_filter_(result, this_output_chunk_rows, filter_mask);
+  }
+
   for (idx_t out_col_idx = 0; out_col_idx < result.ColumnCount(); out_col_idx++) {
     auto file_col_idx = state.column_ids_[out_col_idx];
     if (file_col_idx == COLUMN_IDENTIFIER_ROW_ID) {
       continue;
+    }
+    if (pushdown && std::find(state.filter_columns_.begin(), state.filter_columns_.end(), out_col_idx) !=
+                        state.filter_columns_.end()) {
+      continue;  // already decoded above
     }
     root_reader->GetChildReader(file_col_idx)
         ->Read(result.GetSize(), filter_mask, define_ptr, repeat_ptr, result.data_[out_col_idx]);
   }
 
   state.group_offset_ += this_output_chunk_rows;
+
+  // Emit only the surviving rows: the chunk leaves the scan already dense, so no Filter operator
+  // is needed above it. (Constant vectors slice for free; dead rows in flat vectors were skipped,
+  // not decoded, and the dictionary view never reads them.)
+  if (pushdown && !filter_mask.all()) {
+    SelectionVector sel(this_output_chunk_rows);
+    idx_t approved = 0;
+    for (idx_t i = 0; i < this_output_chunk_rows; i++) {
+      if (filter_mask[i]) {
+        sel.SetIndex(approved++, i);
+      }
+    }
+    if (approved == 0) {
+      // Everything filtered: leave the vectors flat (no dictionary churn) — the caller's retry
+      // loop re-reads them in place after a cheap partial reset.
+      result.SetCardinality(0);
+      return true;
+    }
+    result.Slice(sel, approved);
+  }
   return true;
 }
 

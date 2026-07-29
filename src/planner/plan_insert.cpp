@@ -133,19 +133,23 @@ auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRe
 
 auto Planner::PlanDelete(const DeleteStatement &statement) -> AbstractPlanNodeRef {
   auto table = PlanTableRef(*statement.table_);
-  auto [_, condition] = PlanExpression(*statement.expr_, {table});
-  auto filter =
-      std::make_shared<FilterPlanNode>(table->output_schema_, std::move(condition), std::move(table));
+  // Same WHERE handling as SELECT, so `DELETE ... WHERE k IN (SELECT ...)` flattens to a SEMI join
+  // over the scan instead of failing. A SEMI join emits each qualifying row exactly once, which is
+  // what a delete needs, and its output schema is its left child's, so the RID column the physical
+  // lowering appends to the scan rides through untouched.
+  auto rows = PlanWhere(*statement.expr_, std::move(table), /*outer_statement=*/nullptr);
 
   return std::make_shared<DeletePlanNode>(MakeDmlResultSchema("__bumblebee_internal.delete_rows"),
-                                          std::move(filter), statement.table_->oid_);
+                                          std::move(rows), statement.table_->oid_);
 }
 
 auto Planner::PlanUpdate(const UpdateStatement &statement) -> AbstractPlanNodeRef {
   auto table = PlanTableRef(*statement.table_);
-  auto [_, condition] = PlanExpression(*statement.filter_expr_, {table});
-  AbstractPlanNodeRef filter =
-      std::make_shared<FilterPlanNode>(table->output_schema_, std::move(condition), std::move(table));
+  // See PlanDelete: an IN/EXISTS conjunct becomes a SEMI/ANTI join over the scan. The SET
+  // expressions below are planned against this node's output, whose schema is the table's either
+  // way (a SEMI join emits its left side only), so nothing downstream changes shape.
+  AbstractPlanNodeRef filter = PlanWhere(*statement.filter_expr_, std::move(table),
+                                         /*outer_statement=*/nullptr);
 
   const auto scope = std::vector{filter};
 

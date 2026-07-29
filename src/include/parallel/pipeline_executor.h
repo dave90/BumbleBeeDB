@@ -57,6 +57,21 @@ class PipelineExecutor {
   std::vector<std::unique_ptr<DataChunk>> intermediate_chunks_;
   DataChunk final_chunk_;  // the chunk handed to the sink (last operator's output)
 
+  /** Per boundary, the columns actually written into that chunk each iteration (nullptr = all):
+   * the source's SourceWrittenColumns hint, carried through column-preserving operators (a
+   * Filter's output holds the same columns as its input). Reset touches only those, so a pruned
+   * scan's constant-NULL columns pass the whole pipeline without per-chunk work. */
+  std::vector<const std::vector<idx_t> *> chunk_written_;
+
+  /** @brief Reset the chunk at boundary `idx` (source = 0), honoring its written-columns hint. */
+  void ResetChunk(DataChunk &chunk, idx_t idx) {
+    if (chunk_written_[idx] != nullptr) {
+      chunk.Reset(*chunk_written_[idx]);
+    } else {
+      chunk.Reset();
+    }
+  }
+
   /** LIFO of operators still holding buffered output. Invariant: strictly increasing bottom→top. */
   std::vector<idx_t> in_process_operators_;
   bool exhausted_source_{false};

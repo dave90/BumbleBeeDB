@@ -248,6 +248,22 @@ auto TableHeap::MakeScan(const std::vector<idx_t> &projection) -> std::unique_pt
   return MakeMorselScan(state, 0, state->NumPages());
 }
 
+auto TableHeap::EstimatedRowCount() const -> idx_t {
+  // Snapshot the page list under the latch, then sum each page's slot count. This over-counts
+  // logically-deleted rows (an estimate is all the planner needs) and is O(pages) — infrequent
+  // (statistics / planning time), never on the row path.
+  std::vector<page_id_t> pages;
+  {
+    std::lock_guard lock(latch_);
+    pages = page_directory_;
+  }
+  idx_t total = 0;
+  for (const auto pid : pages) {
+    total += bpm_->ReadPage(pid).As<TablePage>()->GetNumTuples();
+  }
+  return total;
+}
+
 auto TableHeap::MakeMvccScan(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, ScanPredicate predicate,
                              const std::vector<idx_t> &projection) -> std::unique_ptr<TableScan> {
   auto state = BeginParallelScan(txn_mgr, txn, oid, std::move(predicate), projection);

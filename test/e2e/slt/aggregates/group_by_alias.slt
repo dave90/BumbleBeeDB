@@ -1,0 +1,28 @@
+# GROUP BY may name a SELECT alias of a plain column (`l_suppkey AS supplier_no ... GROUP BY
+# supplier_no`, the TPC-H q15 view shape). The alias resolves to the UNDERLYING column — GROUP BY
+# runs on the aggregation's input. A FROM-scope column of the same name wins over the alias.
+
+statement ok
+CREATE TABLE li (sk INT, price INT);
+
+statement ok
+INSERT INTO li VALUES (1, 100), (1, 50), (2, 300), (3, 10);
+
+query rowsort
+SELECT sk AS supplier_no, sum(price) AS total FROM li GROUP BY supplier_no;
+----
+1 150
+2 300
+3 10
+
+# The alias also works inside a derived table, and the outer query sees the aliased names.
+query rowsort
+SELECT supplier_no, total FROM (SELECT sk AS supplier_no, sum(price) AS total FROM li GROUP BY supplier_no) AS r;
+----
+1 150
+2 300
+3 10
+
+# An alias over an expression still has no input column to group on.
+statement error
+SELECT price / 100 AS bucket, count(*) FROM li GROUP BY bucket;

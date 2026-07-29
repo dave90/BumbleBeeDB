@@ -145,6 +145,64 @@ class MockCollector : public PhysicalOperator {
   }
 };
 
+/** @brief A source whose global state advertises `n` usable tasks, so a pipeline over it is wide. */
+class MockWideScan : public MockScan {
+ public:
+  MockWideScan(std::vector<int> values, idx_t chunk_size, idx_t threads)
+      : MockScan(std::move(values), chunk_size), threads_(threads) {}
+
+  struct GlobalState : GlobalSourceState {
+    explicit GlobalState(idx_t n) : n_(n) {}
+    auto MaxThreads() -> idx_t override { return n_; }
+    idx_t n_;
+  };
+  auto GetGlobalSourceState(ClientContext & /*ctx*/, GlobalSinkState * /*own*/) const
+      -> std::unique_ptr<GlobalSourceState> override {
+    return std::make_unique<GlobalState>(threads_);
+  }
+
+ private:
+  idx_t threads_;
+};
+
+/**
+ * @brief A pipeline breaker that is both sink and source — the shape of Insert or a hash aggregate.
+ *
+ * Its child sinks into it on a CHILD pipeline that must finish first, so breaker and parent land on
+ * one dependency chain and can never run at the same time.
+ */
+class MockBreaker : public PhysicalOperator {
+ public:
+  explicit MockBreaker(std::unique_ptr<PhysicalOperator> child)
+      : PhysicalOperator(PhysicalOperatorType::UNGROUPED_AGGREGATE, OneIntSchema(), 0) {
+    children_.push_back(std::move(child));
+  }
+
+  auto IsSink() const -> bool override { return true; }
+  auto IsSource() const -> bool override { return true; }
+
+  auto GetGlobalSinkState(ClientContext & /*ctx*/) const -> std::unique_ptr<GlobalSinkState> override {
+    return std::make_unique<GlobalSinkState>();
+  }
+  auto GetLocalSinkState(ExecutionContext & /*ctx*/) const -> std::unique_ptr<LocalSinkState> override {
+    return std::make_unique<LocalSinkState>();
+  }
+  auto Sink(ExecutionContext & /*ctx*/, DataChunk & /*input*/, GlobalSinkState & /*g*/,
+            LocalSinkState & /*l*/) const -> SinkResultType override {
+    return SinkResultType::NEED_MORE_INPUT;
+  }
+  auto GetData(ExecutionContext & /*ctx*/, DataChunk & /*output*/, GlobalSourceState & /*g*/,
+               LocalSourceState & /*l*/) const -> SourceResultType override {
+    return SourceResultType::FINISHED;
+  }
+
+  void BuildPipelines(Pipeline &current, PipelineBuilder &builder) const override {
+    current.source_ = this;
+    auto &build = builder.CreateChildPipeline(current, *this);
+    children_[0]->BuildPipelines(build, builder);
+  }
+};
+
 struct Harness {
   std::unique_ptr<Catalog> catalog{std::make_unique<Catalog>()};
   TransactionManager txn_mgr{catalog.get()};
@@ -192,6 +250,55 @@ TEST(ExecutorTest, StreamingOperatorAppliesInSourceToSinkOrder) {
   std::vector<int> got = gs.rows_;
   std::sort(got.begin(), got.end());
   EXPECT_EQ(got, (std::vector<int>{111, 112, 113}));  // each +10 then +100
+}
+
+// PeakTaskDemand sizes the worker pool. Chained pipelines run one after another, so adding their
+// task counts up would spawn threads that can never have work — which is most of the cost of a
+// small statement (one OS thread create+join ≈ 10µs).
+TEST(ExecutorTest, PeakTaskDemandDoesNotAddUpChainedPipelines) {
+  Harness h;
+  // Collector <- Breaker <- Scan: two pipelines, the parent waiting on the child.
+  auto scan = std::make_unique<MockScan>(std::vector<int>{1, 2, 3}, 2);
+  auto breaker = std::make_unique<MockBreaker>(std::move(scan));
+  auto collector = std::make_unique<MockCollector>(std::move(breaker));
+
+  Executor executor(h.client);
+  executor.Initialize(*collector);
+  ASSERT_EQ(executor.Pipelines().size(), 2u);
+  EXPECT_EQ(executor.PeakTaskDemand(), 1u);  // NOT 2 — they never overlap
+  executor.ExecuteQuery();
+}
+
+// The same bound must not cost parallelism: a single wide pipeline still asks for its full width.
+TEST(ExecutorTest, PeakTaskDemandKeepsAWidePipelineWide) {
+  Harness h;
+  auto scan = std::make_unique<MockWideScan>(std::vector<int>{1, 2, 3, 4}, 1, /*threads=*/6);
+  auto collector = std::make_unique<MockCollector>(std::move(scan));
+
+  Executor executor(h.client);
+  executor.Initialize(*collector);
+  ASSERT_EQ(executor.Pipelines().size(), 1u);
+  EXPECT_EQ(executor.PeakTaskDemand(), 6u);
+  executor.ExecuteQuery();
+
+  // MockScan has no shared cursor, so each task replays the whole input: 6 x 4 rows is direct
+  // evidence that six tasks really ran, i.e. the bound did not throttle the pipeline.
+  auto &gs = static_cast<MockCollector::GlobalState &>(*executor.Pipelines()[0]->sink_gstate_);
+  EXPECT_EQ(gs.rows_.size(), 24u);
+}
+
+// A chain of wide pipelines takes the MAX, not the sum: only one of them is ever runnable.
+TEST(ExecutorTest, PeakTaskDemandTakesTheWidestLinkOfAChain) {
+  Harness h;
+  auto scan = std::make_unique<MockWideScan>(std::vector<int>{1, 2, 3, 4}, 1, /*threads=*/5);
+  auto breaker = std::make_unique<MockBreaker>(std::move(scan));
+  auto collector = std::make_unique<MockCollector>(std::move(breaker));
+
+  Executor executor(h.client);
+  executor.Initialize(*collector);
+  ASSERT_EQ(executor.Pipelines().size(), 2u);
+  EXPECT_EQ(executor.PeakTaskDemand(), 5u);  // max(5, 1), not 6
+  executor.ExecuteQuery();
 }
 
 }  // namespace bumblebee

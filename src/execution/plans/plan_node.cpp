@@ -91,6 +91,42 @@ auto ProjectionPlanNode::RenameSchema(const Schema &schema, const std::vector<st
   return Schema(columns);
 }
 
+auto AggregationPlanNode::AggResultType(AggregationType agg_type, const LogicalType &input_type) -> LogicalType {
+  switch (agg_type) {
+    case AggregationType::CountStarAggregate:
+    case AggregationType::CountAggregate:
+      // A count is an integer no matter what it counts.
+      return LogicalType(LogicalTypeId::INTEGER);
+    case AggregationType::SumAggregate:
+      // SUM widens integers to BIGINT: summing millions of INT32s overflows 32 bits (it would
+      // saturate at INT32_MAX), so every integer input goes to BIGINT — the widest integer
+      // BumbleBeeDB has. FLOAT/DOUBLE stay DOUBLE, DECIMAL stays DECIMAL. Mirrors DuckDB's
+      // "widen within the family" rule, capped at 64 bits (no 128-bit type here). Caveat: a sum
+      // past the int64 range still overflows, and the double accumulator is exact only to 2^53.
+      switch (input_type.GetTypeId()) {
+        case LogicalTypeId::TINYINT:
+        case LogicalTypeId::SMALLINT:
+        case LogicalTypeId::INTEGER:
+        case LogicalTypeId::BIGINT:
+        case LogicalTypeId::UTINYINT:
+        case LogicalTypeId::USMALLINT:
+        case LogicalTypeId::UINTEGER:
+        case LogicalTypeId::UBIGINT:
+          return LogicalType(LogicalTypeId::BIGINT);
+        default:
+          return input_type;
+      }
+    case AggregationType::MinAggregate:
+    case AggregationType::MaxAggregate:
+      // MIN/MAX preserve the type of what they aggregate.
+      return input_type;
+    case AggregationType::AvgAggregate:
+      // AVG is a ratio: always DOUBLE regardless of input type.
+      return LogicalType(LogicalTypeId::DOUBLE);
+  }
+  UNREACHABLE("unknown aggregation type");
+}
+
 auto AggregationPlanNode::InferAggSchema(const std::vector<AbstractExpressionRef> &group_bys,
                                          const std::vector<AbstractExpressionRef> &aggregates,
                                          const std::vector<AggregationType> &agg_types) -> Schema {
@@ -104,21 +140,8 @@ auto AggregationPlanNode::InferAggSchema(const std::vector<AbstractExpressionRef
     columns.emplace_back(group_by->GetReturnType());
   }
   for (size_t idx = 0; idx < aggregates.size(); idx++) {
-    switch (agg_types[idx]) {
-      case AggregationType::CountStarAggregate:
-      case AggregationType::CountAggregate:
-        // A count is an integer no matter what it counts.
-        columns.emplace_back(Column::Make("<unnamed>", LogicalType(LogicalTypeId::INTEGER)));
-        break;
-      case AggregationType::SumAggregate:
-      case AggregationType::MinAggregate:
-      case AggregationType::MaxAggregate:
-        // These preserve the type of what they aggregate.
-        columns.emplace_back(aggregates[idx]->GetReturnType());
-        break;
-      default:
-        UNREACHABLE("unknown aggregation type");
-    }
+    const auto &arg = aggregates[idx]->GetReturnType();
+    columns.emplace_back(Column::Make(arg.GetName(), AggResultType(agg_types[idx], arg.GetType())));
   }
   return Schema(columns);
 }

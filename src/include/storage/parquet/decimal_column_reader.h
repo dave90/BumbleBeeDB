@@ -39,6 +39,14 @@ struct DecimalParquetValueConversion {
     }
   }
 
+  /** @brief INT32/INT64-stored decimals of exactly this width are already the in-memory value, so
+   * a run of them copies in bulk (see `bumblebee::PlainIsBitwise`). */
+  static auto PlainIsBitwise(ColumnReader &reader) -> bool {
+    bool plain_decoder = false;
+    const auto byte_len = GetByteLength(reader, plain_decoder);
+    return plain_decoder && byte_len == sizeof(PHYSICAL_TYPE);
+  }
+
   static auto DictRead(ByteBuffer &dict, uint32_t &offset, ColumnReader &reader) -> PHYSICAL_TYPE {
     auto *dict_ptr = reinterpret_cast<PHYSICAL_TYPE *>(dict.ptr_);
     return dict_ptr[offset];

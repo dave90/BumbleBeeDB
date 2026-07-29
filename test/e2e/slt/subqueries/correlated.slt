@@ -1,0 +1,152 @@
+# Correlated subqueries, decorrelated at plan time:
+#  - [NOT] EXISTS with `inner = outer` equalities  -> SEMI/ANTI hash join on the correlation keys.
+#  - scalar aggregate with `inner = outer`         -> GROUP BY key + LEFT join (missing group -> NULL).
+# Only equality correlation in the subquery WHERE is supported; other shapes error cleanly.
+
+statement ok
+CREATE TABLE orders (o_orderkey INT, o_prio VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'hi'), (2, 'lo'), (3, 'hi'), (4, 'lo');
+
+statement ok
+CREATE TABLE lineitem (l_orderkey INT, l_qty INT, l_commit INT, l_receipt INT);
+
+statement ok
+INSERT INTO lineitem VALUES (1, 5, 1, 2), (1, 30, 2, 1), (2, 10, 1, 2), (2, 40, 5, 3), (3, 8, 9, 9);
+
+# Correlated EXISTS (the TPC-H q04 shape): orders with at least one late lineitem.
+query rowsort
+SELECT o_orderkey FROM orders WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey AND l_commit < l_receipt);
+----
+1
+2
+
+# Correlated NOT EXISTS: the complement, including the order with no lineitems at all.
+query rowsort
+SELECT o_orderkey FROM orders WHERE NOT EXISTS (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey AND l_commit < l_receipt);
+----
+3
+4
+
+# EXISTS composes with ordinary conjuncts.
+query rowsort
+SELECT o_orderkey FROM orders WHERE o_prio = 'hi' AND EXISTS (SELECT 1 FROM lineitem WHERE l_orderkey = o_orderkey);
+----
+1
+3
+
+statement ok
+CREATE TABLE part (p_partkey INT);
+
+statement ok
+INSERT INTO part VALUES (100), (200), (300);
+
+statement ok
+CREATE TABLE li2 (l_partkey INT, l_quantity INT);
+
+statement ok
+INSERT INTO li2 VALUES (100, 5), (100, 30), (100, 10), (200, 40), (200, 8);
+
+# Correlated scalar aggregate (the TPC-H q17 shape): per-key AVG, computed in one pass.
+# key 100: avg 15 -> 10 > 7.5 qualifies; key 200: avg 24 -> 10 > 12 fails; key 300: no group -> NULL.
+query
+SELECT p_partkey FROM part WHERE 10 > (SELECT 0.5 * avg(l_quantity) FROM li2 WHERE l_partkey = p_partkey);
+----
+100
+
+# A missing group yields NULL (LEFT join), observable through IS NULL.
+query
+SELECT p_partkey FROM part WHERE (SELECT sum(l_quantity) FROM li2 WHERE l_partkey = p_partkey) IS NULL;
+----
+300
+
+# Correlated scalar COUNT with a `0 <` guard (the benchmark's q04 phrasing).
+query rowsort
+SELECT o_orderkey FROM orders WHERE 0 < (SELECT count(*) FROM lineitem WHERE l_orderkey = o_orderkey AND l_commit < l_receipt);
+----
+1
+2
+
+# The subquery may keep its own residual predicates alongside the correlation.
+query rowsort
+SELECT p_partkey FROM part WHERE 100 > (SELECT min(l_quantity) FROM li2 WHERE l_partkey = p_partkey AND l_quantity > 9);
+----
+100
+200
+
+# --- Correlation-key restriction ------------------------------------------------------------
+# When the outer WHERE narrows the table the correlation key comes from, the decorrelated
+# aggregate is SEMI-joined against those keys first, so it groups only the keys the outer query
+# can actually probe. The answers below must be identical to the unrestricted plan's.
+
+statement ok
+CREATE TABLE part2 (p_partkey INT, p_brand VARCHAR, p_size INT);
+
+statement ok
+INSERT INTO part2 VALUES (100, 'B1', 1), (200, 'B2', 2), (300, 'B1', 3), (400, 'B2', 1);
+
+statement ok
+CREATE TABLE li3 (l_partkey INT, l_quantity INT);
+
+statement ok
+INSERT INTO li3 VALUES (100, 5), (100, 30), (100, 10), (200, 40), (200, 8), (300, 100), (300, 2);
+
+# key 100: avg 15 -> 10 > 7.5 qualifies. key 300 is filtered out of the outer query, and 400 has
+# no group at all (LEFT join -> NULL -> the comparison is unknown -> dropped).
+query rowsort
+SELECT p_partkey FROM part2 WHERE p_brand = 'B1' AND 10 > (SELECT 0.5 * avg(l_quantity) FROM li3 WHERE l_partkey = p_partkey);
+----
+100
+
+# Two conjuncts on the key table, and the surviving key has no group: still NULL, not a wrong value.
+query
+SELECT p_partkey FROM part2 WHERE p_brand = 'B2' AND p_size = 1 AND (SELECT sum(l_quantity) FROM li3 WHERE l_partkey = p_partkey) IS NULL;
+----
+400
+
+# The full TPC-H q17 shape: the key table is joined to the aggregated one, and only the
+# single-table conjuncts (p_brand) can restrict the keys — the join predicate cannot.
+query rowsort
+SELECT l_partkey, l_quantity FROM li3, part2 WHERE p_partkey = l_partkey AND p_brand = 'B1' AND l_quantity < (SELECT 2.0 * avg(l_quantity) FROM li3 WHERE l_partkey = p_partkey);
+----
+100 10
+100 5
+300 100
+300 2
+
+# An OR over the key table restricts too (it is still one single-table conjunct).
+query rowsort
+SELECT p_partkey FROM part2 WHERE (p_size = 2 OR p_brand = 'B1') AND 50 > (SELECT avg(l_quantity) FROM li3 WHERE l_partkey = p_partkey);
+----
+100
+200
+
+# The correlated table restricted to nothing by its own residual predicate: every group vanishes,
+# so every outer row sees NULL.
+query
+SELECT count(*) FROM part2 WHERE p_brand = 'B1' AND (SELECT sum(l_quantity) FROM li3 WHERE l_partkey = p_partkey AND l_quantity > 1000) IS NULL;
+----
+2
+
+# Unsupported correlation shapes fail cleanly (never wrong results):
+# a non-equality correlation...
+statement error
+SELECT p_partkey FROM part WHERE 10 > (SELECT avg(l_quantity) FROM li2 WHERE l_partkey < p_partkey);
+
+# ...a correlated scalar outside a WHERE comparison...
+statement error
+SELECT (SELECT sum(l_quantity) FROM li2 WHERE l_partkey = p_partkey) FROM part;
+
+# ...a correlated non-aggregate scalar...
+statement error
+SELECT p_partkey FROM part WHERE 10 > (SELECT l_quantity FROM li2 WHERE l_partkey = p_partkey);
+
+# ...a correlated IN...
+statement error
+SELECT p_partkey FROM part WHERE p_partkey IN (SELECT l_partkey FROM li2 WHERE l_quantity < p_partkey);
+
+# ...and correlated EXISTS over an ungrouped aggregate (such a subquery yields one row even over
+# zero input, so EXISTS would be constantly true — the join rewrite would silently distort it).
+statement error
+SELECT o_orderkey FROM orders WHERE EXISTS (SELECT max(l_qty) FROM lineitem WHERE l_orderkey = o_orderkey);

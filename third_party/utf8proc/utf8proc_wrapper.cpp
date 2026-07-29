@@ -35,13 +35,16 @@ UnicodeType Utf8Proc::Analyze(const char *s, size_t len, UnicodeInvalidReason *i
 	// Word-at-a-time fast path: most strings are pure ASCII, so validate 8 bytes
 	// per step. A word is a run of plain ASCII iff no byte has the high bit set and
 	// no byte is NUL. The SWAR NUL test is the classic (w - 0x01..) & ~w & 0x80..
-	// trick. Any word failing either test falls through to the byte-precise loop
-	// below (which also handles all multi-byte sequences), so behaviour - including
-	// the exact invalid reason and position - is identical to the scalar scan.
+	// trick. A word failing either test falls to the byte-precise scalar loop, which
+	// STAYS scalar across consecutive multi-byte sequences (mostly-multi-byte text -
+	// e.g. Cyrillic - would otherwise reload and retest the same word once per
+	// character) and rejoins the word loop on the next plain-ASCII byte.
+	// A truncated trailing sequence is INVALID (the continuation reads are bounds-
+	// checked; they must never read past `len`).
 	constexpr uint64_t HIGH_BITS = 0x8080808080808080ULL;
 	constexpr uint64_t LOW_ONES = 0x0101010101010101ULL;
 	size_t i = 0;
-	for (;;) {
+	while (i < len) {
 		while (i + 8 <= len) {
 			uint64_t w;
 			memcpy(&w, s + i, 8);
@@ -50,46 +53,73 @@ UnicodeType Utf8Proc::Analyze(const char *s, size_t len, UnicodeInvalidReason *i
 			}
 			i += 8;
 		}
-		if (i >= len) {
-			break;
-		}
-		char c = s[i];
-		if (c == '\0') {
-			AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::NULL_BYTE);
-			return UnicodeType::INVALID;
-		}
-		// 1 Byte / ASCII
-		if ((c & 0x80) == 0) {
-			i++;
-			continue;
-		}
-		type = UnicodeType::UNICODE;
-		if ((s[++i] & 0xC0) != 0x80) {
+		while (i < len) {
+			char c = s[i];
+			if (c == '\0') {
+				AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::NULL_BYTE);
+				return UnicodeType::INVALID;
+			}
+			// 1 Byte / ASCII: stay scalar when the next byte is multi-byte again (a single space
+			// between two Cyrillic words would otherwise bounce through the word loop and back,
+			// paying a word load + test for one byte); rejoin the word loop otherwise.
+			if ((c & 0x80) == 0) {
+				i++;
+				if (i < len && (s[i] & 0x80) != 0) {
+					continue;
+				}
+				break;
+			}
+			type = UnicodeType::UNICODE;
+			// Batched 2-byte path: mostly-2-byte text (Cyrillic, Greek, Hebrew, ...) comes in
+			// runs, so validate four [110xxxxx][10xxxxxx] pairs per 8-byte word (little-endian
+			// lane order; such bytes are >= 0x80, so no NUL can hide in a matching word). On a
+			// mismatch (ASCII, 3/4-byte lead, run end) fall to the byte-precise decode below.
+#if defined(__LITTLE_ENDIAN__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+			{
+				constexpr uint64_t PAIR_MASK = 0xC0E0C0E0C0E0C0E0ULL;
+				constexpr uint64_t PAIR_LEAD = 0x80C080C080C080C0ULL;
+				bool advanced = false;
+				while (i + 8 <= len) {
+					uint64_t w2;
+					memcpy(&w2, s + i, 8);
+					if ((w2 & PAIR_MASK) != PAIR_LEAD) {
+						break;
+					}
+					i += 8;
+					advanced = true;
+				}
+				if (advanced) {
+					continue;  // re-classify whatever follows the run
+				}
+			}
+#endif
+			if (++i >= len || (s[i] & 0xC0) != 0x80) {
+				AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
+				return UnicodeType::INVALID;
+			}
+			if ((c & 0xE0) == 0xC0) {
+				i++;
+				continue;
+			}
+			if (++i >= len || (s[i] & 0xC0) != 0x80) {
+				AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
+				return UnicodeType::INVALID;
+			}
+			if ((c & 0xF0) == 0xE0) {
+				i++;
+				continue;
+			}
+			if (++i >= len || (s[i] & 0xC0) != 0x80) {
+				AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
+				return UnicodeType::INVALID;
+			}
+			if ((c & 0xF8) == 0xF0) {
+				i++;
+				continue;
+			}
 			AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
 			return UnicodeType::INVALID;
 		}
-		if ((c & 0xE0) == 0xC0) {
-			i++;
-			continue;
-		}
-		if ((s[++i] & 0xC0) != 0x80) {
-			AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
-			return UnicodeType::INVALID;
-		}
-		if ((c & 0xF0) == 0xE0) {
-			i++;
-			continue;
-		}
-		if ((s[++i] & 0xC0) != 0x80) {
-			AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
-			return UnicodeType::INVALID;
-		}
-		if ((c & 0xF8) == 0xF0) {
-			i++;
-			continue;
-		}
-		AssignInvalidUTF8Reason(invalid_reason, invalid_pos, i, UnicodeInvalidReason::BYTE_MISMATCH);
-		return UnicodeType::INVALID;
 	}
 
 	return type;

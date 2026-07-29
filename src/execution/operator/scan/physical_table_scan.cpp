@@ -44,6 +44,9 @@ auto ResolveHeap(ClientContext &context, table_oid_t oid) -> TableHeap * {
 /** @brief The shared scan snapshot for a whole `PhysicalTableScan`. */
 struct TableScanGlobalState : GlobalSourceState {
   std::shared_ptr<ParallelScanState> scan_state_;
+  // One shared constant-NULL vector per pruned column: every emitted chunk references it instead
+  // of allocating a fresh constant (immutable, so sharing across worker threads is safe).
+  std::vector<std::unique_ptr<Vector>> null_vectors_;
 
   auto MaxThreads() -> idx_t override {
     const idx_t pages = scan_state_->NumPages();
@@ -59,6 +62,9 @@ struct TableScanLocalState : LocalSourceState {
   // are then referenced zero-copy into the full-width output slots.
   DataChunk narrow_;
   bool narrow_ready_{false};
+  // The first pruned output column, or ColumnCount when none: its encoding tells whether the
+  // shared constant-NULL references are still in place (see GetData).
+  idx_t first_null_column_{0};
 };
 
 void PhysicalTableScan::BuildPipelines(Pipeline &current, PipelineBuilder & /*builder*/) const {
@@ -73,6 +79,16 @@ auto PhysicalTableScan::GetGlobalSourceState(ClientContext &context, GlobalSinkS
   // Seed the per-scan morsel granularity from the session config; a lowered value lets a small table
   // span several morsels so tests exercise the multi-morsel path without a large row count.
   gs->scan_state_->morsel_pages_ = std::max<idx_t>(1, context.config_.morsel_pages_);
+  if (!projection_.empty()) {
+    gs->null_vectors_.resize(output_schema_->GetColumnCount());
+    for (idx_t c = 0, k = 0; c < output_schema_->GetColumnCount(); c++) {
+      if (k < projection_.size() && projection_[k] == c) {
+        k++;
+        continue;
+      }
+      gs->null_vectors_[c] = std::make_unique<Vector>(Value::Null(output_schema_->GetColumn(c).GetType()));
+    }
+  }
   return gs;
 }
 
@@ -102,6 +118,15 @@ auto PhysicalTableScan::GetData(ExecutionContext & /*context*/, DataChunk &outpu
       }
       ls.narrow_.Initialize(types);
       ls.narrow_ready_ = true;
+      ls.first_null_column_ = output.ColumnCount();
+      for (idx_t c = 0, k = 0; c < output.ColumnCount(); c++) {
+        if (k < projection_.size() && projection_[k] == c) {
+          k++;
+          continue;
+        }
+        ls.first_null_column_ = c;
+        break;
+      }
     }
     scan_target = &ls.narrow_;
   }
@@ -116,12 +141,15 @@ auto PhysicalTableScan::GetData(ExecutionContext & /*context*/, DataChunk &outpu
           for (idx_t k = 0; k < projection_.size(); k++) {
             output.data_[projection_[k]].Reference(ls.narrow_.data_[k]);
           }
-          for (idx_t c = 0, k = 0; c < output.ColumnCount(); c++) {
-            if (k < projection_.size() && projection_[k] == c) {
-              k++;
-              continue;
+         if (ls.first_null_column_ != output.ColumnCount() &&
+              output.data_[ls.first_null_column_].GetVectorType() != VectorType::CONSTANT_VECTOR) {
+            for (idx_t c = 0, k = 0; c < output.ColumnCount(); c++) {
+              if (k < projection_.size() && projection_[k] == c) {
+                k++;
+                continue;
+              }
+              output.data_[c].Reference(*gs.null_vectors_[c]);
             }
-            output.data_[c].Reference(Value::Null(output_schema_->GetColumn(c).GetType()));
           }
           output.SetCardinality(ls.narrow_.GetSize());
         }
@@ -134,6 +162,7 @@ auto PhysicalTableScan::GetData(ExecutionContext & /*context*/, DataChunk &outpu
     if (!gs.scan_state_->NextMorsel(begin, end)) {
       return SourceResultType::FINISHED;  // the morsel space is exhausted
     }
+    ls.batch_idx_ = begin;  // page order == serial scan order, one morsel per task at a time
     ls.cursor_ = heap.MakeMorselScan(gs.scan_state_, begin, end);
   }
 }

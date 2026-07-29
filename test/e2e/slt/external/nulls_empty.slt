@@ -25,6 +25,21 @@ SELECT SUM(col5) FROM n;
 ----
 330
 
+# NULLs in a pushed-down filter column: a NULL comparison is not-true, so the row is dropped
+# inside the scan (row 8's NULL col5 must not surface).
+query
+SELECT col1 FROM n WHERE col5 > 45 ORDER BY col1;
+----
+5
+6
+7
+9
+
+query
+SELECT COUNT(*) FROM n WHERE col4 IS NOT NULL AND col5 < 65;
+----
+3
+
 # An empty external table: declared columns over a fresh (empty) subfolder.
 statement ok
 CREATE TABLE e (a INT, b VARCHAR) WITH (format='parquet', location='${TMPDIR}/empty_sub');

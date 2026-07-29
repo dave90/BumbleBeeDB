@@ -1,0 +1,57 @@
+# Uncorrelated [NOT] EXISTS: one bit for the whole statement, pre-executed as `count(*) LIMIT 1`
+# over the subquery (correlated EXISTS is a separate feature).
+
+statement ok
+CREATE TABLE t (v INT);
+
+statement ok
+INSERT INTO t VALUES (1), (2), (NULL);
+
+statement ok
+CREATE TABLE u (w INT);
+
+statement ok
+INSERT INTO u VALUES (10);
+
+statement ok
+CREATE TABLE empty_t (w INT);
+
+query rowsort
+SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u);
+----
+1
+2
+NULL
+
+query
+SELECT v FROM t WHERE EXISTS (SELECT 1 FROM empty_t);
+----
+
+query
+SELECT v FROM t WHERE NOT EXISTS (SELECT 1 FROM u);
+----
+
+query rowsort
+SELECT v FROM t WHERE NOT EXISTS (SELECT 1 FROM empty_t);
+----
+1
+2
+NULL
+
+# EXISTS over a filtered subquery.
+query rowsort
+SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE w > 5) AND v = 1;
+----
+1
+
+# A subquery returning only NULL rows still EXISTS (row count, not values).
+query rowsort
+SELECT v FROM t WHERE EXISTS (SELECT w FROM u WHERE w IS NOT NULL);
+----
+1
+2
+NULL
+
+# EXPLAIN must not execute the EXISTS subquery.
+statement ok
+EXPLAIN SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u);

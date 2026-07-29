@@ -41,6 +41,12 @@ class PhysicalTableScan : public PhysicalOperator {
         emit_rids_(emit_rids) {}
 
   auto IsSource() const -> bool override { return true; }
+  auto SourceProvidesBatchIndex() const -> bool override { return true; }
+  auto SourceWrittenColumns() const -> const std::vector<idx_t> * override {
+    // With pruning, only the projected columns are gathered per chunk; the rest are constant-NULL
+    // references established once per task.
+    return (!projection_.empty() && !emit_rids_) ? &projection_ : nullptr;
+  }
 
   void BuildPipelines(Pipeline &current, PipelineBuilder &builder) const override;
 

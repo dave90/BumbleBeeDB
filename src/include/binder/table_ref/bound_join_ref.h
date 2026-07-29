@@ -36,7 +36,11 @@ enum class JoinType : uint8_t {
   /** INNER JOIN. */
   INNER = 4,
   /** FULL OUTER JOIN. */
-  OUTER = 5
+  OUTER = 5,
+  /** Semi join: emit each left row that has at least one right match (left columns only). */
+  SEMI = 6,
+  /** Anti join: emit each left row that has NO right match (left columns only). */
+  ANTI = 7,
 };
 
 }  // namespace bumblebee
@@ -62,6 +66,12 @@ struct fmt::formatter<bumblebee::JoinType> : fmt::formatter<fmt::string_view> {
         break;
       case bumblebee::JoinType::OUTER:
         name = "Outer";
+        break;
+      case bumblebee::JoinType::SEMI:
+        name = "Semi";
+        break;
+      case bumblebee::JoinType::ANTI:
+        name = "Anti";
         break;
       default:
         name = "Unknown";

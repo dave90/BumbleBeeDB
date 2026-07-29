@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -54,6 +55,19 @@ struct ParquetReaderScanState {
 
   ResizeableBuffer define_buf_;
   ResizeableBuffer repeat_buf_;
+
+  /** In-scan filter pushdown (both empty/null = decode everything, the default). The scan decodes
+   * `filter_columns_` first, calls `row_filter_` to evaluate the pushed WHERE over them — the
+   * callback clears the mask bit of every failing row — then decodes the remaining columns with
+   * that mask (their conversion is skipped for dead rows) and emits the chunk already sliced down
+   * to the surviving rows. The callback is the execution layer's hook: the reader stays free of
+   * expression machinery. */
+  std::vector<idx_t> filter_columns_;  // output-column indexes the pushed predicate reads
+  std::function<void(DataChunk &chunk, idx_t count, parquet_filter_t &mask)> row_filter_;
+
+  /** The output columns the readers actually write (set by InitializeScan): the retry loop in
+   * Scan resets only these between batches, leaving pruned/synthetic columns untouched. */
+  std::vector<idx_t> reset_columns_;
 };
 
 /**

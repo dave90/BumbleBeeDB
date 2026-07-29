@@ -1,0 +1,27 @@
+# SUM widens integer inputs to BIGINT so a large sum does not overflow the input's 32-bit
+# width. Regression for the benchmark finding SUM(int32) saturating at INT32_MAX (2147483647).
+
+statement ok
+CREATE TABLE t (a INT, g INT);
+
+statement ok
+INSERT INTO t VALUES (2000000000, 1), (2000000000, 1), (2000000000, 2), (2000000000, 2);
+
+# Ungrouped: 4 * 2e9 = 8e9, far past INT32_MAX.
+query
+SELECT SUM(a) FROM t;
+----
+8000000000
+
+# Grouped: each group sums 2 * 2e9 = 4e9, also past INT32_MAX.
+query rowsort
+SELECT g, SUM(a) FROM t GROUP BY g;
+----
+1 4000000000
+2 4000000000
+
+# MIN/MAX still return the value unchanged (the fix only touches SUM).
+query
+SELECT MIN(a), MAX(a) FROM t;
+----
+2000000000 2000000000

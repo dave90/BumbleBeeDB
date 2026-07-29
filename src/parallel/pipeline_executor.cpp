@@ -70,6 +70,13 @@ PipelineExecutor::PipelineExecutor(Pipeline &pipeline, ClientContext &client, Th
   } else {
     final_chunk_.Initialize(TypesOf(*pipeline_.operators_.back()->output_schema_));
   }
+
+  // Written-columns hint per boundary: the source's, carried through column-preserving operators.
+  chunk_written_.resize(pipeline_.operators_.size() + 1);
+  chunk_written_[0] = pipeline_.source_->SourceWrittenColumns();
+  for (idx_t i = 0; i < pipeline_.operators_.size(); i++) {
+    chunk_written_[i + 1] = pipeline_.operators_[i]->PreservesInputColumns() ? chunk_written_[i] : nullptr;
+  }
 }
 
 void PipelineExecutor::GoToSource(idx_t &current_idx, idx_t initial_idx) {
@@ -112,7 +119,7 @@ auto PipelineExecutor::Execute(DataChunk &input, DataChunk &result, idx_t initia
     auto &current_chunk =
         (current_idx == pipeline_.operators_.size()) ? result : *intermediate_chunks_[current_idx];
 
-    current_chunk.Reset();
+    ResetChunk(current_chunk, current_idx);
     OperatorResultType res;
     {
       ProfileScope scope(context_.thread_.profiler_, current_op.id_, Phase::Execute);
@@ -148,7 +155,7 @@ auto PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t initial_idx) 
     return Sink(input) == SinkResultType::FINISHED ? OperatorResultType::FINISHED : OperatorResultType::NEED_MORE_INPUT;
   }
   while (true) {
-    final_chunk_.Reset();
+    ResetChunk(final_chunk_, pipeline_.operators_.size());
     auto result = Execute(input, final_chunk_, initial_idx);
     if (result == OperatorResultType::FINISHED) {
       return OperatorResultType::FINISHED;
@@ -173,13 +180,16 @@ void PipelineExecutor::Run() {
       if (exhausted_source_) {
         break;
       }
-      source_chunk.Reset();
+      ResetChunk(source_chunk, 0);
       if (FetchFromSource(source_chunk) == SourceResultType::FINISHED) {
         exhausted_source_ = true;
       }
       if (source_chunk.GetSize() == 0) {
         continue;  // the loop head breaks if also exhausted
       }
+      // Every chunk derived from this source chunk inherits its batch index (streaming operators
+      // stay within the task), so an order-dependent sink can restore the serial order.
+      local_sink_state_->batch_idx_ = local_source_state_->batch_idx_;
     }
     if (ExecutePushInternal(source_chunk) == OperatorResultType::FINISHED) {
       finished_ = true;

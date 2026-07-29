@@ -37,6 +37,7 @@
 #include "execution/operator/helper/physical_result_collector.h"
 #include "execution/physical_plan_generator.h"
 #include "execution/plans/abstract_plan.h"
+#include "execution/plans/limit_plan.h"
 #include "fmt/format.h"
 #include "main/client_context.h"
 #include "optimizer/optimizer.h"
@@ -483,6 +484,12 @@ void BumbleBeeInstance::HandleExplainStatement(const ExplainStatement &stmt, Res
   }
 
   Planner planner(*catalog_);
+  // EXPLAIN ANALYZE actually runs the query, so its scalar subqueries must pre-execute like a real
+  // run. Every other EXPLAIN variant must not execute anything: no eval hook, and the planner keeps
+  // each subquery behind a "(subquery)" placeholder instead.
+  if ((stmt.options_ & ExplainOptions::ANALYZE) != 0) {
+    planner.subquery_eval_ = [this](const AbstractPlanNodeRef &subplan) { return EvalScalarSubquery(subplan); };
+  }
   planner.PlanQuery(*stmt.statement_);
 
   const bool show_schema = (stmt.options_ & ExplainOptions::SCHEMA) != 0;
@@ -552,6 +559,7 @@ void BumbleBeeInstance::ApplyConfig(ClientContext &client) const {
   client.config_.max_memory_ = max_memory_;
   client.config_.morsel_pages_ = std::max<idx_t>(1, morsel_pages_);
   client.config_.morsel_size_ = morsel_size_;
+  client.config_.agg_partition_threshold_ = agg_partition_threshold_;
   // 0 means "leave the ClientContext's hardware-detected default"; otherwise clamp to the hard ceiling.
   if (max_threads_ > 0) {
     client.config_.max_threads_ = std::clamp<idx_t>(max_threads_, 1, MAX_THREADS);
@@ -559,10 +567,79 @@ void BumbleBeeInstance::ApplyConfig(ClientContext &client) const {
   client.mem_.SetBudget(max_memory_);
 }
 
+auto BumbleBeeInstance::EvalScalarSubquery(const AbstractPlanNodeRef &subplan) -> Value {
+  const auto result_type = subplan->OutputSchema().GetColumn(0).GetType();
+
+  // LIMIT 2 caps the materialization: 0/1 rows are the legal outcomes and a second row already
+  // proves the error, so a huge accidental result is never fully collected just to be rejected.
+  auto limited = std::make_shared<LimitPlanNode>(subplan->output_schema_, subplan, 2);
+  Optimizer optimizer(*catalog_);
+  auto optimized = optimizer.Optimize(limited);
+
+  // Same transaction discipline as ExecuteStatement: join the session's explicit transaction when
+  // one is open, else autocommit — with the same detect → force-external → retry loop on overflow.
+  const bool autocommit = ActiveTxn() == nullptr;
+  std::unordered_set<const AbstractPlanNode *> force_external;
+  while (true) {
+    ClientContext client(*catalog_, *txn_mgr_, bpm_);
+    ApplyConfig(client);
+    auto *txn = autocommit ? txn_mgr_->Begin() : ActiveTxn();
+    client.txn_ = txn;
+    try {
+      PhysicalPlanGenerator generator(client);
+      generator.SetForceExternal(force_external);
+      auto physical = generator.PlanRoot(optimized);
+
+      Executor executor(client);
+      executor.Initialize(*physical);
+      executor.ExecuteQuery();
+
+      auto *gs = dynamic_cast<ResultCollectorGlobalState *>(executor.GetOrCreateSinkState(*physical));
+      Value result = Value::Null(result_type);
+      idx_t rows = 0;
+      if (gs != nullptr) {
+        for (const auto &chunk : gs->chunks_) {
+          if (chunk->GetSize() > 0 && rows == 0) {
+            result = chunk->GetValue(0, 0);  // Value owns its payload; safe past the executor
+          }
+          rows += chunk->GetSize();
+        }
+      }
+      if (rows > 1) {
+        throw ExecutionException("scalar subquery returned more than one row");
+      }
+      if (autocommit) {
+        txn_mgr_->Commit(txn);
+      }
+      return result;
+    } catch (const MemoryLimitException &e) {
+      const auto *culprit = static_cast<const AbstractPlanNode *>(e.Culprit());
+      if (autocommit && culprit != nullptr && force_external.insert(culprit).second) {
+        txn_mgr_->Abort(txn);
+        continue;
+      }
+      txn_mgr_->Abort(txn);
+      if (!autocommit) {
+        ActiveTxn() = nullptr;
+      }
+      throw;
+    } catch (...) {
+      txn_mgr_->Abort(txn);
+      if (!autocommit) {
+        ActiveTxn() = nullptr;  // a failed statement aborts the explicit transaction
+      }
+      throw;
+    }
+  }
+}
+
 void BumbleBeeInstance::ExecuteStatement(const BoundStatement &statement, ResultWriter &writer) {
   // Optimize ONCE; only lowering (below) decides in-memory vs external, so the logical tree is a stable
-  // set of nodes across retries and each node is identified by its pointer.
+  // set of nodes across retries and each node is identified by its pointer. Scalar subqueries are
+  // pre-executed during planning (via the eval hook) for the same reason: substituting them later
+  // would rebuild the tree and break the pointer identity the retry loop depends on.
   Planner planner(*catalog_);
+  planner.subquery_eval_ = [this](const AbstractPlanNodeRef &subplan) { return EvalScalarSubquery(subplan); };
   planner.PlanQuery(statement);
   Optimizer optimizer(*catalog_);
   auto optimized_plan = optimizer.Optimize(planner.plan_);

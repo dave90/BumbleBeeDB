@@ -226,6 +226,23 @@ void Vector::Initialize(bool zero_data, idx_t capacity) {
   }
 }
 
+void Vector::ResetFromCache(vector_data_mngr_ptr_t &cache_mngr) {
+  BUMBLEBEE_ASSERT(type_.GetPhysicalType() != PhysicalType::LIST && type_.GetPhysicalType() != PhysicalType::ARRAY,
+                   "Vector::ResetFromCache: LIST/ARRAY vectors cannot reuse a cached buffer");
+  // Drop this vector's own references first, so a buffer nobody else kept alive reads
+  // use_count() == 1 (the cache's own reference).
+  aux_data_mngr_.reset();
+  data_mngr_.reset();
+  if (cache_mngr == nullptr || cache_mngr.use_count() != 1 ||
+      cache_mngr->GetType() != VectorDataMngrType::STANDARD_DATA_MNGR) {
+    cache_mngr = VectorDataMngr::CreateStandardVector(type_.GetPhysicalType());
+  }
+  vtype_ = VectorType::FLAT_VECTOR;
+  data_mngr_ = cache_mngr;
+  data_ = data_mngr_->GetData();
+  validity_.Reset();
+}
+
 auto Vector::ToString(idx_t count) const -> std::string {
   std::string s = "Vector type(" + std::to_string(static_cast<int>(vtype_)) + ", " + type_.ToString() + "[";
   if (data_ == nullptr && vtype_ != VectorType::SEQUENCE_VECTOR && vtype_ != VectorType::SEQUENCE_CIRCULAR_VECTOR) {

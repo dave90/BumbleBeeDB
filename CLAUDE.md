@@ -89,7 +89,7 @@ test/e2e/slt/           sqllogictest files by category      (* = header-only ope
 ```
 
 Reference docs: `DEVELOP.MD` (coding style, enforced), `test/e2e/README.md` (`.slt` format and
-config directives), `TODO.md` (open features).
+config directives).
 
 ## Architecture in one pass
 

@@ -135,7 +135,10 @@ class Binder {
 
   auto BindWhere(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<BoundExpression>;
 
-  auto BindGroupBy(duckdb_libpgquery::PGList *list) -> std::vector<std::unique_ptr<BoundExpression>>;
+  auto BindGroupBy(duckdb_libpgquery::PGList *list, const std::vector<std::unique_ptr<BoundExpression>> &select_list)
+      -> std::vector<std::unique_ptr<BoundExpression>>;
+  auto ResolveGroupByAlias(const std::vector<std::unique_ptr<BoundExpression>> &select_list,
+                           duckdb_libpgquery::PGNode *node) -> std::unique_ptr<BoundExpression>;
 
   auto BindHaving(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<BoundExpression>;
 
@@ -154,8 +157,9 @@ class Binder {
   auto BindFuncCall(duckdb_libpgquery::PGFuncCall *root) -> std::unique_ptr<BoundExpression>;
 
   auto BindAExpr(duckdb_libpgquery::PGAExpr *root) -> std::unique_ptr<BoundExpression>;
+  auto BindSubLink(duckdb_libpgquery::PGSubLink *root) -> std::unique_ptr<BoundExpression>;
+  auto ResolveOuterColumn(const std::vector<std::string> &col_name) -> std::unique_ptr<BoundExpression>;
   auto BindTypeCast(duckdb_libpgquery::PGTypeCast *root) -> std::unique_ptr<BoundExpression>;
-  /** @brief Resolve a scalar type name (with typmods: VARCHAR(n), DECIMAL(w,s)) to a LogicalType. */
   auto ResolveTypeName(duckdb_libpgquery::PGTypeName *type_name) -> LogicalType;
 
   auto BindBoolExpr(duckdb_libpgquery::PGBoolExpr *root) -> std::unique_ptr<BoundExpression>;
@@ -195,7 +199,12 @@ class Binder {
 
   auto BindLimitOffset(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<BoundExpression>;
 
-  auto BindSort(duckdb_libpgquery::PGList *list) -> std::vector<std::unique_ptr<BoundOrderBy>>;
+  auto BindSort(duckdb_libpgquery::PGList *list,
+                const std::vector<std::unique_ptr<BoundExpression>> &select_list)
+      -> std::vector<std::unique_ptr<BoundOrderBy>>;
+
+  auto ResolveOrderByFromSelectList(const std::vector<std::unique_ptr<BoundExpression>> &select_list,
+                                    const std::string &name) -> std::unique_ptr<BoundExpression>;
 
   auto BindDelete(duckdb_libpgquery::PGDeleteStmt *stmt) -> std::unique_ptr<DeleteStatement>;
 
@@ -235,6 +244,26 @@ class Binder {
   /** @return A guard that restores the current scope when it goes out of scope. */
   auto NewContext() -> ContextGuard { return ContextGuard(&scope_, &cte_scope_); }
 
+  /**
+   * Opens an outer-scope level for an expression subquery (SubLink): the enclosing query's FROM
+   * scope becomes visible to the subquery as a correlation fallback (a normal in-scope column
+   * always wins). Popped when the guard dies. Only BindSubLink holds one — derived tables in a
+   * FROM clause deliberately stay uncorrelated.
+   */
+  class OuterScopeGuard {
+   public:
+    explicit OuterScopeGuard(std::vector<const BoundTableRef *> *stack, const BoundTableRef *scope)
+        : stack_(stack) {
+      stack_->push_back(scope);
+    }
+    ~OuterScopeGuard() { stack_->pop_back(); }
+
+    DISALLOW_COPY_AND_MOVE(OuterScopeGuard);
+
+   private:
+    std::vector<const BoundTableRef *> *stack_;
+  };
+
   /** One parse-tree node per statement of the last parsed query. */
   std::vector<duckdb_libpgquery::PGNode *> statement_nodes_;
 
@@ -247,6 +276,17 @@ class Binder {
 
   /** The CTEs currently in scope, used to resolve table references. */
   const CTEList *cte_scope_{nullptr};
+
+  /**
+   * The enclosing queries' FROM scopes, one per SubLink nesting level (outermost first; entries may
+   * be null for an enclosing SELECT without FROM). A column that fails normal resolution falls back
+   * to these, innermost first, and binds as a BoundOuterColumnRef.
+   */
+  std::vector<const BoundTableRef *> outer_scopes_;
+
+  /** How many outer (correlated) column refs have been bound; BindSubLink diffs it around the
+   * subquery bind to know whether the subquery is correlated. */
+  size_t outer_refs_bound_{0};
 
   /** Supplies unique names for the items that do not have one (subqueries, VALUES clauses). */
   size_t universal_id_{0};

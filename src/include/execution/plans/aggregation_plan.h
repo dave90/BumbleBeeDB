@@ -25,7 +25,7 @@
 namespace bumblebee {
 
 /** The supported aggregate functions. */
-enum class AggregationType { CountStarAggregate, CountAggregate, SumAggregate, MinAggregate, MaxAggregate };
+enum class AggregationType { CountStarAggregate, CountAggregate, SumAggregate, MinAggregate, MaxAggregate, AvgAggregate };
 
 }  // namespace bumblebee
 
@@ -49,6 +49,9 @@ struct fmt::formatter<bumblebee::AggregationType> : fmt::formatter<fmt::string_v
         break;
       case bumblebee::AggregationType::MaxAggregate:
         name = "max";
+        break;
+      case bumblebee::AggregationType::AvgAggregate:
+        name = "avg";
         break;
       default:
         name = "unknown";
@@ -120,6 +123,20 @@ class AggregationPlanNode : public AbstractPlanNode {
   static auto InferAggSchema(const std::vector<AbstractExpressionRef> &group_bys,
                              const std::vector<AbstractExpressionRef> &aggregates,
                              const std::vector<AggregationType> &agg_types) -> Schema;
+
+  /**
+   * @brief The value type an aggregate produces from an argument of `input_type`.
+   *
+   * The single source of truth for aggregate result typing, so every consumer (the aggregation
+   * node's own schema and the placeholder columns the projection/sort above it reference) agrees:
+   * COUNT is INTEGER; SUM widens integers to BIGINT so a large sum doesn't overflow (FLOAT/DOUBLE
+   * stay DOUBLE, DECIMAL stays DECIMAL); MIN/MAX keep the argument's type.
+   *
+   * @param agg_type The aggregate function.
+   * @param input_type The type of the aggregate's argument.
+   * @return LogicalType The aggregate's output value type.
+   */
+  static auto AggResultType(AggregationType agg_type, const LogicalType &input_type) -> LogicalType;
 
   BUMBLEBEE_PLAN_NODE_CLONE_WITH_CHILDREN(AggregationPlanNode);
 

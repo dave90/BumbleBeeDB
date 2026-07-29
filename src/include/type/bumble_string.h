@@ -126,8 +126,11 @@ class BumbleString {
   }
 
   auto operator==(const BumbleString &r) const -> bool {
+    // The zero-length guard matters: it skips the (surprisingly costly) memcmp CALL for the very
+    // common ''-vs-'' case — e.g. a `col <> ''` filter compares every empty row as equal-length.
     auto left_length = Size();
-    return left_length == r.Size() && memcmp(GetDataUnsafe(), r.GetDataUnsafe(), left_length) == 0;
+    return left_length == r.Size() &&
+           (left_length == 0 || memcmp(GetDataUnsafe(), r.GetDataUnsafe(), left_length) == 0);
   }
 
   /** @return True if a string of `len` bytes is stored inline. */

@@ -1,0 +1,81 @@
+{
+  "engine": "bumblebeedb",
+  "compare": false,
+  "db": "data/db/bbdb_dml.db",
+  "reset_db": true,
+  "setup": [
+    "data/setup/bumblebeedb_dml.sql"
+  ],
+  "setup_cmd": "${BBDB_BIN:-../build/BumbleBee} --db $DB --no-seed --test-protocol < $FILE",
+  "run_cmd": "${BBDB_BIN:-../build/BumbleBee} --db $DB --no-seed --test-protocol -c \"$(cat $FILE)\"",
+  "stdin_cmd": "${BBDB_BIN:-../build/BumbleBee} --db $DB --no-seed --test-protocol < $FILE",
+  "comparison_config": "configs/sqlite_dml.json",
+  "query_dir": "data/dml",
+  "previous_comparison": true,
+  "_driver_note": "stdin, exactly like the sqlite reference. The `run` driver passes the file through the shell as `-c \"$(cat F)\"`, and a large DML file makes THAT the measurement: a 475 KB load.sql costs ~0.30s of shell command substitution before the engine is even exec'd (reproduce with `/usr/bin/true \"$(cat data/dml/load.sql)\"`). sqlite is fed `< $FILE` and pays none of it, so the run driver was comparing our shell against their engine.",
+  "driver": "stdin",
+  "tests": [
+    {
+      "test": "dml_load",
+      "file": "load.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_update_pred",
+      "file": "update_pred.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_point_range",
+      "file": "point_range.sql",
+      "num_tries": 3
+    },
+    {
+      "test": "dml_point_in",
+      "file": "point_in.sql",
+      "num_tries": 3
+    },
+    {
+      "test": "dml_delete_pred",
+      "file": "delete_pred.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_txn_autocommit",
+      "file": "txn_autocommit.sql",
+      "num_tries": 1,
+      "driver": "stdin"
+    },
+    {
+      "test": "dml_txn_single",
+      "file": "txn_single.sql",
+      "num_tries": 1,
+      "driver": "stdin"
+    },
+    {
+      "test": "dml_insert_join",
+      "file": "insert_join.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_update_join",
+      "file": "update_join.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_delete_join",
+      "file": "delete_join.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_update_join_in",
+      "file": "update_join_in.sql",
+      "num_tries": 1
+    },
+    {
+      "test": "dml_delete_join_in",
+      "file": "delete_join_in.sql",
+      "num_tries": 1
+    }
+  ]
+}

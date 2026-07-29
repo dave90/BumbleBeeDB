@@ -35,6 +35,7 @@ class PhysicalFilter : public PhysicalOperator {
   }
 
   auto IsOperator() const -> bool override { return true; }
+  auto PreservesInputColumns() const -> bool override { return true; }
 
   class LocalState : public LocalOperatorState {
    public:

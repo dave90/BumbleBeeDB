@@ -1,0 +1,75 @@
+# LIKE / NOT LIKE string matching: `%` matches any run of characters (including none), `_` any
+# single character, everything else literally. A NULL operand matches nothing (LIKE and NOT LIKE).
+
+statement ok
+CREATE TABLE t (s VARCHAR);
+
+statement ok
+INSERT INTO t VALUES ('google.com'),('www.google.co'),('bing'),('MED BOX'),('BRASS ring'),(NULL);
+
+# `%x%` = contains.
+query rowsort
+SELECT s FROM t WHERE s LIKE '%google%';
+----
+'google.com'
+'www.google.co'
+
+# `%x` = ends with (anchor).
+query
+SELECT s FROM t WHERE s LIKE '%BOX';
+----
+'MED BOX'
+
+# `x%` = starts with.
+query
+SELECT s FROM t WHERE s LIKE 'BRASS%';
+----
+'BRASS ring'
+
+# `_` matches exactly one character.
+query
+SELECT s FROM t WHERE s LIKE 'b_ng';
+----
+'bing'
+
+# NOT LIKE excludes matches and NULLs (NULL NOT LIKE ... is unknown, not true).
+query rowsort
+SELECT s FROM t WHERE s NOT LIKE '%google%';
+----
+'BRASS ring'
+'MED BOX'
+'bing'
+
+# A pattern with no wildcards is an exact match.
+query
+SELECT COUNT(*) FROM t WHERE s LIKE 'bing';
+----
+1
+
+# No match -> empty.
+query
+SELECT COUNT(*) FROM t WHERE s LIKE '%zzz%';
+----
+0
+
+# A literal '%' in the data must not be swallowed by a pattern '%' wildcard at the same offset.
+statement ok
+CREATE TABLE esc (u VARCHAR);
+
+statement ok
+INSERT INTO esc VALUES ('http%26a'),('httpXXa'),('ab');
+
+# '____%' means length >= 4: both http... rows match, 'ab' does not (the '%' at offset 4 in
+# 'http%26a' must be treated as a wildcard, not matched literally against the pattern '%').
+query rowsort
+SELECT u FROM esc WHERE u LIKE '____%';
+----
+'http%26a'
+'httpXXa'
+
+# A wildcard following the point where the data itself has a '%'.
+query rowsort
+SELECT u FROM esc WHERE u LIKE 'http%a';
+----
+'http%26a'
+'httpXXa'

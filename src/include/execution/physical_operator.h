@@ -76,6 +76,10 @@ class GlobalSourceState {
 class LocalSourceState {
  public:
   virtual ~LocalSourceState() = default;
+  /** The global position of the morsel the current chunk came from (sources that advertise
+   * SourceProvidesBatchIndex keep it current). An order-dependent sink sorts by it, which
+   * reconstructs the serial scan order from a parallel pipeline. */
+  idx_t batch_idx_{0};
 };
 
 /** Global operator (streaming) state: shared across a pipeline's tasks. */
@@ -100,6 +104,10 @@ class GlobalSinkState {
 class LocalSinkState {
  public:
   virtual ~LocalSinkState() = default;
+  /** The batch index of the chunk being sunk, copied from the source's local state by the
+   * pipeline executor (streaming operators are 1:N within a task, so every derived chunk
+   * inherits its source chunk's batch). */
+  idx_t batch_idx_{0};
 };
 
 /**
@@ -125,6 +133,12 @@ class PhysicalOperator {
   virtual auto Execute(ExecutionContext &context, DataChunk &input, DataChunk &output, GlobalOperatorState &gstate,
                        LocalOperatorState &lstate) const -> OperatorResultType;
   virtual auto ParallelOperator() const -> bool { return true; }
+  /** True when the ROWS this operator passes depend on task interleaving (a streaming LIMIT
+   * takes whichever rows arrive first). Order-dependent sinks stay serial below such an operator. */
+  virtual auto OperatorOrderDependent() const -> bool { return false; }
+  /** True when the output chunk holds exactly the input's columns (a Filter slices them 1:1), so
+   * the pipeline executor may carry the source's written-columns hint through this operator. */
+  virtual auto PreservesInputColumns() const -> bool { return false; }
 
   // ---- source role ------------------------------------------------------------
   virtual auto IsSource() const -> bool { return false; }
@@ -135,6 +149,13 @@ class PhysicalOperator {
   virtual auto GetData(ExecutionContext &context, DataChunk &output, GlobalSourceState &gstate,
                        LocalSourceState &lstate) const -> SourceResultType;
   virtual auto IsOrderPreserving() const -> bool { return false; }
+  /** True when this source keeps LocalSourceState::batch_idx_ current, i.e. an order-dependent
+   * sink downstream can run in parallel and still reconstruct the serial order. */
+  virtual auto SourceProvidesBatchIndex() const -> bool { return false; }
+  /** The output columns GetData actually writes per chunk, or nullptr for "all of them". A pruned
+   * scan writes a handful of a 100-column schema; the pipeline executor then resets only those,
+   * and the source establishes the remaining columns (its constant NULLs) once per task. */
+  virtual auto SourceWrittenColumns() const -> const std::vector<idx_t> * { return nullptr; }
 
   // ---- sink role (== pipeline breaker) ----------------------------------------
   virtual auto IsSink() const -> bool { return false; }
@@ -146,6 +167,10 @@ class PhysicalOperator {
   virtual auto Finalize(ClientContext &context, GlobalSinkState &gstate, idx_t stage, idx_t task_idx,
                         idx_t task_count) const -> SinkFinalizeType;
   virtual auto ParallelSink() const -> bool { return true; }
+  /** True when this sink's output order must match the serial input order. Such a sink may run
+   * in parallel only over a source that provides batch indexes (and with no operator in between
+   * that picks rows nondeterministically under parallelism, e.g. a streaming LIMIT). */
+  virtual auto SinkOrderDependent() const -> bool { return false; }
   virtual auto FinalizeStageCount(GlobalSinkState &gstate) const -> idx_t { return 1; }
   virtual auto FinalizeMaxThreads(GlobalSinkState &gstate, idx_t stage) const -> idx_t { return 1; }
 

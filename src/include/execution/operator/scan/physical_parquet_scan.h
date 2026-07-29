@@ -46,6 +46,12 @@ class PhysicalParquetScan : public PhysicalOperator {
         projection_(std::move(projection)) {}
 
   auto IsSource() const -> bool override { return true; }
+  auto SourceProvidesBatchIndex() const -> bool override { return true; }
+  auto SourceWrittenColumns() const -> const std::vector<idx_t> * override {
+    // With pruning, only the projected columns are decoded per chunk; the rest are constant-NULL
+    // references established once per task. (RID scans append a trailing column: full reset.)
+    return (!projection_.empty() && !emit_rids_) ? &projection_ : nullptr;
+  }
 
   void BuildPipelines(Pipeline &current, PipelineBuilder &builder) const override;
 

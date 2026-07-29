@@ -129,7 +129,10 @@ void PhysicalInsert::Combine(ExecutionContext &context, GlobalSinkState &gstate,
     // tuple was deleted revives that slot, a live key is rejected as a duplicate, and a fresh key appends a
     // new tuple + index entry. A table with no PK index (legacy, direct-catalog) just appends.
     if (pk != nullptr) {
-      InsertOrRevive(&context.client_.txn_mgr_, context.client_.txn_, table_oid_, *heap, *pk, *to_insert, rids);
+      // An auto `_id` was just minted from the table's monotonic counter, so the index cannot already
+      // hold it: the probe that classifies duplicate/revive/new is skippable (see InsertOrRevive).
+      InsertOrRevive(&context.client_.txn_mgr_, context.client_.txn_, table_oid_, *heap, *pk, *to_insert, rids,
+                     /*keys_are_fresh=*/info->auto_id_);
     } else {
       MvccInsert(&context.client_.txn_mgr_, context.client_.txn_, table_oid_, *heap, *to_insert, rids);
     }

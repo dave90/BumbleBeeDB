@@ -93,6 +93,7 @@ void UpdateNumericAggregate(AggregationType type, const_data_ptr_t raw, const Se
   const auto *data = reinterpret_cast<const T *>(raw);
   const bool all_valid = validity.AllValid();
   switch (type) {
+    case AggregationType::AvgAggregate:  // AVG accumulates exactly like SUM (value + count); it only differs at finalize.
     case AggregationType::SumAggregate:
       if (sel != nullptr) {
         return all_valid ? UpdateSumKernel<T, false, true>(data, sel, validity, addrs, count, cnt_off, val_off)
@@ -126,6 +127,7 @@ void UpdateNumericAggregate(AggregationType type, const_data_ptr_t raw, const Se
 void UpdateConstant(AggregationType type, double x, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
                     idx_t val_off) {
   switch (type) {
+    case AggregationType::AvgAggregate:  // AVG accumulates like SUM.
     case AggregationType::SumAggregate:
       for (idx_t i = 0; i < count; i++) {
         auto *addr = addrs[i];
@@ -162,7 +164,7 @@ void UpdateFallbackAggregate(AggregationType type, Vector &arg, data_ptr_t *addr
     const auto x = val.GetAs<double>();
     auto *addr = addrs[i];
     const auto cnt = Load<int64_t>(addr + cnt_off);
-    if (type == AggregationType::SumAggregate) {
+    if (type == AggregationType::SumAggregate || type == AggregationType::AvgAggregate) {
       Store<double>(Load<double>(addr + val_off) + x, addr + val_off);
     } else if (cnt == 0) {
       Store<double>(x, addr + val_off);

@@ -132,6 +132,34 @@ TEST(SingleFileDiskManagerTest, ReopenReadsBackWrittenPages) {
   std::filesystem::remove(path);
 }
 
+// Regression: a db file grown past 2 GiB must still read back. GetFileSize returned a 32-bit int,
+// which wraps once the file passes 2^31 bytes, and ReadPage read that as "file_size < 0" -> an I/O
+// error, failing EVERY read beyond that point. Out-of-core operators spill into this file, so a spill
+// larger than 2 GiB silently got zero-filled pages instead of its data (TPC-H q05 -> 0 rows, and an
+// ever-growing multi-GiB file because writes kept succeeding). A page written past the boundary must
+// round-trip. The file is sparse (resize_file), so this costs no real disk space.
+TEST(SingleFileDiskManagerTest, ReadsPageBeyondTwoGigabytes) {
+  auto path = TempDbPath("bbdb_dm_over_2gb.db");
+  std::filesystem::remove(path);
+  {
+    SingleFileDiskManager dm(path);
+    // A page whose byte offset lands past 2^31, so writing it grows the file beyond 2 GiB.
+    const page_id_t page_id = static_cast<page_id_t>((int64_t{2} << 30) / PAGE_SIZE) + 16;
+    ASSERT_GT(static_cast<int64_t>(page_id) * PAGE_SIZE, int64_t{2} << 30);
+
+    data_t write_buf[PAGE_SIZE];
+    data_t read_buf[PAGE_SIZE];
+    FillPage(write_buf, 'Q');
+    FillPage(read_buf, 0);
+    ASSERT_TRUE(dm.WritePage(page_id, write_buf));
+    ASSERT_GT(dm.GetDbFileSize(), static_cast<size_t>(int64_t{2} << 30)) << "file must have grown past 2 GiB";
+
+    ASSERT_TRUE(dm.ReadPage(page_id, read_buf)) << "a read past 2 GiB must not be seen as an I/O error";
+    EXPECT_EQ(0, std::memcmp(write_buf, read_buf, PAGE_SIZE)) << "a page beyond 2 GiB must round-trip intact";
+  }
+  std::filesystem::remove(path);
+}
+
 // Concurrent I/O through the SingleFileDiskManager: many threads write and read back their own disjoint
 // pages at once. Writes to high page ids also race EnsureCapacity (file growth) — all serialized by the
 // `db_io_latch_`, so no torn page, no lost write, and the counter reflects every write.

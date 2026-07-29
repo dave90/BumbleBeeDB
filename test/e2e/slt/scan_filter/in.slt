@@ -1,0 +1,120 @@
+# [NOT] IN over a value list. SQL three-valued semantics: a match wins outright; a non-match
+# that involved a NULL (tested value or list element) is NULL, which selects nothing for BOTH
+# polarities — the classic `NOT IN (..., NULL)` empty-result case is pinned below.
+
+statement ok
+CREATE TABLE t (v INT, s VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (NULL, 'e');
+
+query rowsort
+SELECT v, s FROM t WHERE v IN (1, 3);
+----
+1 'a'
+3 'c'
+
+# NOT IN over a clean list: the complement, minus the NULL row (NULL never qualifies).
+query rowsort
+SELECT v, s FROM t WHERE v NOT IN (1, 3);
+----
+2 'b'
+4 'd'
+
+# A NULL in the list poisons every NOT IN non-match -> empty result (the classic).
+query
+SELECT v, s FROM t WHERE v NOT IN (1, NULL);
+----
+
+# A NULL in the list does not affect IN matches.
+query
+SELECT v, s FROM t WHERE v IN (1, NULL);
+----
+1 'a'
+
+# Strings.
+query rowsort
+SELECT s FROM t WHERE s IN ('a', 'e', 'zzz');
+----
+'a'
+'e'
+
+query rowsort
+SELECT s FROM t WHERE s NOT IN ('a', 'e');
+----
+'b'
+'c'
+'d'
+
+# Single-element list.
+query
+SELECT v FROM t WHERE v IN (2);
+----
+2
+
+# Mixed numeric types coerce to a common type before comparing.
+query
+SELECT v FROM t WHERE v IN (1, 2.5);
+----
+1
+
+# IN in the SELECT list: NULL-involved rows fold to false.
+query rowsort
+SELECT v, v IN (1, 2) FROM t;
+----
+1 true
+2 true
+3 false
+4 false
+NULL false
+
+# IN as part of a larger predicate.
+query
+SELECT v FROM t WHERE v IN (1, 2, 3) AND s <> 'b' ORDER BY v;
+----
+1
+3
+
+# Non-constant list elements: an expression over the row (v = 6 - v holds for v = 3).
+query rowsort
+SELECT v FROM t WHERE v IN (6 - v, 1);
+----
+1
+3
+
+# An all-constant list is prepared (sorted) once and reused for every chunk, so the awkward inputs
+# have to survive that: unsorted, duplicated and negative elements, over a table wide enough to
+# span several chunks (and every chunk on the small-vector build).
+statement ok
+CREATE TABLE big (k BIGINT);
+
+statement ok
+INSERT INTO big VALUES (-9), (-2), (0), (1), (5), (12), (33), (34), (100), (1000), (NULL);
+
+query rowsort
+SELECT k FROM big WHERE k IN (33, -9, 1000, 33, 0, -9, 7);
+----
+-9
+0
+1000
+33
+
+query rowsort
+SELECT k FROM big WHERE k NOT IN (33, -9, 1000, 0, 12, 34, 100, 5);
+----
+-2
+1
+
+# Boundary values around the list's extremes: nothing outside it may match.
+query
+SELECT count(*) FROM big WHERE k IN (-8, 2, 999, 1001);
+----
+0
+
+# The same list evaluated in the SELECT list rather than the WHERE clause.
+query rowsort
+SELECT k, k IN (-9, 1000) FROM big WHERE k < 1;
+----
+-2 false
+-9 true
+0 false

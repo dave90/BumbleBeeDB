@@ -18,6 +18,34 @@
 
 namespace bumblebee {
 
+namespace {
+
+/** @brief The prefilter row loop, monomorphized per first-key type: one flat data pointer and
+ * inline validity reads instead of a per-row encoding dispatch (this loop sees every input row
+ * once the heap is full, so it is the TopN sink's hot path). Same order-code construction as
+ * TopNHeap::OrderCodeAt. */
+template <class T, bool IS_SIGNED>
+void PrefilterCodes(const T *data, const ValidityMask &validity, uint64_t threshold, bool desc, idx_t count,
+                    SelectionVector &sel, idx_t &nc) {
+  static constexpr uint64_t SIGN = 0x8000000000000000ULL;
+  for (idx_t i = 0; i < count; i++) {
+    uint64_t code;
+    if constexpr (IS_SIGNED) {
+      code = static_cast<uint64_t>(static_cast<int64_t>(data[i])) ^ SIGN;
+    } else {
+      code = static_cast<uint64_t>(data[i]);
+    }
+    if (desc) {
+      code = ~code;
+    }
+    if (!validity.RowIsValid(i) || code <= threshold) {
+      sel.SetIndex(nc++, i);
+    }
+  }
+}
+
+}  // namespace
+
 TopNHeap::TopNHeap(const std::vector<LogicalType> &payload_types, const std::vector<LogicalType> &key_types,
                    const std::vector<OrderModifiers> &modifiers, idx_t limit)
     : modifiers_(modifiers), limit_(limit), append_sel_(MaxValue<idx_t>(STANDARD_VECTOR_SIZE, limit)),
@@ -89,7 +117,13 @@ void TopNHeap::Sink(DataChunk &input, DataChunk &keys) {
   if (limit_ == 0 || count == 0) {
     return;
   }
-  keys.Normalify();
+  // Only the first key column needs flattening — the prefilter and the entry order-codes read it
+  // through FlatVector. The remaining key columns go through CreateSortKey, which Orrifies any
+  // encoding itself; materializing them here (a dictionary STRING column from a filtered scan,
+  // say) would copy every row just to throw most of them away at the prefilter.
+  if (prefilter_enabled_) {
+    keys.data_[0].Normalify(count);
+  }
 
   // Fast path: once the heap is full, only rows whose first-column order-code is <= the
   // threshold (the worst kept entry) can still qualify — a strictly larger code sorts
@@ -97,12 +131,50 @@ void TopNHeap::Sink(DataChunk &input, DataChunk &keys) {
   // built. NULL rows cannot be ruled out cheaply and stay candidates.
   if (prefilter_enabled_ && heap_.size() >= limit_ && heap_.front().first_valid_) {
     const uint64_t threshold = heap_.front().first_code_;
-    Vector &first = keys.data_[0];
+    Vector &first = keys.data_[0];  // flat: the chunk was just Normalified
+    const auto &validity = FlatVector::Validity(first);
     idx_t nc = 0;
-    for (idx_t i = 0; i < count; i++) {
-      if (!first.RowIsValid(i) || OrderCodeAt(first, i) <= threshold) {
-        cand_sel_.SetIndex(nc++, i);
-      }
+    switch (first_type_) {
+      case PhysicalType::TINYINT:
+        PrefilterCodes<int8_t, true>(FlatVector::GetData<int8_t>(first), validity, threshold, first_desc_, count,
+                                     cand_sel_, nc);
+        break;
+      case PhysicalType::SMALLINT:
+        PrefilterCodes<int16_t, true>(FlatVector::GetData<int16_t>(first), validity, threshold, first_desc_, count,
+                                      cand_sel_, nc);
+        break;
+      case PhysicalType::INTEGER:
+        PrefilterCodes<int32_t, true>(FlatVector::GetData<int32_t>(first), validity, threshold, first_desc_, count,
+                                      cand_sel_, nc);
+        break;
+      case PhysicalType::BIGINT:
+        PrefilterCodes<int64_t, true>(FlatVector::GetData<int64_t>(first), validity, threshold, first_desc_, count,
+                                      cand_sel_, nc);
+        break;
+      case PhysicalType::UTINYINT:
+        PrefilterCodes<uint8_t, false>(FlatVector::GetData<uint8_t>(first), validity, threshold, first_desc_, count,
+                                       cand_sel_, nc);
+        break;
+      case PhysicalType::USMALLINT:
+        PrefilterCodes<uint16_t, false>(FlatVector::GetData<uint16_t>(first), validity, threshold, first_desc_, count,
+                                        cand_sel_, nc);
+        break;
+      case PhysicalType::UINTEGER:
+        PrefilterCodes<uint32_t, false>(FlatVector::GetData<uint32_t>(first), validity, threshold, first_desc_, count,
+                                        cand_sel_, nc);
+        break;
+      case PhysicalType::UBIGINT:
+        PrefilterCodes<uint64_t, false>(FlatVector::GetData<uint64_t>(first), validity, threshold, first_desc_, count,
+                                        cand_sel_, nc);
+        break;
+      default:
+        // Unreachable (the prefilter only enables for the integer types above); keep the generic
+        // per-row path as a safety net.
+        for (idx_t i = 0; i < count; i++) {
+          if (!first.RowIsValid(i) || OrderCodeAt(first, i) <= threshold) {
+            cand_sel_.SetIndex(nc++, i);
+          }
+        }
     }
     if (nc == 0) {
       return;  // the whole chunk is pruned

@@ -23,8 +23,23 @@ namespace bumblebee {
 DataChunk::DataChunk() : count_(0), capacity_(STANDARD_VECTOR_SIZE) {}
 
 DataChunk::DataChunk(DataChunk &&other) noexcept
-    : data_(std::move(other.data_)), count_(other.count_), capacity_(other.capacity_) {
+    : data_(std::move(other.data_)),
+      count_(other.count_),
+      capacity_(other.capacity_),
+      cache_types_(std::move(other.cache_types_)),
+      cache_mngrs_(std::move(other.cache_mngrs_)) {
   other.Destroy();
+}
+
+void DataChunk::CacheBuffers() {
+  cache_types_.clear();
+  cache_mngrs_.clear();
+  cache_types_.reserve(data_.size());
+  cache_mngrs_.reserve(data_.size());
+  for (auto &v : data_) {
+    cache_types_.push_back(v.GetType());
+    cache_mngrs_.push_back(v.GetDataMngr());
+  }
 }
 
 auto DataChunk::GetValue(idx_t col, idx_t index) const -> Value {
@@ -90,6 +105,7 @@ void DataChunk::Initialize(const std::vector<PhysicalType> &types) {
   for (const auto &type : types) {
     data_.emplace_back(type);
   }
+  CacheBuffers();
 }
 
 void DataChunk::Initialize(const std::vector<LogicalType> &types) {
@@ -99,6 +115,7 @@ void DataChunk::Initialize(const std::vector<LogicalType> &types) {
   for (const auto &type : types) {
     data_.emplace_back(type);
   }
+  CacheBuffers();
 }
 
 void DataChunk::Initialize(const std::vector<LogicalType> &types, const std::unordered_set<idx_t> &cols_to_initialize) {
@@ -112,6 +129,7 @@ void DataChunk::Initialize(const std::vector<LogicalType> &types, const std::uno
       data_.emplace_back(types[i]);
     }
   }
+  CacheBuffers();
 }
 
 void DataChunk::InitializeEmpty(const std::vector<PhysicalType> &types) {
@@ -170,6 +188,8 @@ void DataChunk::Resize(idx_t size) {
 
 void DataChunk::Destroy() {
   data_.clear();
+  cache_types_.clear();
+  cache_mngrs_.clear();
   capacity_ = 0;
   count_ = 0;
 }
@@ -240,12 +260,24 @@ void DataChunk::Slice(DataChunk &other, const SelectionVector &sel, idx_t count,
   count_ = count;
   SelCache merge_cache;
   for (idx_t c = 0; c < other.ColumnCount(); c++) {
-    if (other.data_[c].GetVectorType() == VectorType::DICTIONARY_VECTOR) {
+    auto &src = other.data_[c];
+    auto &dst = data_[col_offset + c];
+    if (src.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+      // A selection over a constant is the same constant — and when the target still references
+      // that very constant from the previous batch (partial resets leave it in place), there is
+      // nothing to do at all. This is what lets a pruned scan's 100 constant-NULL columns cross a
+      // Filter with zero per-chunk work.
+      if (dst.GetVectorType() != VectorType::CONSTANT_VECTOR || dst.DataMngrPtr() != src.DataMngrPtr()) {
+        dst.Reference(src);
+      }
+      continue;
+    }
+    if (src.GetVectorType() == VectorType::DICTIONARY_VECTOR) {
       // Already a dictionary: compose the selections instead of nesting.
-      data_[col_offset + c].Reference(other.data_[c]);
-      data_[col_offset + c].Slice(sel, count, merge_cache);
+      dst.Reference(src);
+      dst.Slice(sel, count, merge_cache);
     } else {
-      data_[col_offset + c].Slice(other.data_[c], sel, count);
+      dst.Slice(src, sel, count);
     }
   }
 }
@@ -270,21 +302,59 @@ void DataChunk::Reset() {
   if (data_.empty()) {
     return;
   }
-  auto types = GetTypes();
-  data_.clear();
+  if (cache_mngrs_.size() != data_.size()) {
+    // No usable cache (InitializeEmpty / Split changed the column set): rebuild from scratch
+    // once; Initialize records the fresh buffers so later Resets take the cheap path.
+    auto types = GetTypes();
+    data_.clear();
+    count_ = 0;
+    Initialize(types);
+    return;
+  }
+  for (idx_t i = 0; i < data_.size(); i++) {
+    auto &vec = data_[i];
+    const auto ptype = vec.GetType();
+    if (ptype == PhysicalType::LIST || ptype == PhysicalType::ARRAY || ptype != cache_types_[i]) {
+      // Nested children can't be reused in place, and a re-typed column outgrew its buffer:
+      // re-create the vector and adopt its new buffer as the cache.
+      Vector fresh(vec.GetLogicalType());
+      vec.Reference(fresh);
+      cache_types_[i] = ptype;
+      cache_mngrs_[i] = vec.GetDataMngr();
+    } else {
+      vec.ResetFromCache(cache_mngrs_[i]);
+    }
+  }
   count_ = 0;
-  Initialize(types);
+  capacity_ = STANDARD_VECTOR_SIZE;
 }
 
 void DataChunk::Reset(const std::vector<idx_t> &columns_to_reset) {
   if (data_.empty()) {
     return;
   }
-  auto types = GetTypes();
-  data_.clear();
+  if (cache_mngrs_.size() != data_.size()) {
+    Reset();  // no usable cache yet: the full path rebuilds it
+    return;
+  }
+  // Only the named columns go back to a fresh flat buffer; the others are left exactly as they
+  // are (a pruned scan's constant-NULL references stay valid across chunks, so re-pointing them
+  // every iteration would be pure churn).
+  for (const auto i : columns_to_reset) {
+    BUMBLEBEE_ASSERT(i < data_.size(), "DataChunk::Reset: the column is out of range");
+    auto &vec = data_[i];
+    const auto ptype = vec.GetType();
+    if (ptype == PhysicalType::LIST || ptype == PhysicalType::ARRAY || ptype != cache_types_[i]) {
+      Vector fresh(vec.GetLogicalType());
+      vec.Reference(fresh);
+      cache_types_[i] = ptype;
+      cache_mngrs_[i] = vec.GetDataMngr();
+    } else {
+      vec.ResetFromCache(cache_mngrs_[i]);
+    }
+  }
   count_ = 0;
-  std::unordered_set<idx_t> cols_to_init(columns_to_reset.begin(), columns_to_reset.end());
-  Initialize(types, cols_to_init);
+  capacity_ = STANDARD_VECTOR_SIZE;
 }
 
 auto DataChunk::GetTypes() const -> std::vector<LogicalType> {

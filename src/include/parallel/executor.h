@@ -57,6 +57,14 @@ class Executor {
   auto NumOperators() const -> idx_t { return num_operators_; }
   auto HasError() const -> bool { return has_error_.load(std::memory_order_acquire); }
 
+  /**
+   * @brief The most tasks this query can have runnable at any one instant.
+   *
+   * Bounds the worker pool: pipelines on one dependency chain run one after another, so only
+   * mutually independent ones add up. See the definition for why it never under-counts.
+   */
+  auto PeakTaskDemand() const -> idx_t;
+
   /** @brief Latch the first execution exception and flag the query as failed. */
   void PushError(std::exception_ptr e);
 

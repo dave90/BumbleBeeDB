@@ -10,15 +10,9 @@ INSERT INTO t VALUES (1, 2, 'x');
 
 # IS NULL / IS NOT NULL landed — positive coverage lives in scan_filter/null_predicates.slt.
 
-# IN / BETWEEN / LIKE — rejected in the binder.
-statement error
-SELECT a FROM t WHERE a IN (1, 2);
-
+# BETWEEN — rejected in the binder. (LIKE: scan_filter/like.slt; IN: scan_filter/in.slt.)
 statement error
 SELECT a FROM t WHERE a BETWEEN 1 AND 3;
-
-statement error
-SELECT a FROM t WHERE s LIKE 'x%';
 
 # NOT and unary minus — bound but not planned.
 statement error
@@ -41,10 +35,7 @@ SELECT CASE WHEN a = 1 THEN 1 ELSE 0 END FROM t;
 statement error
 SELECT COALESCE(b, 0) FROM t;
 
-# Unsupported aggregates / scalar functions.
-statement error
-SELECT AVG(a) FROM t;
-
+# Unsupported aggregates / scalar functions. (AVG is now supported: see aggregates/avg.slt.)
 statement error
 SELECT COUNT(DISTINCT a) FROM t;
 

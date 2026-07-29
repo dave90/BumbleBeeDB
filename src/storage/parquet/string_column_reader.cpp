@@ -55,6 +55,9 @@ void StringParquetValueConversion::PlainSkip(ByteBuffer &plain_data, ColumnReade
 auto StringParquetValueConversion::Null() -> string_t { return string_t(""); }
 
 auto StringColumnReader::VerifyString(const char *str_data, uint32_t str_len) -> uint32_t {
+  if (str_len == 0) {
+    return 0;  // nothing to validate — and empty strings dominate sparse text columns
+  }
   if (logical_type_.GetPhysicalType() != PhysicalType::STRING) {
     return str_len;
   }

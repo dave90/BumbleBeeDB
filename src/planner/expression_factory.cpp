@@ -21,6 +21,7 @@
 #include "execution/expressions/abstract_expression.h"
 #include "execution/expressions/arithmetic_expression.h"
 #include "execution/expressions/comparison_expression.h"
+#include "execution/expressions/like_expression.h"
 #include "execution/expressions/logic_expression.h"
 #include "execution/expressions/string_expression.h"
 #include "execution/plans/aggregation_plan.h"
@@ -44,6 +45,9 @@ auto Planner::GetAggCallFromFactory(const std::string &func_name, std::vector<Ab
     }
     if (func_name == "sum") {
       return {AggregationType::SumAggregate, {std::move(expr)}};
+    }
+    if (func_name == "avg") {
+      return {AggregationType::AvgAggregate, {std::move(expr)}};
     }
     if (func_name == "count") {
       return {AggregationType::CountAggregate, {std::move(expr)}};
@@ -91,6 +95,13 @@ auto Planner::GetBinaryExpressionFromFactory(const std::string &op_name, Abstrac
   }
   if (op_name == "or") {
     return std::make_shared<LogicExpression>(std::move(left), std::move(right), LogicType::Or);
+  }
+  // libpg_query names LIKE "~~" and NOT LIKE "!~~".
+  if (op_name == "~~") {
+    return std::make_shared<LikeExpression>(std::move(left), std::move(right), /*negated=*/false);
+  }
+  if (op_name == "!~~") {
+    return std::make_shared<LikeExpression>(std::move(left), std::move(right), /*negated=*/true);
   }
   throw PlannerException(fmt::format("the binary operator {} cannot be planned", op_name));
 }

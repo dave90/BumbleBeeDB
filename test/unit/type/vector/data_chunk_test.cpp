@@ -607,4 +607,46 @@ TEST(DataChunkNullTests, AppendWithResizePreservesNull) {
   EXPECT_FALSE(chunk1.GetValue(0, 999).IsNull());
 }
 
+// Reset() must reuse the originally-allocated buffer when this chunk is its only owner — the
+// operator hot loop calls Reset per chunk, and a free + re-malloc per column dominated wide scans.
+TEST(DataChunkResetTests, ResetReusesTheUnsharedBuffer) {
+  DataChunk chunk;
+  chunk.Initialize(std::vector<PhysicalType>{PhysicalType::INTEGER});
+  FillChunk(chunk, 10);
+  chunk.SetValue(0, 3, Value::Null());
+  auto *before = chunk.data_[0].GetData();
+
+  chunk.Reset();
+  EXPECT_EQ(chunk.data_[0].GetData(), before);  // same allocation, no churn
+  EXPECT_EQ(chunk.GetSize(), 0U);
+  EXPECT_EQ(chunk.GetCapacity(), STANDARD_VECTOR_SIZE);
+  EXPECT_EQ(chunk.data_[0].GetVectorType(), VectorType::FLAT_VECTOR);
+  chunk.SetCardinality(10);
+  EXPECT_FALSE(chunk.GetValue(0, 3).IsNull());  // validity came back all-valid
+}
+
+// When someone else still references the buffer, Reset must NOT hand it out again: the holder keeps
+// the old data alive and the chunk gets a fresh allocation.
+TEST(DataChunkResetTests, ResetDoesNotReuseASharedBuffer) {
+  DataChunk chunk;
+  chunk.Initialize(std::vector<PhysicalType>{PhysicalType::INTEGER});
+  FillChunk(chunk, 4, 7);  // column 0 holds the base value (7) in every row
+  auto *before = chunk.data_[0].GetData();
+
+  Vector holder{LogicalType(LogicalTypeId::INTEGER)};
+  holder.Reference(chunk.data_[0]);  // a downstream operator kept the batch alive
+
+  chunk.Reset();
+  EXPECT_NE(chunk.data_[0].GetData(), before);  // fresh buffer for the chunk
+  EXPECT_EQ(holder.GetData(), before);          // the holder still reads the original data
+  EXPECT_EQ(holder.GetValue(1), Value(7).CastAs(LogicalType(LogicalTypeId::INTEGER)));
+
+  // Once the holder lets go, the next Reset round-trips back to buffer reuse.
+  holder.Reference(Value(0));
+  chunk.Reset();
+  auto *replacement = chunk.data_[0].GetData();
+  chunk.Reset();
+  EXPECT_EQ(chunk.data_[0].GetData(), replacement);
+}
+
 }  // namespace bumblebee

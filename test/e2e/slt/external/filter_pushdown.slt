@@ -1,0 +1,52 @@
+# In-scan filter pushdown on external parquet tables: the WHERE is evaluated inside the scan
+# (filter columns decoded first, remaining columns skip the rejected rows, no Filter operator in
+# the plan). These pin the semantics against the heap path, which was used as the oracle:
+# multi-column conjuncts, a filter column that is not in the SELECT list, string predicates,
+# zero-match predicates (the all-filtered-batch path), and NULLs in the filter column.
+# fixture: lineitem-arrow.parquet
+
+statement ok
+CREATE TABLE li () WITH (format='parquet', location='${TMPDIR}');
+
+# Conjunct over two columns; neither ordering nor grouping — pure scan+filter+aggregate.
+query
+SELECT COUNT(*), SUM(l_orderkey) FROM li WHERE l_quantity > 49 AND l_discount < 0.02;
+----
+28 82699
+
+# The filter columns (l_quantity, l_shipmode) are pruned from the output: they are decoded for
+# the predicate only, and the projection above never sees them.
+query
+SELECT l_orderkey, l_extendedprice FROM li WHERE l_quantity = 50 AND l_shipmode = 'RAIL' ORDER BY l_orderkey, l_extendedprice;
+----
+231 54959.50
+1731 47552.50
+2114 53408.00
+2147 46451.00
+2278 47252.00
+2342 53508.50
+2790 50855.50
+3490 49304.00
+4224 53008.00
+4357 49204.00
+4481 46201.00
+4674 52507.50
+5605 49354.00
+5920 54359.00
+
+# String equality on two VARCHAR columns.
+query
+SELECT COUNT(*) FROM li WHERE l_shipmode = 'AIR' AND l_returnflag = 'R';
+----
+176
+
+# String <> '' over every row (nothing is empty in this fixture: all rows survive).
+query
+SELECT SUM(l_partkey) FROM li WHERE l_comment <> '';
+----
+615388
+
+# A predicate no row matches: every batch is fully filtered inside the scan.
+query
+SELECT l_orderkey FROM li WHERE l_partkey = 999999;
+----

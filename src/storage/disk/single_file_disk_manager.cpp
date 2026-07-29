@@ -95,7 +95,7 @@ auto SingleFileDiskManager::ReadPage(page_id_t page_id, data_ptr_t page_data) ->
   }
   auto offset = static_cast<size_t>(page_id) * PAGE_SIZE;
 
-  int file_size = GetFileSize(db_file_name_);
+  int64_t file_size = GetFileSize(db_file_name_);
   if (file_size < 0) {
     LOG_DEBUG("I/O error: fail to get db file size");
     return false;
@@ -130,7 +130,7 @@ auto SingleFileDiskManager::DeletePage(page_id_t page_id) -> void {
     return;
   }
   auto offset = static_cast<size_t>(page_id) * PAGE_SIZE;
-  int file_size = GetFileSize(db_file_name_);
+  int64_t file_size = GetFileSize(db_file_name_);
   if (file_size < 0 || offset + PAGE_SIZE > static_cast<size_t>(file_size)) {
     return;  // never written / beyond EOF — nothing on disk to clear (idempotent)
   }
@@ -155,10 +155,13 @@ auto SingleFileDiskManager::GetDbFileSize() -> size_t {
   return static_cast<size_t>(file_size);
 }
 
-auto SingleFileDiskManager::GetFileSize(const std::string &file_name) -> int {
+auto SingleFileDiskManager::GetFileSize(const std::string &file_name) -> int64_t {
   struct stat stat_buf {};
   int rc = stat(file_name.c_str(), &stat_buf);
-  return rc == 0 ? static_cast<int>(stat_buf.st_size) : -1;
+  // st_size is a 64-bit off_t; keep it 64-bit. Truncating to int wraps negative once the
+  // file passes 2 GiB (which spilling routinely does), and ReadPage then treats every read
+  // as an I/O error — silently returning empty pages, so a spilled join yields wrong results.
+  return rc == 0 ? static_cast<int64_t>(stat_buf.st_size) : -1;
 }
 
 }  // namespace bumblebee

@@ -36,6 +36,9 @@ class PhysicalLimit : public PhysicalOperator {
   }
 
   auto IsOperator() const -> bool override { return true; }
+  // Which rows the shared counter admits depends on task interleaving: an order-dependent sink
+  // below a parallel limit could not reconstruct the serial result, so it stays serial.
+  auto OperatorOrderDependent() const -> bool override { return true; }
 
   class GlobalState : public GlobalOperatorState {
    public:

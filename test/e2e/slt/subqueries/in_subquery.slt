@@ -1,0 +1,114 @@
+# `x [NOT] IN (SELECT ...)`: planned as a null-aware SEMI/ANTI hash join (outer probes, subquery
+# builds). Three-valued NULL semantics: a NULL tested value never qualifies for IN; one NULL in a
+# non-empty subquery result makes NOT IN emit nothing; against an EMPTY result NOT IN is vacuously
+# true for every row, NULLs included.
+
+statement ok
+CREATE TABLE t (v INT, s VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (NULL, 'e');
+
+statement ok
+CREATE TABLE u (w INT);
+
+statement ok
+INSERT INTO u VALUES (1), (3), (3), (7);
+
+statement ok
+CREATE TABLE nu (w INT);
+
+statement ok
+INSERT INTO nu VALUES (1), (NULL);
+
+statement ok
+CREATE TABLE empty_t (w INT);
+
+query rowsort
+SELECT v, s FROM t WHERE v IN (SELECT w FROM u);
+----
+1 'a'
+3 'c'
+
+# Duplicates in the subquery result must NOT duplicate outer rows (semi join, not inner join).
+query rowsort
+SELECT v FROM t WHERE v IN (SELECT w FROM u);
+----
+1
+3
+
+query rowsort
+SELECT v, s FROM t WHERE v NOT IN (SELECT w FROM u);
+----
+2 'b'
+4 'd'
+
+# One NULL in the (non-empty) subquery result: NOT IN emits nothing (the classic).
+query
+SELECT v, s FROM t WHERE v NOT IN (SELECT w FROM nu);
+----
+
+# ...but IN still matches through it.
+query
+SELECT v, s FROM t WHERE v IN (SELECT w FROM nu);
+----
+1 'a'
+
+# Empty subquery result: IN selects nothing; NOT IN is vacuously true for EVERY row, NULL included.
+query
+SELECT v FROM t WHERE v IN (SELECT w FROM empty_t);
+----
+
+query rowsort
+SELECT v, s FROM t WHERE v NOT IN (SELECT w FROM empty_t);
+----
+1 'a'
+2 'b'
+3 'c'
+4 'd'
+NULL 'e'
+
+# Combined with ordinary WHERE conjuncts (the filter stays below the semi join).
+query rowsort
+SELECT v FROM t WHERE v IN (SELECT w FROM u) AND s <> 'a';
+----
+3
+
+# The subquery may be arbitrarily complex: derived table + aggregation + WHERE.
+query rowsort
+SELECT v FROM t WHERE v IN (SELECT min(w) FROM u WHERE w > 1);
+----
+3
+
+# The tested value may be an expression.
+query rowsort
+SELECT v FROM t WHERE v + 2 IN (SELECT w FROM u);
+----
+1
+
+# Strings.
+statement ok
+CREATE TABLE names (n VARCHAR);
+
+statement ok
+INSERT INTO names VALUES ('a'), ('c'), ('zzz');
+
+query rowsort
+SELECT s FROM t WHERE s IN (SELECT n FROM names);
+----
+'a'
+'c'
+
+query rowsort
+SELECT s FROM t WHERE s NOT IN (SELECT n FROM names);
+----
+'b'
+'d'
+'e'
+
+# IN (subquery) nests with a scalar subquery inside.
+query rowsort
+SELECT v FROM t WHERE v IN (SELECT w FROM u WHERE w < (SELECT max(w) FROM u));
+----
+1
+3

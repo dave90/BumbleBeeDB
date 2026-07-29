@@ -73,7 +73,7 @@ auto FindPrimaryKeyIndex(Catalog &catalog, const TableInfo &info) -> std::shared
 }
 
 void InsertOrRevive(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, TableHeap &heap, IndexInfo &pk,
-                    DataChunk &chunk, Vector &out_rids) {
+                    DataChunk &chunk, Vector &out_rids, bool keys_are_fresh) {
   const idx_t count = chunk.GetSize();
   if (count == 0) {
     return;
@@ -84,10 +84,13 @@ void InsertOrRevive(TransactionManager *txn_mgr, Transaction *txn, table_oid_t o
   const auto temp_ts = txn->GetTransactionTempTs();
   auto *rid_out = FlatVector::GetData<int64_t>(out_rids);
 
+  std::vector<RID> found;  // reused across rows
   for (idx_t i = 0; i < count; i++) {
     auto *key = keys.KeyAt(i);
-    std::vector<RID> found;
-    index->ScanKey(key, keys.width, &found);
+    found.clear();
+    if (!keys_are_fresh) {
+      index->ScanKey(key, keys.width, &found);
+    }
     if (found.empty()) {
       // A key the directory has never seen: append a fresh tuple and register it.
       RID rid = heap.AppendRowBytes(TupleMeta{temp_ts, false}, scattered.RowAt(i),

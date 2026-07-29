@@ -147,6 +147,20 @@ auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> 
           right_req.insert(i - left_count);
         }
       }
+      // The build side's layout only needs the columns some ancestor reads (captured BEFORE the
+      // key refs join in: keys live in their own layout slots, so storing their input columns too
+      // is only needed when the parent reads them). The build child mirrors the physical
+      // convention exactly — LEFT/SEMI/ANTI preserve the left child and build on the right;
+      // everything else (INNER, and the RIGHT/OUTER types that currently execute as INNER)
+      // builds on the left. SEMI/ANTI emit no build columns at all: their layout is keys-only.
+      const bool build_is_left =
+          !(join.GetJoinType() == JoinType::LEFT || join.GetJoinType() == JoinType::SEMI ||
+            join.GetJoinType() == JoinType::ANTI);
+      std::vector<idx_t> build_live;
+      if (join.GetJoinType() != JoinType::SEMI && join.GetJoinType() != JoinType::ANTI) {
+        const auto &req = build_is_left ? left_req : right_req;
+        build_live.assign(req.begin(), req.end());
+      }
       // Key expressions are evaluated against their own side's chunk, but by convention the left
       // keys are written as tuple 0 and the right keys as tuple 1; collect both spaces so either
       // convention only ever over-collects.
@@ -160,7 +174,11 @@ auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> 
       }
       auto left = PruneColumns(join.GetLeftPlan(), std::move(left_req));
       auto right = PruneColumns(join.GetRightPlan(), std::move(right_req));
-      return plan->CloneWithChildren({std::move(left), std::move(right)});
+      auto pruned = std::make_shared<HashJoinPlanNode>(join);
+      pruned->children_ = {std::move(left), std::move(right)};
+      pruned->build_live_columns_ = std::move(build_live);
+      pruned->build_live_annotated_ = true;
+      return pruned;
     }
     case PlanType::NestedLoopJoin: {
       // Same seam split; the predicate references the left as tuple 0 and the right as tuple 1.
