@@ -12,12 +12,34 @@
 
 #include "execution/aggregate/aggregate_update_kernels.h"
 
+#include "common/exception.h"
 #include "common/helper.h"
+#include "execution/aggregate/aggregate_semantics.h"
+#include "type/physical_type_dispatch.h"
 #include "type/value.h"
 
 namespace bumblebee {
 
-namespace {
+/** @brief Bump a group row's count slot by `n`. */
+static inline void BumpCount(data_ptr_t addr, idx_t cnt_off, int64_t n = 1) {
+  Store<int64_t>(Load<int64_t>(addr + cnt_off) + n, addr + cnt_off);
+}
+
+/**
+ * @brief Lift "are there NULLs" and "is the argument read through a selection" to template
+ *        arguments, then invoke `fn.operator()<HAS_NULLS, HAS_SEL>()`.
+ *
+ * The kernels below want both as compile-time constants — that is what makes the common all-valid,
+ * flat case a branch-free loop. Doing it by hand costs a four-way ternary per aggregate; this keeps
+ * the four instantiations while naming the choice once. The lambda inlines away entirely.
+ */
+template <class FN>
+static inline void DispatchNullsAndSelection(bool has_nulls, bool has_sel, FN &&fn) {
+  if (has_sel) {
+    return has_nulls ? fn.template operator()<true, true>() : fn.template operator()<false, true>();
+  }
+  return has_nulls ? fn.template operator()<true, false>() : fn.template operator()<false, false>();
+}
 
 /** The typed kernels are instantiated on two compile-time legs so the common case pays for nothing:
  * `HAS_SEL` reads the argument through a selection (a dictionary straight from Orrify — never
@@ -25,29 +47,27 @@ namespace {
  * branch-free loop. `addrs[i]` is each row's group row, so the state stores scatter by nature. */
 
 /** @brief Bump every row's group count: COUNT(*), and every COUNT(x) case with nothing to skip. */
-void UpdateCountStar(data_ptr_t *addrs, idx_t count, idx_t cnt_off) {
+static void UpdateCountStar(data_ptr_t *addrs, idx_t count, idx_t cnt_off) {
   for (idx_t i = 0; i < count; i++) {
-    auto *addr = addrs[i];
-    Store<int64_t>(Load<int64_t>(addr + cnt_off) + 1, addr + cnt_off);
+    BumpCount(addrs[i], cnt_off);
   }
 }
 
 /** @brief COUNT(x) with NULLs present: bump only the rows whose argument is non-NULL. */
 template <bool HAS_SEL>
-void UpdateCountKernel(const SelectionVector *sel, const ValidityMask &validity, data_ptr_t *addrs, idx_t count,
-                       idx_t cnt_off) {
+static void UpdateCountKernel(const SelectionVector *sel, const ValidityMask &validity, data_ptr_t *addrs, idx_t count,
+                              idx_t cnt_off) {
   for (idx_t i = 0; i < count; i++) {
     const idx_t row = HAS_SEL ? sel->GetIndex(i) : i;
     if (validity.RowIsValid(row)) {
-      auto *addr = addrs[i];
-      Store<int64_t>(Load<int64_t>(addr + cnt_off) + 1, addr + cnt_off);
+      BumpCount(addrs[i], cnt_off);
     }
   }
 }
 
 template <class T, bool HAS_NULLS, bool HAS_SEL>
-void UpdateSumKernel(const T *data, const SelectionVector *sel, const ValidityMask &validity, data_ptr_t *addrs,
-                     idx_t count, idx_t cnt_off, idx_t val_off) {
+static void UpdateSumKernel(const T *data, const SelectionVector *sel, const ValidityMask &validity, data_ptr_t *addrs,
+                            idx_t count, idx_t cnt_off, idx_t val_off) {
   for (idx_t i = 0; i < count; i++) {
     const idx_t row = HAS_SEL ? sel->GetIndex(i) : i;
     if constexpr (HAS_NULLS) {
@@ -56,14 +76,14 @@ void UpdateSumKernel(const T *data, const SelectionVector *sel, const ValidityMa
       }
     }
     auto *addr = addrs[i];
-    Store<int64_t>(Load<int64_t>(addr + cnt_off) + 1, addr + cnt_off);
+    BumpCount(addr, cnt_off);
     Store<double>(Load<double>(addr + val_off) + static_cast<double>(data[row]), addr + val_off);
   }
 }
 
 template <class T, bool MIN, bool HAS_NULLS, bool HAS_SEL>
-void UpdateMinMaxKernel(const T *data, const SelectionVector *sel, const ValidityMask &validity, data_ptr_t *addrs,
-                        idx_t count, idx_t cnt_off, idx_t val_off) {
+static void UpdateMinMaxKernel(const T *data, const SelectionVector *sel, const ValidityMask &validity,
+                               data_ptr_t *addrs, idx_t count, idx_t cnt_off, idx_t val_off) {
   for (idx_t i = 0; i < count; i++) {
     const idx_t row = HAS_SEL ? sel->GetIndex(i) : i;
     if constexpr (HAS_NULLS) {
@@ -74,12 +94,8 @@ void UpdateMinMaxKernel(const T *data, const SelectionVector *sel, const Validit
     auto *addr = addrs[i];
     const auto cnt = Load<int64_t>(addr + cnt_off);
     const auto x = static_cast<double>(data[row]);
-    if (cnt == 0) {
-      Store<double>(x, addr + val_off);
-    } else {
-      const auto cur = Load<double>(addr + val_off);
-      Store<double>(MIN ? (x < cur ? x : cur) : (x > cur ? x : cur), addr + val_off);
-    }
+    // cnt == 0 means "no extreme yet", so the first value seeds the state instead of folding.
+    Store<double>(cnt == 0 ? x : FoldExtreme<MIN>(Load<double>(addr + val_off), x), addr + val_off);
     Store<int64_t>(cnt + 1, addr + cnt_off);
   }
 }
@@ -87,75 +103,57 @@ void UpdateMinMaxKernel(const T *data, const SelectionVector *sel, const Validit
 /** @brief The typed leg of one aggregate's update: pick the SUM / MIN / MAX kernel for element type `T`
  * and the right (all-valid vs masked) × (direct vs through-selection) instantiation. */
 template <class T>
-void UpdateNumericAggregate(AggregationType type, const_data_ptr_t raw, const SelectionVector *sel,
-                            const ValidityMask &validity, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
-                            idx_t val_off) {
+static void UpdateNumericAggregate(AggregationType type, const_data_ptr_t raw, const SelectionVector *sel,
+                                   const ValidityMask &validity, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
+                                   idx_t val_off) {
   const auto *data = reinterpret_cast<const T *>(raw);
-  const bool all_valid = validity.AllValid();
-  switch (type) {
-    case AggregationType::AvgAggregate:  // AVG accumulates exactly like SUM (value + count); it only differs at finalize.
-    case AggregationType::SumAggregate:
-      if (sel != nullptr) {
-        return all_valid ? UpdateSumKernel<T, false, true>(data, sel, validity, addrs, count, cnt_off, val_off)
-                         : UpdateSumKernel<T, true, true>(data, sel, validity, addrs, count, cnt_off, val_off);
-      }
-      return all_valid ? UpdateSumKernel<T, false, false>(data, sel, validity, addrs, count, cnt_off, val_off)
-                       : UpdateSumKernel<T, true, false>(data, sel, validity, addrs, count, cnt_off, val_off);
-    case AggregationType::MinAggregate:
-      if (sel != nullptr) {
-        return all_valid
-                   ? UpdateMinMaxKernel<T, true, false, true>(data, sel, validity, addrs, count, cnt_off, val_off)
-                   : UpdateMinMaxKernel<T, true, true, true>(data, sel, validity, addrs, count, cnt_off, val_off);
-      }
-      return all_valid
-                 ? UpdateMinMaxKernel<T, true, false, false>(data, sel, validity, addrs, count, cnt_off, val_off)
-                 : UpdateMinMaxKernel<T, true, true, false>(data, sel, validity, addrs, count, cnt_off, val_off);
-    default:
-      if (sel != nullptr) {
-        return all_valid
-                   ? UpdateMinMaxKernel<T, false, false, true>(data, sel, validity, addrs, count, cnt_off, val_off)
-                   : UpdateMinMaxKernel<T, false, true, true>(data, sel, validity, addrs, count, cnt_off, val_off);
-      }
-      return all_valid
-                 ? UpdateMinMaxKernel<T, false, false, false>(data, sel, validity, addrs, count, cnt_off, val_off)
-                 : UpdateMinMaxKernel<T, false, true, false>(data, sel, validity, addrs, count, cnt_off, val_off);
+  const bool has_nulls = !validity.AllValid();
+  const bool has_sel = sel != nullptr;
+
+  // COUNT(*) and COUNT(x) are answered before we get here, so only the four value aggregates remain.
+  if (IsSumLike(type)) {
+    return DispatchNullsAndSelection(has_nulls, has_sel, [&]<bool HAS_NULLS, bool HAS_SEL>() {
+      UpdateSumKernel<T, HAS_NULLS, HAS_SEL>(data, sel, validity, addrs, count, cnt_off, val_off);
+    });
   }
+  if (type == AggregationType::MinAggregate) {
+    return DispatchNullsAndSelection(has_nulls, has_sel, [&]<bool HAS_NULLS, bool HAS_SEL>() {
+      UpdateMinMaxKernel<T, true, HAS_NULLS, HAS_SEL>(data, sel, validity, addrs, count, cnt_off, val_off);
+    });
+  }
+  if (type == AggregationType::MaxAggregate) {
+    return DispatchNullsAndSelection(has_nulls, has_sel, [&]<bool HAS_NULLS, bool HAS_SEL>() {
+      UpdateMinMaxKernel<T, false, HAS_NULLS, HAS_SEL>(data, sel, validity, addrs, count, cnt_off, val_off);
+    });
+  }
+  throw NotImplementedException(fmt::format("grouped aggregation: unsupported aggregate {}", type));
 }
 
 /** @brief A CONSTANT non-NULL argument: the value (and its NULL check) is hoisted out of the loop —
  * every row folds the SAME x, only the group states differ. */
-void UpdateConstant(AggregationType type, double x, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
-                    idx_t val_off) {
-  switch (type) {
-    case AggregationType::AvgAggregate:  // AVG accumulates like SUM.
-    case AggregationType::SumAggregate:
-      for (idx_t i = 0; i < count; i++) {
-        auto *addr = addrs[i];
-        Store<int64_t>(Load<int64_t>(addr + cnt_off) + 1, addr + cnt_off);
-        Store<double>(Load<double>(addr + val_off) + x, addr + val_off);
-      }
-      return;
-    default:
-      const bool is_min = type == AggregationType::MinAggregate;
-      for (idx_t i = 0; i < count; i++) {
-        auto *addr = addrs[i];
-        const auto cnt = Load<int64_t>(addr + cnt_off);
-        if (cnt == 0) {
-          Store<double>(x, addr + val_off);
-        } else {
-          const auto cur = Load<double>(addr + val_off);
-          Store<double>(is_min ? (x < cur ? x : cur) : (x > cur ? x : cur), addr + val_off);
-        }
-        Store<int64_t>(cnt + 1, addr + cnt_off);
-      }
+static void UpdateConstant(AggregationType type, double x, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
+                           idx_t val_off) {
+  if (IsSumLike(type)) {
+    for (idx_t i = 0; i < count; i++) {
+      auto *addr = addrs[i];
+      BumpCount(addr, cnt_off);
+      Store<double>(Load<double>(addr + val_off) + x, addr + val_off);
+    }
+    return;
+  }
+  for (idx_t i = 0; i < count; i++) {
+    auto *addr = addrs[i];
+    const auto cnt = Load<int64_t>(addr + cnt_off);
+    Store<double>(cnt == 0 ? x : FoldExtreme(type, Load<double>(addr + val_off), x), addr + val_off);
+    Store<int64_t>(cnt + 1, addr + cnt_off);
   }
 }
 
 /** @brief Non-numeric argument: the boundary per-row path (matches the aggregates' numeric-only scope).
  * `GetValue` is encoding-aware, so this works for any vector type at logical row `i`. */
-void UpdateFallbackAggregate(AggregationType type, Vector &arg, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
-                             idx_t val_off) {
-  const bool is_min = type == AggregationType::MinAggregate;
+static void UpdateFallbackAggregate(AggregationType type, Vector &arg, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
+                                    idx_t val_off) {
+  const bool sum_like = IsSumLike(type);  // hoisted: it cannot change across the rows
   for (idx_t i = 0; i < count; i++) {
     const auto val = arg.GetValue(i);
     if (val.IsNull()) {
@@ -164,49 +162,21 @@ void UpdateFallbackAggregate(AggregationType type, Vector &arg, data_ptr_t *addr
     const auto x = val.GetAs<double>();
     auto *addr = addrs[i];
     const auto cnt = Load<int64_t>(addr + cnt_off);
-    if (type == AggregationType::SumAggregate || type == AggregationType::AvgAggregate) {
-      Store<double>(Load<double>(addr + val_off) + x, addr + val_off);
-    } else if (cnt == 0) {
-      Store<double>(x, addr + val_off);
-    } else {
-      const auto cur = Load<double>(addr + val_off);
-      Store<double>(is_min ? (x < cur ? x : cur) : (x > cur ? x : cur), addr + val_off);
-    }
+    const auto cur = Load<double>(addr + val_off);
+    Store<double>(sum_like ? cur + x : (cnt == 0 ? x : FoldExtreme(type, cur, x)), addr + val_off);
     Store<int64_t>(cnt + 1, addr + cnt_off);
   }
 }
 
 /** @brief Route SUM/MIN/MAX to the tight loop instantiated for the argument's physical type. */
-void UpdateByPhysicalType(AggregationType type, Vector &arg, const_data_ptr_t data, const SelectionVector *sel,
-                          const ValidityMask &validity, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
-                          idx_t val_off) {
-  switch (arg.GetLogicalType().GetPhysicalType()) {
-    case PhysicalType::TINYINT:
-      return UpdateNumericAggregate<int8_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::SMALLINT:
-      return UpdateNumericAggregate<int16_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::INTEGER:
-      return UpdateNumericAggregate<int32_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::BIGINT:
-      return UpdateNumericAggregate<int64_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::UTINYINT:
-      return UpdateNumericAggregate<uint8_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::USMALLINT:
-      return UpdateNumericAggregate<uint16_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::UINTEGER:
-      return UpdateNumericAggregate<uint32_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::UBIGINT:
-      return UpdateNumericAggregate<uint64_t>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::FLOAT:
-      return UpdateNumericAggregate<float>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    case PhysicalType::DOUBLE:
-      return UpdateNumericAggregate<double>(type, data, sel, validity, addrs, count, cnt_off, val_off);
-    default:
-      return UpdateFallbackAggregate(type, arg, addrs, count, cnt_off, val_off);
-  }
+static void UpdateByPhysicalType(AggregationType type, Vector &arg, const_data_ptr_t data, const SelectionVector *sel,
+                                 const ValidityMask &validity, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
+                                 idx_t val_off) {
+  const auto ptype = arg.GetLogicalType().GetPhysicalType();
+  DispatchNumericPhysicalType(
+      ptype, [&]<class T>() { UpdateNumericAggregate<T>(type, data, sel, validity, addrs, count, cnt_off, val_off); },
+      [&]() { UpdateFallbackAggregate(type, arg, addrs, count, cnt_off, val_off); });
 }
-
-}  // namespace
 
 void UpdateOneAggregate(AggregationType type, Vector &arg, data_ptr_t *addrs, idx_t count, idx_t cnt_off,
                         idx_t val_off) {

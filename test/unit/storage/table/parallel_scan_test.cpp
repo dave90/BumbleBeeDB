@@ -29,15 +29,13 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto MakeSchema() -> SchemaRef {
+static auto MakeSchema() -> SchemaRef {
   std::vector<Column> cols{Column("id", LogicalType(LogicalTypeId::INTEGER))};
   return std::make_shared<Schema>(cols);
 }
 
 /** @brief Append `n` rows (id = 0..n-1) to the heap in chunks, spanning many pages. */
-void AppendRows(TableHeap &heap, int n) {
+static void AppendRows(TableHeap &heap, int n) {
   const std::vector<LogicalType> types{LogicalType(LogicalTypeId::INTEGER)};
   int written = 0;
   while (written < n) {
@@ -55,7 +53,7 @@ void AppendRows(TableHeap &heap, int n) {
 }
 
 /** @brief Drain a HeapScan cursor, collecting every id it yields into `out`. */
-void DrainInto(TableScan &scan, std::vector<int> &out) {
+static void DrainInto(TableScan &scan, std::vector<int> &out) {
   const std::vector<LogicalType> types{LogicalType(LogicalTypeId::INTEGER)};
   while (true) {
     DataChunk chunk;
@@ -68,8 +66,6 @@ void DrainInto(TableScan &scan, std::vector<int> &out) {
     }
   }
 }
-
-}  // namespace
 
 TEST(ParallelScanTest, MorselsCoverEveryRowExactlyOnce) {
   MemoryDiskManager dm(1024);

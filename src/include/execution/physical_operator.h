@@ -171,8 +171,6 @@ class PhysicalOperator {
    * in parallel only over a source that provides batch indexes (and with no operator in between
    * that picks rows nondeterministically under parallelism, e.g. a streaming LIMIT). */
   virtual auto SinkOrderDependent() const -> bool { return false; }
-  virtual auto FinalizeStageCount(GlobalSinkState &gstate) const -> idx_t { return 1; }
-  virtual auto FinalizeMaxThreads(GlobalSinkState &gstate, idx_t stage) const -> idx_t { return 1; }
 
   /** @brief Grow the pipeline DAG downwards from this operator */
   virtual void BuildPipelines(Pipeline &current, PipelineBuilder &builder) const;

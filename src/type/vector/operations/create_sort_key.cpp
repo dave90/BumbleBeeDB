@@ -18,12 +18,11 @@
 #include "common/exception.h"
 #include "common/helper.h"
 #include "common/macros.h"
+#include "type/physical_type_dispatch.h"
 #include "common/sort_key_encoding.h"
 #include "type/bumble_string.h"
 
 namespace bumblebee {
-
-namespace {
 
 /** One column to encode, and how many rows of it. */
 struct SortKeyVectorData {
@@ -135,7 +134,7 @@ struct SortKeyConstructInfo {
  * complemented, which exactly reverses the memcmp order.
  */
 template <class OP, class T>
-inline void EncodeOneRow(data_ptr_t result_ptr, idx_t &offset, T value, bool is_null, bool flip) {
+static inline void EncodeOneRow(data_ptr_t result_ptr, idx_t &offset, T value, bool is_null, bool flip) {
   idx_t encode_len = is_null ? OP::EncodeNull(result_ptr + offset) : OP::Encode(result_ptr + offset, value);
 
   if (flip) {
@@ -147,7 +146,7 @@ inline void EncodeOneRow(data_ptr_t result_ptr, idx_t &offset, T value, bool is_
 }
 
 template <class OP>
-void TemplatedConstructSortKeyConstant(Vector &vector, idx_t size, SortKeyConstructInfo &info) {
+static void TemplatedConstructSortKeyConstant(Vector &vector, idx_t size, SortKeyConstructInfo &info) {
   BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::CONSTANT_VECTOR, "expected a constant vector");
   auto *data = ConstantVector::GetData<typename OP::TYPE>(vector);
   bool is_null = !vector.RowIsValid(0);
@@ -157,8 +156,8 @@ void TemplatedConstructSortKeyConstant(Vector &vector, idx_t size, SortKeyConstr
 }
 
 template <class OP, class T, bool HAS_NULL>
-void TemplatedConstructSortKeyFlat(T *__restrict data, const ValidityMask &validity, idx_t size,
-                                   data_ptr_t *__restrict result, idx_t *__restrict offsets, bool flip) {
+static void TemplatedConstructSortKeyFlat(T *__restrict data, const ValidityMask &validity, idx_t size,
+                                          data_ptr_t *__restrict result, idx_t *__restrict offsets, bool flip) {
   if (HAS_NULL) {
     bool no_nulls = validity.AllValid();
     for (idx_t r = 0; r < size; r++) {
@@ -173,9 +172,9 @@ void TemplatedConstructSortKeyFlat(T *__restrict data, const ValidityMask &valid
 }
 
 template <class OP, class T, bool HAS_NULL>
-void TemplatedConstructSortKeyGeneric(T *__restrict data, const ValidityMask *validity, idx_t size,
-                                      const SelectionVector &sel, data_ptr_t *__restrict result,
-                                      idx_t *__restrict offsets, bool flip) {
+static void TemplatedConstructSortKeyGeneric(T *__restrict data, const ValidityMask *validity, idx_t size,
+                                             const SelectionVector &sel, data_ptr_t *__restrict result,
+                                             idx_t *__restrict offsets, bool flip) {
   if (HAS_NULL) {
     bool no_nulls = validity == nullptr || validity->AllValid();
     for (idx_t r = 0; r < size; r++) {
@@ -192,7 +191,7 @@ void TemplatedConstructSortKeyGeneric(T *__restrict data, const ValidityMask *va
 }
 
 template <class OP>
-void TemplatedConstructSortKey(SortKeyVectorData &vector_data, SortKeyConstructInfo &info) {
+static void TemplatedConstructSortKey(SortKeyVectorData &vector_data, SortKeyConstructInfo &info) {
   auto &vector = vector_data.vector_;
   switch (vector.GetVectorType()) {
     case VectorType::CONSTANT_VECTOR:
@@ -227,55 +226,27 @@ void TemplatedConstructSortKey(SortKeyVectorData &vector_data, SortKeyConstructI
   }
 }
 
-void ConstructSortKey(SortKeyVectorData &vector_data, SortKeyConstructInfo &info) {
+static void ConstructSortKey(SortKeyVectorData &vector_data, SortKeyConstructInfo &info) {
   auto &vector = vector_data.vector_;
-  switch (vector.GetType()) {
-    case PhysicalType::TINYINT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<int8_t>>(vector_data, info);
-      break;
-    case PhysicalType::SMALLINT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<int16_t>>(vector_data, info);
-      break;
-    case PhysicalType::INTEGER:
-      TemplatedConstructSortKey<SortKeyConstantOperator<int32_t>>(vector_data, info);
-      break;
-    case PhysicalType::BIGINT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<int64_t>>(vector_data, info);
-      break;
-    case PhysicalType::UTINYINT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<uint8_t>>(vector_data, info);
-      break;
-    case PhysicalType::USMALLINT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<uint16_t>>(vector_data, info);
-      break;
-    case PhysicalType::UINTEGER:
-      TemplatedConstructSortKey<SortKeyConstantOperator<uint32_t>>(vector_data, info);
-      break;
-    case PhysicalType::UBIGINT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<uint64_t>>(vector_data, info);
-      break;
-    case PhysicalType::FLOAT:
-      TemplatedConstructSortKey<SortKeyConstantOperator<float>>(vector_data, info);
-      break;
-    case PhysicalType::DOUBLE:
-      TemplatedConstructSortKey<SortKeyConstantOperator<double>>(vector_data, info);
-      break;
-    case PhysicalType::STRING:
-      TemplatedConstructSortKey<SortKeyStringOperator>(vector_data, info);
-      break;
-    default:
-      throw NotImplementedException(
-          fmt::format("create_sort_key: unsupported type {}", LogicalType::NameOf(vector.GetType())));
-  }
+  DispatchNumericPhysicalType(
+      vector.GetType(), [&]<class T>() { TemplatedConstructSortKey<SortKeyConstantOperator<T>>(vector_data, info); },
+      [&]() -> void {
+        if (vector.GetType() == PhysicalType::STRING) {
+          TemplatedConstructSortKey<SortKeyStringOperator>(vector_data, info);
+          return;
+        }
+        throw NotImplementedException(
+            fmt::format("create_sort_key: unsupported type {}", LogicalType::NameOf(vector.GetType())));
+      });
 }
 
 /** @return The bytes one STRING row needs: the NULL marker, or the full encoding. */
-inline auto StringRowEncodeLength(string_t &value, bool is_null) -> idx_t {
+static inline auto StringRowEncodeLength(string_t &value, bool is_null) -> idx_t {
   return is_null ? SortKeyStringOperator::GetNullEncodeLength() : SortKeyStringOperator::GetEncodeLength(value);
 }
 
-void GetSortKeyVariableLengthGeneric(string_t *__restrict data, const ValidityMask *validity, idx_t size,
-                                     const SelectionVector &sel, idx_t *__restrict result) {
+static void GetSortKeyVariableLengthGeneric(string_t *__restrict data, const ValidityMask *validity, idx_t size,
+                                            const SelectionVector &sel, idx_t *__restrict result) {
   bool no_nulls = validity == nullptr || validity->AllValid();
   for (idx_t i = 0; i < size; ++i) {
     auto idx = sel.GetIndex(i);
@@ -284,7 +255,7 @@ void GetSortKeyVariableLengthGeneric(string_t *__restrict data, const ValidityMa
   }
 }
 
-void GetSortKeyVariableLengthConstant(Vector &data, idx_t size, idx_t *__restrict result) {
+static void GetSortKeyVariableLengthConstant(Vector &data, idx_t size, idx_t *__restrict result) {
   BUMBLEBEE_ASSERT(data.GetVectorType() == VectorType::CONSTANT_VECTOR, "expected a constant vector");
   auto *s = ConstantVector::GetData<string_t>(data);
   bool is_null = ConstantVector::IsNull(data);
@@ -294,8 +265,8 @@ void GetSortKeyVariableLengthConstant(Vector &data, idx_t size, idx_t *__restric
   }
 }
 
-void GetSortKeyVariableLengthFlat(string_t *__restrict data, const ValidityMask &validity, idx_t size,
-                                  idx_t *__restrict result) {
+static void GetSortKeyVariableLengthFlat(string_t *__restrict data, const ValidityMask &validity, idx_t size,
+                                         idx_t *__restrict result) {
   bool all_valid = validity.AllValid();
   for (idx_t i = 0; i < size; ++i) {
     bool is_null = !all_valid && !validity.RowIsValid(i);
@@ -303,7 +274,7 @@ void GetSortKeyVariableLengthFlat(string_t *__restrict data, const ValidityMask 
   }
 }
 
-void GetSortKeyLength(SortKeyVectorData &data, SortKeyLengthInfo &result) {
+static void GetSortKeyLength(SortKeyVectorData &data, SortKeyLengthInfo &result) {
   auto &vector = data.vector_;
   auto type = vector.GetType();
 
@@ -315,8 +286,7 @@ void GetSortKeyLength(SortKeyVectorData &data, SortKeyLengthInfo &result) {
   }
 
   if (type != PhysicalType::STRING) {
-    throw NotImplementedException(
-        fmt::format("create_sort_key: unsupported type {}", LogicalType::NameOf(type)));
+    throw NotImplementedException(fmt::format("create_sort_key: unsupported type {}", LogicalType::NameOf(type)));
   }
   switch (vector.GetVectorType()) {
     case VectorType::CONSTANT_VECTOR:
@@ -337,7 +307,7 @@ void GetSortKeyLength(SortKeyVectorData &data, SortKeyLengthInfo &result) {
 }
 
 /** @brief Reserve the bytes of every row's key in `result`'s heap, and record where they are. */
-void PrepareSortData(Vector &result, idx_t size, SortKeyLengthInfo &key_lengths, data_ptr_t *data_ptr) {
+static void PrepareSortData(Vector &result, idx_t size, SortKeyLengthInfo &key_lengths, data_ptr_t *data_ptr) {
   BUMBLEBEE_ASSERT(result.GetType() == PhysicalType::STRING, "the sort keys must go into a STRING vector");
 
   auto *result_data = FlatVector::GetData<string_t>(result);
@@ -378,8 +348,8 @@ void PrepareSortData(Vector &result, idx_t size, SortKeyLengthInfo &key_lengths,
   }
 }
 
-void CreateSortKeyInternal(std::vector<sort_key_data_ptr_t> &sort_key_data,
-                           const std::vector<OrderModifiers> &modifiers, Vector &result, idx_t row_count) {
+static void CreateSortKeyInternal(std::vector<sort_key_data_ptr_t> &sort_key_data,
+                                  const std::vector<OrderModifiers> &modifiers, Vector &result, idx_t row_count) {
   // 1. Measure: how many bytes does each row's key need?
   SortKeyLengthInfo key_lengths(row_count);
   for (auto &vd : sort_key_data) {
@@ -387,7 +357,7 @@ void CreateSortKeyInternal(std::vector<sort_key_data_ptr_t> &sort_key_data,
   }
 
   // 2. Reserve: allocate the (still empty) keys in the result's heap.
-  auto data_pointers = std::unique_ptr<data_ptr_t[]>(new data_ptr_t[row_count]);
+  auto data_pointers = std::make_unique_for_overwrite<data_ptr_t[]>(row_count);
   PrepareSortData(result, row_count, key_lengths, data_pointers.get());
 
   // 3. Fill: append each column's encoding to every row, in key order. `offsets` tracks how
@@ -399,8 +369,6 @@ void CreateSortKeyInternal(std::vector<sort_key_data_ptr_t> &sort_key_data,
     ConstructSortKey(*sort_key_data[c], info);
   }
 }
-
-}  // namespace
 
 void CreateSortKey::Create(DataChunk &input, const std::vector<OrderModifiers> &modifiers, Vector &result) {
   BUMBLEBEE_ASSERT(modifiers.size() == input.ColumnCount(), "one order modifier per column");

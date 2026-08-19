@@ -88,20 +88,17 @@ auto PhysicalPlanGenerator::CreatePlan(const AbstractPlanNodeRef &plan) -> std::
   }
 }
 
-namespace {
-
 /** @brief Coerce each equi-key pair to one common type. Defined further down, next to the ordinary
  * hash-join lowering that shares it; declared here for the DML lowering above it. */
-void CoerceJoinKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<AbstractExpressionRef> &right_keys);
+static void CoerceJoinKeys(std::vector<AbstractExpressionRef> &left_keys,
+                           std::vector<AbstractExpressionRef> &right_keys);
 
 /** @brief `base` with a trailing BIGINT RID column appended (the scan-emitted row identifier). */
-auto AppendRidColumn(const SchemaRef &base) -> SchemaRef {
+static auto AppendRidColumn(const SchemaRef &base) -> SchemaRef {
   std::vector<Column> cols = base->GetColumns();
   cols.emplace_back("__rid", LogicalType(LogicalTypeId::BIGINT));
   return std::make_shared<const Schema>(cols);
 }
-
-}  // namespace
 
 auto PhysicalPlanGenerator::LowerDmlChild(const AbstractPlanNodeRef &child, idx_t &rid_column)
     -> std::unique_ptr<PhysicalOperator> {
@@ -238,10 +235,8 @@ auto PhysicalPlanGenerator::CreateDelete(const AbstractPlanNodeRef &plan) -> std
   return std::make_unique<PhysicalDelete>(plan->output_schema_, del.GetTableOid(), std::move(child), rid_column);
 }
 
-namespace {
-
 /** @brief Numeric widening rank; -1 for non-numeric physical types. */
-auto NumericJoinKeyRank(PhysicalType t) -> int {
+static auto NumericJoinKeyRank(PhysicalType t) -> int {
   switch (t) {
     case PhysicalType::TINYINT:
     case PhysicalType::UTINYINT:
@@ -271,7 +266,8 @@ auto NumericJoinKeyRank(PhysicalType t) -> int {
  * a key pair like `INTEGER = BIGINT` (e.g. an external parquet table's INT32 column joined to a
  * heap BIGINT) would silently mis-probe unless both sides are materialized at one width.
  */
-void CoerceJoinKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<AbstractExpressionRef> &right_keys) {
+static void CoerceJoinKeys(std::vector<AbstractExpressionRef> &left_keys,
+                           std::vector<AbstractExpressionRef> &right_keys) {
   for (idx_t i = 0; i < left_keys.size(); i++) {
     auto lt = left_keys[i]->GetReturnType().GetType();
     auto rt = right_keys[i]->GetReturnType().GetType();
@@ -291,8 +287,6 @@ void CoerceJoinKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<A
   }
 }
 
-}  // namespace
-
 auto PhysicalPlanGenerator::CreateHashJoin(const AbstractPlanNodeRef &plan) -> std::unique_ptr<PhysicalOperator> {
   const auto &hj = dynamic_cast<const HashJoinPlanNode &>(*plan);
   auto left = CreatePlan(hj.GetLeftPlan());    // child 0 = left input
@@ -311,9 +305,8 @@ auto PhysicalPlanGenerator::CreateHashJoin(const AbstractPlanNodeRef &plan) -> s
     op = std::make_unique<PhysicalGraceHashJoin>(plan->output_schema_, left_keys, right_keys, hj.GetJoinType(),
                                                  left_cols, std::move(left), std::move(right));
   } else {
-    auto hash_join = std::make_unique<PhysicalHashJoin>(plan->output_schema_, left_keys, right_keys,
-                                                        hj.GetJoinType(), left_cols, std::move(left),
-                                                        std::move(right));
+    auto hash_join = std::make_unique<PhysicalHashJoin>(plan->output_schema_, left_keys, right_keys, hj.GetJoinType(),
+                                                        left_cols, std::move(left), std::move(right));
     hash_join->null_aware_ = hj.null_aware_;
     if (hj.build_live_annotated_) {
       hash_join->SetLiveBuildColumns(hj.build_live_columns_);
@@ -324,8 +317,7 @@ auto PhysicalPlanGenerator::CreateHashJoin(const AbstractPlanNodeRef &plan) -> s
   return op;
 }
 
-auto PhysicalPlanGenerator::CreateNestedLoopJoin(const AbstractPlanNodeRef &plan)
-    -> std::unique_ptr<PhysicalOperator> {
+auto PhysicalPlanGenerator::CreateNestedLoopJoin(const AbstractPlanNodeRef &plan) -> std::unique_ptr<PhysicalOperator> {
   const auto &nlj = dynamic_cast<const NestedLoopJoinPlanNode &>(*plan);
   auto outer = CreatePlan(nlj.GetLeftPlan());
   auto inner = CreatePlan(nlj.GetRightPlan());
@@ -334,8 +326,7 @@ auto PhysicalPlanGenerator::CreateNestedLoopJoin(const AbstractPlanNodeRef &plan
                                                   std::move(outer), std::move(inner));
 }
 
-auto PhysicalPlanGenerator::CreateAggregation(const AbstractPlanNodeRef &plan)
-    -> std::unique_ptr<PhysicalOperator> {
+auto PhysicalPlanGenerator::CreateAggregation(const AbstractPlanNodeRef &plan) -> std::unique_ptr<PhysicalOperator> {
   const auto &agg = dynamic_cast<const AggregationPlanNode &>(*plan);
   auto child = CreatePlan(agg.GetChildPlan());
   if (agg.GetGroupBys().empty()) {

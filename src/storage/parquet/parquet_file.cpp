@@ -73,17 +73,17 @@ void BufferedSerializer::WriteData(const_data_ptr_t buffer, idx_t write_size) {
     do {
       maximum_size_ *= 2;
     } while (blob_.size_ + write_size > maximum_size_);
-    auto *new_data = new data_t[maximum_size_];
-    std::memcpy(new_data, data_, blob_.size_);
-    data_ = new_data;
-    blob_.data_ = std::unique_ptr<data_t[]>(new_data);
+    auto new_data = std::make_unique_for_overwrite<data_t[]>(maximum_size_);
+    std::memcpy(new_data.get(), data_, blob_.size_);
+    data_ = new_data.get();
+    blob_.data_ = std::move(new_data);
   }
   std::memcpy(data_ + blob_.size_, buffer, write_size);
   blob_.size_ += write_size;
 }
 
 BufferedFileWriter::BufferedFileWriter(const std::string &path)
-    : path_(path), buffer_(new data_t[FILE_BUFFER_SIZE]) {
+    : path_(path), buffer_(std::make_unique_for_overwrite<data_t[]>(FILE_BUFFER_SIZE)) {
   fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd_ < 0) {
     throw Exception(fmt::format("Cannot open file \"{}\" for writing: {}", path, strerror(errno)));

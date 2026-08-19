@@ -18,15 +18,13 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief The prefilter row loop, monomorphized per first-key type: one flat data pointer and
  * inline validity reads instead of a per-row encoding dispatch (this loop sees every input row
  * once the heap is full, so it is the TopN sink's hot path). Same order-code construction as
  * TopNHeap::OrderCodeAt. */
 template <class T, bool IS_SIGNED>
-void PrefilterCodes(const T *data, const ValidityMask &validity, uint64_t threshold, bool desc, idx_t count,
-                    SelectionVector &sel, idx_t &nc) {
+static void PrefilterCodes(const T *data, const ValidityMask &validity, uint64_t threshold, bool desc, idx_t count,
+                           SelectionVector &sel, idx_t &nc) {
   static constexpr uint64_t SIGN = 0x8000000000000000ULL;
   for (idx_t i = 0; i < count; i++) {
     uint64_t code;
@@ -44,11 +42,11 @@ void PrefilterCodes(const T *data, const ValidityMask &validity, uint64_t thresh
   }
 }
 
-}  // namespace
-
 TopNHeap::TopNHeap(const std::vector<LogicalType> &payload_types, const std::vector<LogicalType> &key_types,
                    const std::vector<OrderModifiers> &modifiers, idx_t limit)
-    : modifiers_(modifiers), limit_(limit), append_sel_(MaxValue<idx_t>(STANDARD_VECTOR_SIZE, limit)),
+    : modifiers_(modifiers),
+      limit_(limit),
+      append_sel_(MaxValue<idx_t>(STANDARD_VECTOR_SIZE, limit)),
       cand_sel_(STANDARD_VECTOR_SIZE) {
   payload_.Initialize(payload_types);
   heap_.reserve(MinValue<idx_t>(limit_, STANDARD_VECTOR_SIZE));

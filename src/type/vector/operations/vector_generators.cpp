@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "common/exception.h"
+#include "type/physical_type_dispatch.h"
 #include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
@@ -104,41 +105,10 @@ static void SwitchGenerateSequence(Vector &result, idx_t count, const SelectionV
       TemplatedGeneralGenerateSequence<T, HAS_END>(result, count, start, offset, stride, increment, end);
     }
   };
-  switch (result.GetType()) {
-    case PhysicalType::TINYINT:
-      generate.template operator()<int8_t>();
-      break;
-    case PhysicalType::SMALLINT:
-      generate.template operator()<int16_t>();
-      break;
-    case PhysicalType::INTEGER:
-      generate.template operator()<int32_t>();
-      break;
-    case PhysicalType::BIGINT:
-      generate.template operator()<int64_t>();
-      break;
-    case PhysicalType::UTINYINT:
-      generate.template operator()<uint8_t>();
-      break;
-    case PhysicalType::USMALLINT:
-      generate.template operator()<uint16_t>();
-      break;
-    case PhysicalType::UINTEGER:
-      generate.template operator()<uint32_t>();
-      break;
-    case PhysicalType::UBIGINT:
-      generate.template operator()<uint64_t>();
-      break;
-    case PhysicalType::FLOAT:
-      generate.template operator()<float>();
-      break;
-    case PhysicalType::DOUBLE:
-      generate.template operator()<double>();
-      break;
-    default:
-      throw NotImplementedException(
-          fmt::format("GenerateSequence: unsupported type {}", LogicalType::NameOf(result.GetType())));
-  }
+  DispatchNumericPhysicalType(result.GetType(), generate, [&]() -> void {
+    throw NotImplementedException(
+        fmt::format("GenerateSequence: unsupported type {}", LogicalType::NameOf(result.GetType())));
+  });
 }
 
 void VectorOperations::GenerateSequence(Vector &result, idx_t count, int64_t start, int64_t increment) {

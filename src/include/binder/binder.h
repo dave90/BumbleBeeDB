@@ -232,7 +232,10 @@ class Binder {
       *cte_scope_ptr_ = old_cte_scope_;
     }
 
-    DISALLOW_COPY_AND_MOVE(ContextGuard);
+    ContextGuard(const ContextGuard &) = delete;
+    auto operator=(const ContextGuard &) -> ContextGuard & = delete;
+    ContextGuard(ContextGuard &&) = delete;
+    auto operator=(ContextGuard &&) -> ContextGuard & = delete;
 
    private:
     const BoundTableRef *old_scope_;
@@ -258,7 +261,10 @@ class Binder {
     }
     ~OuterScopeGuard() { stack_->pop_back(); }
 
-    DISALLOW_COPY_AND_MOVE(OuterScopeGuard);
+    OuterScopeGuard(const OuterScopeGuard &) = delete;
+    auto operator=(const OuterScopeGuard &) -> OuterScopeGuard & = delete;
+    OuterScopeGuard(OuterScopeGuard &&) = delete;
+    auto operator=(OuterScopeGuard &&) -> OuterScopeGuard & = delete;
 
    private:
     std::vector<const BoundTableRef *> *stack_;

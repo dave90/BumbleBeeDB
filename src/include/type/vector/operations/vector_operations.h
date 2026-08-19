@@ -177,7 +177,8 @@ class VectorOperations {
    * @param error_message Out: the first error, if any. May be null.
    * @return True if every row converted.
    */
-  static auto TryCast(Vector &source, Vector &target, idx_t source_count, std::string *error_message) -> bool;
+  [[nodiscard]] static auto TryCast(Vector &source, Vector &target, idx_t source_count, std::string *error_message)
+      -> bool;
 
   // -- Sequence generation --------------------------------------------------
 
@@ -185,8 +186,7 @@ class VectorOperations {
   static void GenerateSequence(Vector &result, idx_t count, int64_t start, int64_t increment);
 
   /** @brief Fill `result` with `count` rows of the circular sequence over [start, end]. */
-  static void GenerateSequence(Vector &result, idx_t count, int64_t start, int64_t offset, int64_t stride,
-                               int64_t end);
+  static void GenerateSequence(Vector &result, idx_t count, int64_t start, int64_t offset, int64_t stride, int64_t end);
 
   /** @brief Fill only the rows named by `sel`, each with the value the sequence has *at that row*. */
   static void GenerateSequence(Vector &result, idx_t count, const SelectionVector &sel, int64_t start,

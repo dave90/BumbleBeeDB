@@ -25,10 +25,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Build a `RowLayout` from a schema's column types. */
-auto LayoutFromSchema(const Schema &schema) -> RowLayout {
+static auto LayoutFromSchema(const Schema &schema) -> RowLayout {
   std::vector<LogicalType> types;
   types.reserve(schema.GetColumnCount());
   for (const auto &col : schema.GetColumns()) {
@@ -40,9 +38,7 @@ auto LayoutFromSchema(const Schema &schema) -> RowLayout {
 }
 
 /** @brief A `Vector` of raw row pointers (physically `UBIGINT`), reused across a scan. */
-auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UBIGINT}}; }
-
-}  // namespace
+static auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UBIGINT}}; }
 
 /**
  * @brief A scan over one `[begin, end)` page-index morsel of a `ParallelScanState`, a page per chunk.
@@ -55,7 +51,9 @@ auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UB
 class HeapScan : public TableScan {
  public:
   HeapScan(std::shared_ptr<ParallelScanState> state, idx_t begin, idx_t end)
-      : state_(std::move(state)), page_idx_(begin), page_end_(std::min<idx_t>(end, state_ ? state_->pages_.size() : 0)) {
+      : state_(std::move(state)),
+        page_idx_(begin),
+        page_end_(std::min<idx_t>(end, state_ ? state_->pages_.size() : 0)) {
     projection_ = state_->projection_;
     if (projection_.empty()) {
       for (idx_t i = 0; i < state_->heap_->layout_.GetColumnCount(); i++) {

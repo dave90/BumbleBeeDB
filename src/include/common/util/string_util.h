@@ -98,9 +98,6 @@ class StringUtil {
     return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
   }
 
-  /** @return True if `c` ends a line. */
-  static auto CharacterIsNewline(char c) -> bool { return c == '\n' || c == '\r'; }
-
   /** @return `c` lowercased, if it is an ASCII upper-case letter. */
   static auto CharacterToLower(char c) -> char {
     if (c >= 'A' && c <= 'Z') {

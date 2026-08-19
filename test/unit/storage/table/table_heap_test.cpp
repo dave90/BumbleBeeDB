@@ -28,9 +28,7 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto MakeSchema() -> SchemaRef {
+static auto MakeSchema() -> SchemaRef {
   std::vector<Column> cols{
       Column("id", LogicalType(LogicalTypeId::INTEGER)),
       Column("name", LogicalType(LogicalTypeId::STRING), VARCHAR_DEFAULT_LENGTH),
@@ -39,23 +37,15 @@ auto MakeSchema() -> SchemaRef {
   return std::make_shared<Schema>(cols);
 }
 
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
-
 struct Person {
   int32_t id_;
   std::string name_;
   double score_;
 };
 
-auto MakeChunk(const Schema &schema, const std::vector<Person> &people) -> std::unique_ptr<DataChunk> {
+static auto MakeChunk(const Schema &schema, const std::vector<Person> &people) -> std::unique_ptr<DataChunk> {
   auto chunk = std::make_unique<DataChunk>();
-  chunk->Initialize(TypesOf(schema));
+  chunk->Initialize(schema.GetTypes());
   for (idx_t i = 0; i < people.size(); i++) {
     chunk->SetValue(0, i, Value(people[i].id_));
     chunk->SetValue(1, i, Value(people[i].name_));
@@ -64,8 +54,6 @@ auto MakeChunk(const Schema &schema, const std::vector<Person> &people) -> std::
   chunk->SetCardinality(people.size());
   return chunk;
 }
-
-}  // namespace
 
 TEST(TableHeapTest, VectorizedAppendThenScanRoundTrips) {
   MemoryDiskManager dm(256);
@@ -80,7 +68,7 @@ TEST(TableHeapTest, VectorizedAppendThenScanRoundTrips) {
 
   auto scan = heap.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   ASSERT_TRUE(scan->Next(out));
   ASSERT_EQ(out.GetSize(), people.size());
   for (idx_t i = 0; i < people.size(); i++) {
@@ -89,7 +77,7 @@ TEST(TableHeapTest, VectorizedAppendThenScanRoundTrips) {
     EXPECT_EQ(out.GetValue(2, i), Value(people[i].score_));
   }
   DataChunk drained;
-  drained.Initialize(TypesOf(*schema));
+  drained.Initialize(schema->GetTypes());
   EXPECT_FALSE(scan->Next(drained));  // one page, then exhausted
 }
 
@@ -127,7 +115,7 @@ TEST(TableHeapTest, EmptyTableScanEndsImmediately) {
 
   auto scan = heap.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   EXPECT_FALSE(scan->Next(out));
 }
 
@@ -168,7 +156,7 @@ TEST(TableHeapTest, ScanSkipsDeletedRows) {
 
   auto scan = heap.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   ASSERT_TRUE(scan->Next(out));
   ASSERT_EQ(out.GetSize(), 2U);  // only rows 1 and 3 survive
   EXPECT_EQ(out.GetValue(0, 0), Value(1));
@@ -192,7 +180,7 @@ TEST(TableHeapTest, FetchGathersByRid) {
   fetch_data[1] = rid_data[0];
 
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   heap.Fetch(to_fetch, 2, out);
   ASSERT_EQ(out.GetSize(), 2U);
   EXPECT_EQ(out.GetValue(0, 0), Value(30));
@@ -222,7 +210,7 @@ TEST(TableHeapTest, VectorizedUpdateChangesOnlyTargetedRows) {
 
   auto scan = heap.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   ASSERT_TRUE(scan->Next(out));
   ASSERT_EQ(out.GetSize(), 4U);
   // Rows come back in slot (append) order; the untouched rows are unchanged.
@@ -258,7 +246,7 @@ TEST(TableHeapTest, UpdateGrowsStringInPlaceKeepingRid) {
   Vector fetch{LogicalType{LogicalTypeId::BIGINT}};
   FlatVector::GetData<int64_t>(fetch)[0] = rid0;
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   heap.Fetch(fetch, 1, out);
   ASSERT_EQ(out.GetSize(), 1U);
   EXPECT_EQ(out.GetValue(0, 0), Value(11));
@@ -289,7 +277,7 @@ TEST(TableHeapTest, MultiPageAppendAndScan) {
   // Scan everything back and count.
   auto scan = heap.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   int seen = 0;
   int64_t sum_ids = 0;
   while (scan->Next(out)) {

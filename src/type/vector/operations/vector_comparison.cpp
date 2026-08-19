@@ -17,48 +17,37 @@
 #include "common/helper.h"
 #include "common/macros.h"
 #include "type/date.h"
+#include "type/physical_type_dispatch.h"
 #include "type/vector/operations/binary_execution.h"
 #include "type/vector/operator/comparison_operators.h"
 #include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief The fast path: both sides share a physical type, so no promotion is needed. */
 template <class OP>
-auto TemplatedSelectOperationSwitchEqualType(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                                             SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count)
-    -> idx_t {
+static auto TemplatedSelectOperationSwitchEqualType(Vector &left, Vector &right, const SelectionVector *sel,
+                                                    idx_t count, SelectionVector *true_sel, SelectionVector *false_sel,
+                                                    idx_t &false_count) -> idx_t {
   BUMBLEBEE_ASSERT(left.GetType() == right.GetType(), "the two sides must share a physical type");
-  switch (left.GetType()) {
-    case PhysicalType::TINYINT:
-      return BinaryExecution::Select<int8_t, int8_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::SMALLINT:
-      return BinaryExecution::Select<int16_t, int16_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::INTEGER:
-      return BinaryExecution::Select<int32_t, int32_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::BIGINT:
-      return BinaryExecution::Select<int64_t, int64_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::UTINYINT:
-      return BinaryExecution::Select<uint8_t, uint8_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::USMALLINT:
-      return BinaryExecution::Select<uint16_t, uint16_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::UINTEGER:
-      return BinaryExecution::Select<uint32_t, uint32_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::UBIGINT:
-      return BinaryExecution::Select<uint64_t, uint64_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::FLOAT:
-      return BinaryExecution::Select<float, float, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::DOUBLE:
-      return BinaryExecution::Select<double, double, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    case PhysicalType::STRING:
-      return BinaryExecution::Select<string_t, string_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
-    default:
-      throw NotImplementedException(
-          fmt::format("comparison: unsupported type {}", LogicalType::NameOf(left.GetType())));
-  }
+  return DispatchNumericAndStringPhysicalType(
+      left.GetType(),
+      [&]<class T>() {
+        return BinaryExecution::Select<T, T, OP>(left, right, sel, count, true_sel, false_sel, false_count);
+      },
+      [&]() -> idx_t {
+        throw NotImplementedException(
+            fmt::format("comparison: unsupported type {}", LogicalType::NameOf(left.GetType())));
+      });
 }
+
+// The two comparison policy functors below stay in an anonymous namespace: they are template
+// arguments to kernels instantiated over the full type cross-product, and a type has no `static`
+// spelling for internal linkage ([basic.link]). Promoting them to `bumblebee` flips every
+// instantiation naming them from internal to weak external linkage, which costs this file
+// 7.4 MB -> 11.4 MB of object code and 710 -> 12,854 exported symbols. See the longer note in
+// vector_arith.cpp, which has the same property.
+namespace {
 
 /** @brief Promote both sides to COMMON_TYPE, then compare. */
 template <class LEFT_TYPE, class RIGHT_TYPE, class COMMON_TYPE, class OP>
@@ -75,8 +64,7 @@ struct StringDateCast {
     date_t date_left;
     idx_t pos;
     if (!Date::TryConvertDate(left.CStr(), left.Length(), pos, date_left, true)) {
-      throw Exception(ExceptionType::CONVERSION,
-                      fmt::format("error parsing string to date: {}", left.GetString()));
+      throw Exception(ExceptionType::CONVERSION, fmt::format("error parsing string to date: {}", left.GetString()));
     }
     if (INVERSE) {
       return OP::Operation(right, date_left);
@@ -84,6 +72,8 @@ struct StringDateCast {
     return OP::Operation(date_left, right);
   }
 };
+
+}  // namespace
 
 /**
  * @brief Compare when at least one side is a DECIMAL, by bringing both onto one scale.
@@ -94,8 +84,8 @@ struct StringDateCast {
  * cast to the common DECIMAL type first, and only then compared.
  */
 template <class OP>
-auto TemplatedSelectOperationDecimal(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                                     SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count)
+static auto TemplatedSelectOperationDecimal(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                                            SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count)
     -> idx_t {
   Vector l_sel_vector(left);
   Vector r_sel_vector(right);
@@ -177,9 +167,9 @@ auto TemplatedSelectOperationDecimal(Vector &left, Vector &right, const Selectio
  * under C's usual arithmetic conversions, and FALSE in SQL.
  */
 template <class LEFT_TYPE, class RIGHT_TYPE, class OP>
-auto TemplatedSelectOperationSwitchCommon(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                                          SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count)
-    -> idx_t {
+static auto TemplatedSelectOperationSwitchCommon(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                                                 SelectionVector *true_sel, SelectionVector *false_sel,
+                                                 idx_t &false_count) -> idx_t {
   auto common_type = LogicalType::CommonType(left.GetType(), right.GetType());
 
   switch (common_type.GetPhysicalType()) {
@@ -204,9 +194,9 @@ auto TemplatedSelectOperationSwitchCommon(Vector &left, Vector &right, const Sel
 }
 
 template <class LEFT_TYPE, class OP>
-auto TemplatedSelectOperationSwitchRight(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                                         SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count)
-    -> idx_t {
+static auto TemplatedSelectOperationSwitchRight(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                                                SelectionVector *true_sel, SelectionVector *false_sel,
+                                                idx_t &false_count) -> idx_t {
   switch (right.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       return TemplatedSelectOperationSwitchCommon<LEFT_TYPE, int8_t, OP>(left, right, sel, count, true_sel, false_sel,
@@ -251,21 +241,25 @@ auto TemplatedSelectOperationSwitchRight(Vector &left, Vector &right, const Sele
 
 /** @brief The slow path: the two sides have different types, so both must be dispatched. */
 template <class OP>
-auto TemplatedSelectOperationSwitchLeft(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                                        SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count)
-    -> idx_t {
+static auto TemplatedSelectOperationSwitchLeft(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                                               SelectionVector *true_sel, SelectionVector *false_sel,
+                                               idx_t &false_count) -> idx_t {
   switch (left.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       return TemplatedSelectOperationSwitchRight<int8_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
     case LogicalTypeId::SMALLINT:
-      return TemplatedSelectOperationSwitchRight<int16_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
+      return TemplatedSelectOperationSwitchRight<int16_t, OP>(left, right, sel, count, true_sel, false_sel,
+                                                              false_count);
     case LogicalTypeId::INTEGER:
-      return TemplatedSelectOperationSwitchRight<int32_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
+      return TemplatedSelectOperationSwitchRight<int32_t, OP>(left, right, sel, count, true_sel, false_sel,
+                                                              false_count);
     case LogicalTypeId::BIGINT:
-      return TemplatedSelectOperationSwitchRight<int64_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
+      return TemplatedSelectOperationSwitchRight<int64_t, OP>(left, right, sel, count, true_sel, false_sel,
+                                                              false_count);
     case LogicalTypeId::BOOLEAN:
     case LogicalTypeId::UTINYINT:
-      return TemplatedSelectOperationSwitchRight<uint8_t, OP>(left, right, sel, count, true_sel, false_sel, false_count);
+      return TemplatedSelectOperationSwitchRight<uint8_t, OP>(left, right, sel, count, true_sel, false_sel,
+                                                              false_count);
     case LogicalTypeId::USMALLINT:
       return TemplatedSelectOperationSwitchRight<uint16_t, OP>(left, right, sel, count, true_sel, false_sel,
                                                                false_count);
@@ -307,7 +301,7 @@ auto TemplatedSelectOperationSwitchLeft(Vector &left, Vector &right, const Selec
 }
 
 /** @return True if the vector holds a nested (LIST / ARRAY) value. */
-inline auto IsNested(const Vector &vector) -> bool {
+static inline auto IsNested(const Vector &vector) -> bool {
   return vector.GetType() == PhysicalType::LIST || vector.GetType() == PhysicalType::ARRAY;
 }
 
@@ -329,19 +323,17 @@ inline auto IsNested(const Vector &vector) -> bool {
  * on top of Equals and adds the both-NULL rows back, exactly as it does for a scalar.
  */
 template <class OP>
-auto SelectNestedComparison(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                            SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count) -> idx_t {
+static auto SelectNestedComparison(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                                   SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count) -> idx_t {
   constexpr bool IS_EQUALS = std::is_same_v<OP, Equals>;
   constexpr bool IS_NOT_EQUALS = std::is_same_v<OP, NotEquals>;
   if constexpr (!IS_EQUALS && !IS_NOT_EQUALS) {
-    throw NotImplementedException(
-        fmt::format("comparison: a {} value has no ordering; only = and <> are supported",
-                    LogicalType::NameOf(left.GetType())));
+    throw NotImplementedException(fmt::format("comparison: a {} value has no ordering; only = and <> are supported",
+                                              LogicalType::NameOf(left.GetType())));
   } else {
     if (left.GetLogicalType() != right.GetLogicalType()) {
       throw NotImplementedException(fmt::format("comparison: cannot compare {} against {}",
-                                                left.GetLogicalType().ToString(),
-                                                right.GetLogicalType().ToString()));
+                                                left.GetLogicalType().ToString(), right.GetLogicalType().ToString()));
     }
     if (sel == nullptr) {
       sel = &FlatVector::INCREMENTAL_SELECTION_VECTOR;
@@ -375,23 +367,21 @@ auto SelectNestedComparison(Vector &left, Vector &right, const SelectionVector *
 
 /** @brief Dispatch a comparison: the equal-type fast path, or the promoting slow path. */
 template <class OP>
-auto SelectOperation(Vector &left, Vector &right, const SelectionVector *sel, idx_t count, SelectionVector *true_sel,
-                     SelectionVector *false_sel, idx_t &false_count) -> idx_t {
+static auto SelectOperation(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                            SelectionVector *true_sel, SelectionVector *false_sel, idx_t &false_count) -> idx_t {
   if (IsNested(left) || IsNested(right)) {
     return SelectNestedComparison<OP>(left, right, sel, count, true_sel, false_sel, false_count);
   }
   // Two DECIMALs of different scales share a physical type but are NOT comparable raw:
   // 1.00 (scale 2, raw 100) and 1.0 (scale 1, raw 10) would compare unequal. Send them
   // down the DECIMAL path, which brings them onto a common scale first.
-  const bool both_decimal = left.GetLogicalTypeId() == LogicalTypeId::DECIMAL &&
-                            right.GetLogicalTypeId() == LogicalTypeId::DECIMAL;
+  const bool both_decimal =
+      left.GetLogicalTypeId() == LogicalTypeId::DECIMAL && right.GetLogicalTypeId() == LogicalTypeId::DECIMAL;
   if (left.GetType() == right.GetType() && (!both_decimal || left.GetLogicalType() == right.GetLogicalType())) {
     return TemplatedSelectOperationSwitchEqualType<OP>(left, right, sel, count, true_sel, false_sel, false_count);
   }
   return TemplatedSelectOperationSwitchLeft<OP>(left, right, sel, count, true_sel, false_sel, false_count);
 }
-
-}  // namespace
 
 // -- The 5-argument overloads: only the matching rows ------------------------
 
@@ -467,8 +457,6 @@ auto VectorOperations::LessThanEquals(Vector &left, Vector &right, const Selecti
 
 // -- IS [NOT] DISTINCT FROM -------------------------------------------------
 
-namespace {
-
 /**
  * @brief The shared core of IS [NOT] DISTINCT FROM.
  *
@@ -478,8 +466,8 @@ namespace {
  * dropped (DISTINCT).
  */
 template <bool NOT_DISTINCT>
-auto SelectDistinctOrNot(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                         SelectionVector *true_sel) -> idx_t {
+static auto SelectDistinctOrNot(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                                SelectionVector *true_sel) -> idx_t {
   if (sel == nullptr) {
     sel = &FlatVector::INCREMENTAL_SELECTION_VECTOR;
   }
@@ -511,8 +499,6 @@ auto SelectDistinctOrNot(Vector &left, Vector &right, const SelectionVector *sel
   return out;
 }
 
-}  // namespace
-
 auto VectorOperations::NotDistinctFrom(Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
                                        SelectionVector *true_sel) -> idx_t {
   return SelectDistinctOrNot<true>(left, right, sel, count, true_sel);
@@ -525,8 +511,6 @@ auto VectorOperations::DistinctFrom(Vector &left, Vector &right, const Selection
 
 // -- IS NULL / IS NOT NULL --------------------------------------------------
 
-namespace {
-
 /**
  * @brief Select rows by validity alone.
  *
@@ -534,8 +518,8 @@ namespace {
  * reads through the selection, a sequence is always valid — so the loop stays uniform.
  */
 template <bool WANT_VALID>
-auto SelectByValidity(Vector &input, const SelectionVector *sel, idx_t count, SelectionVector *true_sel,
-                      SelectionVector *false_sel, idx_t &false_count) -> idx_t {
+static auto SelectByValidity(Vector &input, const SelectionVector *sel, idx_t count, SelectionVector *true_sel,
+                             SelectionVector *false_sel, idx_t &false_count) -> idx_t {
   if (sel == nullptr) {
     sel = &FlatVector::INCREMENTAL_SELECTION_VECTOR;
   }
@@ -558,8 +542,6 @@ auto SelectByValidity(Vector &input, const SelectionVector *sel, idx_t count, Se
   }
   return true_count;
 }
-
-}  // namespace
 
 auto VectorOperations::IsNull(Vector &input, const SelectionVector *sel, idx_t count, SelectionVector *true_sel)
     -> idx_t {

@@ -24,15 +24,11 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Taint the txn and raise a write-write conflict. */
-[[noreturn]] void ThrowWriteWriteConflict(Transaction *txn) {
+[[noreturn]] static void ThrowWriteWriteConflict(Transaction *txn) {
   txn->SetTainted();
   throw ExecutionException("write-write conflict: a concurrent transaction modified this row");
 }
-
-}  // namespace  (close the anonymous namespace: ApplyMvccModify is shared with the index-aware DML path)
 
 /**
  * @brief The shared write path for update (is_delete=false) and delete (is_delete=true).
@@ -86,12 +82,8 @@ void ApplyMvccModify(TransactionManager *txn_mgr, Transaction *txn, table_oid_t 
   txn->AppendWriteSet(oid, rid);
 }
 
-namespace {
-
 /** @brief A flat Vector of `data_ptr_t` pointing at each row buffer, for the row→column decode. */
-auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UBIGINT}}; }
-
-}  // namespace
+static auto MakePointerVector() -> Vector { return Vector{LogicalType{LogicalTypeId::UBIGINT}}; }
 
 void MvccInsert(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, TableHeap &heap, DataChunk &chunk,
                 Vector &out_rids) {
@@ -105,8 +97,8 @@ void MvccInsert(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, 
   auto rid_out = FlatVector::GetData<int64_t>(out_rids);
   for (idx_t i = 0; i < count; i++) {
     // A fresh insert has no prior version, so no undo log and no head undo-link.
-    auto rid = heap.AppendRowBytes(TupleMeta{temp_ts, false}, scattered.RowAt(i),
-                                   static_cast<uint16_t>(scattered.sizes[i]));
+    auto rid =
+        heap.AppendRowBytes(TupleMeta{temp_ts, false}, scattered.RowAt(i), static_cast<uint16_t>(scattered.sizes[i]));
     txn->AppendWriteSet(oid, rid);
     rid_out[i] = rid.Get();
   }

@@ -18,15 +18,14 @@
 #include "common/exception.h"
 #include "common/helper.h"
 #include "type/bumble_string.h"
+#include "type/physical_type_dispatch.h"
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Store a fixed-width column into every row at `col_offset`. */
 template <class T>
-void TemplatedScatter(const VectorData &col, data_ptr_t *ptrs, const SelectionVector &sel, idx_t count,
-                      idx_t col_offset) {
+static void TemplatedScatter(const VectorData &col, data_ptr_t *ptrs, const SelectionVector &sel, idx_t count,
+                             idx_t col_offset) {
   auto data = reinterpret_cast<const T *>(col.data_);
   for (idx_t i = 0; i < count; i++) {
     auto idx = sel.GetIndex(i);
@@ -36,8 +35,8 @@ void TemplatedScatter(const VectorData &col, data_ptr_t *ptrs, const SelectionVe
 }
 
 /** @brief Store a variable-length column: payload after the fixed region, referenced by a handle. */
-void ScatterStrings(const VectorData &col, data_ptr_t *ptrs, const SelectionVector &sel, idx_t count,
-                    idx_t col_offset, std::vector<uint32_t> &payload_cursor) {
+static void ScatterStrings(const VectorData &col, data_ptr_t *ptrs, const SelectionVector &sel, idx_t count,
+                           idx_t col_offset, std::vector<uint32_t> &payload_cursor) {
   auto data = reinterpret_cast<const string_t *>(col.data_);
   for (idx_t i = 0; i < count; i++) {
     auto idx = sel.GetIndex(i);
@@ -61,7 +60,7 @@ void ScatterStrings(const VectorData &col, data_ptr_t *ptrs, const SelectionVect
 
 /** @brief Load a fixed-width column out of every row into `col`, in identity order. */
 template <class T>
-void TemplatedFullScan(data_ptr_t *ptrs, Vector &col, idx_t count, idx_t col_offset) {
+static void TemplatedFullScan(data_ptr_t *ptrs, Vector &col, idx_t count, idx_t col_offset) {
   auto data = FlatVector::GetData<T>(col);
   for (idx_t i = 0; i < count; i++) {
     data[i] = Load<T>(ptrs[i] + col_offset);
@@ -70,8 +69,8 @@ void TemplatedFullScan(data_ptr_t *ptrs, Vector &col, idx_t count, idx_t col_off
 
 /** @brief Load a fixed-width column out of `count` selected rows into the selected slots of `col`. */
 template <class T>
-void TemplatedGather(data_ptr_t *ptrs, const SelectionVector &row_sel, Vector &col, const SelectionVector &col_sel,
-                     idx_t count, idx_t col_offset) {
+static void TemplatedGather(data_ptr_t *ptrs, const SelectionVector &row_sel, Vector &col,
+                            const SelectionVector &col_sel, idx_t count, idx_t col_offset) {
   auto data = FlatVector::GetData<T>(col);
   for (idx_t i = 0; i < count; i++) {
     auto row = ptrs[row_sel.GetIndex(i)];
@@ -88,10 +87,10 @@ void TemplatedGather(data_ptr_t *ptrs, const SelectionVector &row_sel, Vector &c
  * `next_sel` and appends the failures to `no_match_sel` (both as candidate positions).
  */
 template <class T, bool NULL_EQUAL>
-auto TemplatedMatchCol(const VectorData &col, data_ptr_t *rows, const SelectionVector &row_sel,
-                       const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count,
-                       idx_t col_offset, idx_t col_no, SelectionVector &next_sel, SelectionVector &no_match_sel,
-                       idx_t &no_match_count) -> idx_t {
+static auto TemplatedMatchCol(const VectorData &col, data_ptr_t *rows, const SelectionVector &row_sel,
+                              const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count,
+                              idx_t col_offset, idx_t col_no, SelectionVector &next_sel, SelectionVector &no_match_sel,
+                              idx_t &no_match_count) -> idx_t {
   auto data = reinterpret_cast<const T *>(col.data_);
   idx_t survivors = 0;
   for (idx_t p = 0; p < count; p++) {
@@ -119,10 +118,10 @@ auto TemplatedMatchCol(const VectorData &col, data_ptr_t *rows, const SelectionV
 
 /** @brief Filter the candidates on one variable-length (string) key column. */
 template <bool NULL_EQUAL>
-auto TemplatedMatchStringCol(const VectorData &col, data_ptr_t *rows, const SelectionVector &row_sel,
-                             const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count,
-                             idx_t col_offset, idx_t col_no, SelectionVector &next_sel,
-                             SelectionVector &no_match_sel, idx_t &no_match_count) -> idx_t {
+static auto TemplatedMatchStringCol(const VectorData &col, data_ptr_t *rows, const SelectionVector &row_sel,
+                                    const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count,
+                                    idx_t col_offset, idx_t col_no, SelectionVector &next_sel,
+                                    SelectionVector &no_match_sel, idx_t &no_match_count) -> idx_t {
   auto data = reinterpret_cast<const string_t *>(col.data_);
   idx_t survivors = 0;
   for (idx_t p = 0; p < count; p++) {
@@ -135,8 +134,8 @@ auto TemplatedMatchStringCol(const VectorData &col, data_ptr_t *rows, const Sele
     if (col_valid && row_valid) {
       const auto handle = Load<StringHandle>(row + col_offset);
       const auto &str = data[col_row];
-      equal = handle.length_ == str.Size() &&
-              std::memcmp(row + handle.offset_, str.GetDataUnsafe(), handle.length_) == 0;
+      equal =
+          handle.length_ == str.Size() && std::memcmp(row + handle.offset_, str.GetDataUnsafe(), handle.length_) == 0;
     } else if (NULL_EQUAL) {
       equal = !col_valid && !row_valid;
     } else {
@@ -153,50 +152,24 @@ auto TemplatedMatchStringCol(const VectorData &col, data_ptr_t *rows, const Sele
 
 /** @brief Dispatch one key column of Match on its physical type. */
 template <bool NULL_EQUAL>
-auto MatchColumn(const VectorData &col, PhysicalType type, data_ptr_t *rows, const SelectionVector &row_sel,
-                 const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count, idx_t col_offset,
-                 idx_t col_no, SelectionVector &next_sel, SelectionVector &no_match_sel, idx_t &no_match_count)
+static auto MatchColumn(const VectorData &col, PhysicalType type, data_ptr_t *rows, const SelectionVector &row_sel,
+                        const SelectionVector &col_sel, const SelectionVector &cur_sel, idx_t count, idx_t col_offset,
+                        idx_t col_no, SelectionVector &next_sel, SelectionVector &no_match_sel, idx_t &no_match_count)
     -> idx_t {
-  switch (type) {
-    case PhysicalType::TINYINT:
-      return TemplatedMatchCol<int8_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                   next_sel, no_match_sel, no_match_count);
-    case PhysicalType::SMALLINT:
-      return TemplatedMatchCol<int16_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                    next_sel, no_match_sel, no_match_count);
-    case PhysicalType::INTEGER:
-      return TemplatedMatchCol<int32_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                    next_sel, no_match_sel, no_match_count);
-    case PhysicalType::BIGINT:
-      return TemplatedMatchCol<int64_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                    next_sel, no_match_sel, no_match_count);
-    case PhysicalType::UTINYINT:
-      return TemplatedMatchCol<uint8_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                    next_sel, no_match_sel, no_match_count);
-    case PhysicalType::USMALLINT:
-      return TemplatedMatchCol<uint16_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+  return DispatchNumericPhysicalType(
+      type,
+      [&]<class T>() {
+        return TemplatedMatchCol<T, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
+                                                next_sel, no_match_sel, no_match_count);
+      },
+      [&]() -> idx_t {
+        if (type == PhysicalType::STRING) {
+          return TemplatedMatchStringCol<NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
                                                      next_sel, no_match_sel, no_match_count);
-    case PhysicalType::UINTEGER:
-      return TemplatedMatchCol<uint32_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                     next_sel, no_match_sel, no_match_count);
-    case PhysicalType::UBIGINT:
-      return TemplatedMatchCol<uint64_t, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                     next_sel, no_match_sel, no_match_count);
-    case PhysicalType::FLOAT:
-      return TemplatedMatchCol<float, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                  next_sel, no_match_sel, no_match_count);
-    case PhysicalType::DOUBLE:
-      return TemplatedMatchCol<double, NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                   next_sel, no_match_sel, no_match_count);
-    case PhysicalType::STRING:
-      return TemplatedMatchStringCol<NULL_EQUAL>(col, rows, row_sel, col_sel, cur_sel, count, col_offset, col_no,
-                                                 next_sel, no_match_sel, no_match_count);
-    default:
-      throw NotImplementedException("RowOperations::Match: unsupported physical type");
-  }
+        }
+        throw NotImplementedException("RowOperations::Match: unsupported physical type");
+      });
 }
-
-}  // namespace
 
 void RowOperations::ScatterKeys(DataChunk &chunk, const std::vector<uint32_t> &src_cols,
                                 const std::vector<idx_t> &dst_offsets, const std::vector<PhysicalType> &key_types,
@@ -216,40 +189,11 @@ void RowOperations::ScatterKeys(DataChunk &chunk, const std::vector<uint32_t> &s
   for (size_t k = 0; k < src_cols.size(); k++) {
     auto &col = col_data[src_cols[k]];
     idx_t off = dst_offsets[k];
-    switch (key_types[k]) {
-      case PhysicalType::TINYINT:
-        TemplatedScatter<int8_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::SMALLINT:
-        TemplatedScatter<int16_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::INTEGER:
-        TemplatedScatter<int32_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::BIGINT:
-        TemplatedScatter<int64_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::UTINYINT:
-        TemplatedScatter<uint8_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::USMALLINT:
-        TemplatedScatter<uint16_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::UINTEGER:
-        TemplatedScatter<uint32_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::UBIGINT:
-        TemplatedScatter<uint64_t>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::FLOAT:
-        TemplatedScatter<float>(col, ptrs.data(), identity, count, off);
-        break;
-      case PhysicalType::DOUBLE:
-        TemplatedScatter<double>(col, ptrs.data(), identity, count, off);
-        break;
-      default:
-        throw NotImplementedException("RowOperations::ScatterKeys: variable-length key columns are not supported");
-    }
+    DispatchNumericPhysicalType(
+        key_types[k], [&]<class T>() { TemplatedScatter<T>(col, ptrs.data(), identity, count, off); },
+        [&]() -> void {
+          throw NotImplementedException("RowOperations::ScatterKeys: variable-length key columns are not supported");
+        });
   }
 }
 
@@ -294,43 +238,16 @@ void RowOperations::Scatter(DataChunk &columns, const RowLayout &layout, Vector 
   for (idx_t col_no = 0; col_no < types.size(); col_no++) {
     auto &col = col_data[col_no];
     auto col_offset = offsets[col_no];
-    switch (types[col_no].GetPhysicalType()) {
-      case PhysicalType::TINYINT:
-        TemplatedScatter<int8_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::SMALLINT:
-        TemplatedScatter<int16_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::INTEGER:
-        TemplatedScatter<int32_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::BIGINT:
-        TemplatedScatter<int64_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::UTINYINT:
-        TemplatedScatter<uint8_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::USMALLINT:
-        TemplatedScatter<uint16_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::UINTEGER:
-        TemplatedScatter<uint32_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::UBIGINT:
-        TemplatedScatter<uint64_t>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::FLOAT:
-        TemplatedScatter<float>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::DOUBLE:
-        TemplatedScatter<double>(col, ptrs, sel, count, col_offset);
-        break;
-      case PhysicalType::STRING:
-        ScatterStrings(col, ptrs, sel, count, col_offset, payload_cursor);
-        break;
-      default:
-        throw NotImplementedException("RowOperations::Scatter: unsupported physical type");
-    }
+    const auto ptype = types[col_no].GetPhysicalType();
+    DispatchNumericPhysicalType(
+        ptype, [&]<class T>() { TemplatedScatter<T>(col, ptrs, sel, count, col_offset); },
+        [&]() -> void {
+          if (ptype == PhysicalType::STRING) {
+            ScatterStrings(col, ptrs, sel, count, col_offset, payload_cursor);
+            return;
+          }
+          throw NotImplementedException("RowOperations::Scatter: unsupported physical type");
+        });
   }
 }
 
@@ -341,53 +258,22 @@ void RowOperations::FullScanColumn(const RowLayout &layout, Vector &rows, Vector
   col.SetVectorType(VectorType::FLAT_VECTOR);
   col.Validity().Reset();
 
-  switch (col.GetType()) {
-    case PhysicalType::TINYINT:
-      TemplatedFullScan<int8_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::SMALLINT:
-      TemplatedFullScan<int16_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::INTEGER:
-      TemplatedFullScan<int32_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::BIGINT:
-      TemplatedFullScan<int64_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::UTINYINT:
-      TemplatedFullScan<uint8_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::USMALLINT:
-      TemplatedFullScan<uint16_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::UINTEGER:
-      TemplatedFullScan<uint32_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::UBIGINT:
-      TemplatedFullScan<uint64_t>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::FLOAT:
-      TemplatedFullScan<float>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::DOUBLE:
-      TemplatedFullScan<double>(ptrs, col, count, col_offset);
-      break;
-    case PhysicalType::STRING: {
-      auto out = FlatVector::GetData<string_t>(col);
-      for (idx_t i = 0; i < count; i++) {
-        auto row = ptrs[i];
-        auto handle = Load<StringHandle>(row + col_offset);
-        auto *bytes = reinterpret_cast<const char *>(row + handle.offset_);
-        // Copy into col's own heap when the row bytes will not outlive this chunk (Fetch); otherwise
-        // reference them in place (the scan keeps the page pinned across the pull).
-        out[i] = copy_strings ? StringVector::AddString(col, bytes, handle.length_)
-                              : string_t(bytes, handle.length_);
-      }
-      break;
-    }
-    default:
-      throw NotImplementedException("RowOperations::FullScanColumn: unsupported physical type");
-  }
+  DispatchNumericPhysicalType(
+      col.GetType(), [&]<class T>() { TemplatedFullScan<T>(ptrs, col, count, col_offset); },
+      [&]() -> void {
+        if (col.GetType() != PhysicalType::STRING) {
+          throw NotImplementedException("RowOperations::FullScanColumn: unsupported physical type");
+        }
+        auto out = FlatVector::GetData<string_t>(col);
+        for (idx_t i = 0; i < count; i++) {
+          auto row = ptrs[i];
+          auto handle = Load<StringHandle>(row + col_offset);
+          auto *bytes = reinterpret_cast<const char *>(row + handle.offset_);
+          // Copy into col's own heap when the row bytes will not outlive this chunk (Fetch); otherwise
+          // reference them in place (the scan keeps the page pinned across the pull).
+          out[i] = copy_strings ? StringVector::AddString(col, bytes, handle.length_) : string_t(bytes, handle.length_);
+        }
+      });
 
   // Propagate the per-row validity prefix into the output mask.
   auto &mask = col.Validity();
@@ -412,54 +298,24 @@ void RowOperations::Gather(const RowLayout &layout, Vector &rows, const Selectio
   const auto col_offset = layout.GetOffsets()[col_no];
   BUMBLEBEE_ASSERT(col.GetVectorType() == VectorType::FLAT_VECTOR, "RowOperations::Gather: the output must be flat");
 
-  switch (col.GetType()) {
-    case PhysicalType::TINYINT:
-      TemplatedGather<int8_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::SMALLINT:
-      TemplatedGather<int16_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::INTEGER:
-      TemplatedGather<int32_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::BIGINT:
-      TemplatedGather<int64_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::UTINYINT:
-      TemplatedGather<uint8_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::USMALLINT:
-      TemplatedGather<uint16_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::UINTEGER:
-      TemplatedGather<uint32_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::UBIGINT:
-      TemplatedGather<uint64_t>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::FLOAT:
-      TemplatedGather<float>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::DOUBLE:
-      TemplatedGather<double>(ptrs, row_sel, col, col_sel, count, col_offset);
-      break;
-    case PhysicalType::STRING: {
-      auto out = FlatVector::GetData<string_t>(col);
-      for (idx_t i = 0; i < count; i++) {
-        auto row = ptrs[row_sel.GetIndex(i)];
-        if (row == nullptr) {
-          continue;  // the validity pass below emits the NULL
+  DispatchNumericPhysicalType(
+      col.GetType(), [&]<class T>() { TemplatedGather<T>(ptrs, row_sel, col, col_sel, count, col_offset); },
+      [&]() -> void {
+        if (col.GetType() != PhysicalType::STRING) {
+          throw NotImplementedException("RowOperations::Gather: unsupported physical type");
         }
-        auto handle = Load<StringHandle>(row + col_offset);
-        auto *bytes = reinterpret_cast<const char *>(row + handle.offset_);
-        out[col_sel.GetIndex(i)] = copy_strings ? StringVector::AddString(col, bytes, handle.length_)
-                                                : string_t(bytes, handle.length_);
-      }
-      break;
-    }
-    default:
-      throw NotImplementedException("RowOperations::Gather: unsupported physical type");
-  }
+        auto out = FlatVector::GetData<string_t>(col);
+        for (idx_t i = 0; i < count; i++) {
+          auto row = ptrs[row_sel.GetIndex(i)];
+          if (row == nullptr) {
+            continue;  // the validity pass below emits the NULL
+          }
+          auto handle = Load<StringHandle>(row + col_offset);
+          auto *bytes = reinterpret_cast<const char *>(row + handle.offset_);
+          out[col_sel.GetIndex(i)] =
+              copy_strings ? StringVector::AddString(col, bytes, handle.length_) : string_t(bytes, handle.length_);
+        }
+      });
 
   // NULL out every value whose row is null (LEFT-join padding) or whose validity bit is clear.
   auto &mask = col.Validity();

@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 
+#include "execution/aggregate/aggregate_semantics.h"
 #include "execution/plans/aggregation_plan.h"
 #include "type/logical_type.h"
 #include "type/value.h"
@@ -59,12 +60,10 @@ class AggregateAccumulator {
         sum_ += d;
         break;
       case AggregationType::MinAggregate:
-        acc_ = has_acc_ ? (d < acc_ ? d : acc_) : d;
-        has_acc_ = true;
+        FoldMin(d);
         break;
       case AggregationType::MaxAggregate:
-        acc_ = has_acc_ ? (d > acc_ ? d : acc_) : d;
-        has_acc_ = true;
+        FoldMax(d);
         break;
       default:
         break;  // Count: the count_++ above is all it needs
@@ -97,7 +96,7 @@ class AggregateAccumulator {
         return;
       }
       const auto d = val.GetAs<long double>();
-      if (type_ == AggregationType::SumAggregate || type_ == AggregationType::AvgAggregate) {
+      if (IsSumLike(type_)) {
         sum_ += d * static_cast<long double>(count);
       } else if (type_ == AggregationType::MinAggregate) {
         FoldMin(d);
@@ -146,11 +145,9 @@ class AggregateAccumulator {
       if (o.is_string_) {
         FoldStr(o.str_acc_);  // string MIN/MAX: fold the other's extreme in (sets is_string_/has_acc_)
       } else if (!has_acc_) {
-        acc_ = o.acc_;
-      } else if (type_ == AggregationType::MinAggregate) {
-        acc_ = o.acc_ < acc_ ? o.acc_ : acc_;
-      } else if (type_ == AggregationType::MaxAggregate) {
-        acc_ = o.acc_ > acc_ ? o.acc_ : acc_;
+        acc_ = o.acc_;  // nothing here yet: adopt the other side's extreme
+      } else if (IsExtremeAgg(type_)) {
+        acc_ = FoldExtreme(type_, acc_, o.acc_);
       }
       has_acc_ = true;
     }
@@ -181,8 +178,7 @@ class AggregateAccumulator {
  private:
   /** @return True when this is MIN/MAX and the argument is a string (the lexicographic path). */
   auto IsStringMinMax(const Value &v) const -> bool {
-    return (type_ == AggregationType::MinAggregate || type_ == AggregationType::MaxAggregate) &&
-           v.GetPhysicalType() == PhysicalType::STRING;
+    return IsExtremeAgg(type_) && v.GetPhysicalType() == PhysicalType::STRING;
   }
 
   /** @brief Fold one string into the running MIN/MAX, keeping an owned copy of the extreme. */
@@ -193,17 +189,18 @@ class AggregateAccumulator {
       has_acc_ = true;
       return;
     }
-    if (type_ == AggregationType::MinAggregate ? (s < str_acc_) : (s > str_acc_)) {
+    if (TakesExtreme(type_, str_acc_, s)) {
       str_acc_ = s;
     }
   }
 
+  /** @brief Fold one value into the scalar running extreme; the first value seeds it. */
   void FoldMin(long double d) {
-    acc_ = has_acc_ ? (d < acc_ ? d : acc_) : d;
+    acc_ = has_acc_ ? FoldExtreme<true>(acc_, d) : d;
     has_acc_ = true;
   }
   void FoldMax(long double d) {
-    acc_ = has_acc_ ? (d > acc_ ? d : acc_) : d;
+    acc_ = has_acc_ ? FoldExtreme<false>(acc_, d) : d;
     has_acc_ = true;
   }
 
@@ -309,7 +306,10 @@ class AggregateAccumulator {
           if (!validity.RowIsValid(i)) {
             continue;
           }
-          m = !seen ? data[i] : (want_min ? (data[i] < m ? data[i] : m) : (data[i] > m ? data[i] : m));
+          // `want_min` stays a hoisted local rather than a `type_` read: this loop is tuned to
+          // vectorize, and a member load the compiler cannot prove non-aliasing with `data` would
+          // stop it.
+          m = !seen ? data[i] : (want_min ? FoldExtreme<true>(m, data[i]) : FoldExtreme<false>(m, data[i]));
           seen = true;
           valid++;
         }

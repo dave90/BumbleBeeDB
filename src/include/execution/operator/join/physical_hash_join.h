@@ -49,15 +49,18 @@ class PhysicalHashJoin : public PhysicalOperator {
  public:
   PhysicalHashJoin(SchemaRef output_schema, std::vector<AbstractExpressionRef> left_keys,
                    std::vector<AbstractExpressionRef> right_keys, JoinType join_type, idx_t left_column_count,
-                   std::unique_ptr<PhysicalOperator> build, std::unique_ptr<PhysicalOperator> probe)
-      : PhysicalOperator(PhysicalOperatorType::HASH_JOIN, std::move(output_schema), probe->estimated_cardinality_),
+                   std::unique_ptr<PhysicalOperator> left, std::unique_ptr<PhysicalOperator> right)
+      : PhysicalOperator(PhysicalOperatorType::HASH_JOIN, std::move(output_schema), right->estimated_cardinality_),
         left_keys_(std::move(left_keys)),
         right_keys_(std::move(right_keys)),
         join_type_(join_type),
         left_column_count_(left_column_count) {
+    // NOT named build/probe: which side is hashed depends on the join type (`BuildChildIdx()` is
+    // 1, not 0, for the left-preserving types), so for LEFT/SEMI/ANTI the second argument builds
+    // and the first streams as the probe. The old `build, probe` names said the opposite.
     key_modifiers_.assign(left_keys_.size(), OrderModifiers(OrderType::ASCENDING));
-    children_.push_back(std::move(build));  // child 0 = left input
-    children_.push_back(std::move(probe));  // child 1 = right input
+    children_.push_back(std::move(left));   // child 0 = left input
+    children_.push_back(std::move(right));  // child 1 = right input
     // Default: every build column is stored and gathered (SetLiveBuildColumns narrows this).
     const idx_t build_width = children_[BuildChildIdx()]->output_schema_->GetColumnCount();
     live_build_columns_.resize(build_width);

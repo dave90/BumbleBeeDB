@@ -48,9 +48,6 @@ class SingleFileDiskManager : public DiskManager {
   /** @return The number of successful page writes. */
   auto GetNumWrites() const -> int { return num_writes_; }
 
-  /** @return The number of page deletions. */
-  auto GetNumDeletes() const -> int { return num_deletes_; }
-
   /** @return The size of the database file in bytes, or 0 if it cannot be stat'd. */
   auto GetDbFileSize() -> size_t;
 

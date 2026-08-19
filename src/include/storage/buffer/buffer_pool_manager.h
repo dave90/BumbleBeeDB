@@ -95,7 +95,10 @@ class BufferPoolManager {
   BufferPoolManager(size_t num_frames, DiskManager *disk_manager, page_id_t initial_next_page_id = 0);
   ~BufferPoolManager();
 
-  DISALLOW_COPY_AND_MOVE(BufferPoolManager);
+  BufferPoolManager(const BufferPoolManager &) = delete;
+  auto operator=(const BufferPoolManager &) -> BufferPoolManager & = delete;
+  BufferPoolManager(BufferPoolManager &&) = delete;
+  auto operator=(BufferPoolManager &&) -> BufferPoolManager & = delete;
 
   /** @return The number of frames in the pool. */
   auto Size() const -> size_t;
@@ -171,16 +174,16 @@ class BufferPoolManager {
   std::vector<page_id_t> free_pages_;
 
   /** The pool latch: guards `page_table_`, `free_frames_`, `replacer_`, and `flushing_`. */
-  std::shared_ptr<std::mutex> latch_;
+  std::mutex latch_;
   std::vector<std::shared_ptr<FrameHeader>> frames_;
   std::unordered_map<page_id_t, frame_id_t> page_table_;
   std::list<frame_id_t> free_frames_;
-  std::shared_ptr<ArcReplacer> replacer_;
+  std::unique_ptr<ArcReplacer> replacer_;
   /** Pages with an eviction write-back in flight; a fetch of one waits on `flush_cv_`. */
   std::unordered_set<page_id_t> flushing_;
   std::condition_variable flush_cv_;
 
-  std::shared_ptr<DiskScheduler> disk_scheduler_;
+  std::unique_ptr<DiskScheduler> disk_scheduler_;
 };
 
 }  // namespace bumblebee

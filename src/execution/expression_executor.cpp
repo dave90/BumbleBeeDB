@@ -33,10 +33,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Cast `v` to `target` if its physical type differs; otherwise move it through untouched. */
-auto CastIfNeeded(Vector v, const LogicalType &target, idx_t count) -> Vector {
+static auto CastIfNeeded(Vector v, const LogicalType &target, idx_t count) -> Vector {
   if (v.GetLogicalType().GetPhysicalType() == target.GetPhysicalType()) {
     return v;
   }
@@ -48,8 +46,8 @@ auto CastIfNeeded(Vector v, const LogicalType &target, idx_t count) -> Vector {
 /** @brief Run the comparison `t` over `left`/`right`, filling `true_sel` with matching rows.
  * `sel` restricts the tested rows (nullptr = all of [0, count)); the emitted entries are original
  * row indexes, so successive comparisons can chain through their predecessors' output. */
-auto RunCompare(ComparisonType t, Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
-                SelectionVector *true_sel) -> idx_t {
+static auto RunCompare(ComparisonType t, Vector &left, Vector &right, const SelectionVector *sel, idx_t count,
+                       SelectionVector *true_sel) -> idx_t {
   switch (t) {
     case ComparisonType::Equal:
       return VectorOperations::Equals(left, right, sel, count, true_sel);
@@ -68,14 +66,14 @@ auto RunCompare(ComparisonType t, Vector &left, Vector &right, const SelectionVe
 }
 
 /** @brief Flatten an AND tree into comparison leaves. False iff any leaf is not a comparison. */
-auto CollectComparisonConjuncts(const AbstractExpression &expr, std::vector<const ComparisonExpression *> &out)
+static auto CollectComparisonConjuncts(const AbstractExpression &expr, std::vector<const ComparisonExpression *> &out)
     -> bool {
   if (const auto *cmp = dynamic_cast<const ComparisonExpression *>(&expr)) {
     out.push_back(cmp);
     return true;
   }
-  if (const auto *logic = dynamic_cast<const LogicExpression *>(&expr); logic != nullptr &&
-      logic->logic_type_ == LogicType::And) {
+  if (const auto *logic = dynamic_cast<const LogicExpression *>(&expr);
+      logic != nullptr && logic->logic_type_ == LogicType::And) {
     return CollectComparisonConjuncts(*logic->children_[0], out) &&
            CollectComparisonConjuncts(*logic->children_[1], out);
   }
@@ -83,7 +81,7 @@ auto CollectComparisonConjuncts(const AbstractExpression &expr, std::vector<cons
 }
 
 /** @brief A freshly allocated FLAT boolean (UTINYINT) vector of `count` rows set to 0/1 from `true_sel`. */
-auto BoolVectorFromSelection(const SelectionVector &true_sel, idx_t true_count, idx_t count) -> Vector {
+static auto BoolVectorFromSelection(const SelectionVector &true_sel, idx_t true_count, idx_t count) -> Vector {
   Vector result{LogicalType(LogicalTypeId::BOOLEAN)};
   auto *data = FlatVector::GetData<uint8_t>(result);
   std::memset(data, 0, count * sizeof(uint8_t));
@@ -94,7 +92,7 @@ auto BoolVectorFromSelection(const SelectionVector &true_sel, idx_t true_count, 
 }
 
 /** @brief Run the arithmetic op `t` over `left`/`right` (both already at the result type) into `result`. */
-void RunArithmetic(ArithmeticType t, Vector &left, Vector &right, Vector &result, idx_t count) {
+static void RunArithmetic(ArithmeticType t, Vector &left, Vector &right, Vector &result, idx_t count) {
   switch (t) {
     case ArithmeticType::Plus:
       VectorOperations::Sum(left, right, result, count);
@@ -120,7 +118,7 @@ void RunArithmetic(ArithmeticType t, Vector &left, Vector &right, Vector &result
  * folded to false by the comparisons that feed this) the loop is a pure bitwise combine over two
  * contiguous byte arrays; otherwise it falls back to a validity-aware per-row combine.
  */
-auto RunLogic(LogicType t, Vector &left, Vector &right, idx_t count) -> Vector {
+static auto RunLogic(LogicType t, Vector &left, Vector &right, idx_t count) -> Vector {
   left.Normalify(count);
   right.Normalify(count);
   const auto *ld = FlatVector::GetData<uint8_t>(left);
@@ -157,7 +155,7 @@ auto RunLogic(LogicType t, Vector &left, Vector &right, idx_t count) -> Vector {
 }
 
 /** @brief Apply the string transform `t` (upper/lower) per row through Value; NULLs pass through. */
-auto RunString(StringExpressionType t, Vector &arg, idx_t count) -> Vector {
+static auto RunString(StringExpressionType t, Vector &arg, idx_t count) -> Vector {
   arg.Normalify(count);
   Vector result{LogicalType(LogicalTypeId::STRING)};
 
@@ -190,7 +188,7 @@ auto RunString(StringExpressionType t, Vector &arg, idx_t count) -> Vector {
 
 /** @brief SQL LIKE match: `%` matches any run of bytes (incl. none), `_` any single byte, the rest
  * literally. Iterative with `%` backtracking — O(slen * plen) worst case, no allocation. */
-auto LikeMatch(const char *s, size_t slen, const char *p, size_t plen) -> bool {
+static auto LikeMatch(const char *s, size_t slen, const char *p, size_t plen) -> bool {
   size_t si = 0;
   size_t pi = 0;
   size_t star_pi = std::string::npos;  // last '%' position in the pattern, for backtracking
@@ -206,7 +204,7 @@ auto LikeMatch(const char *s, size_t slen, const char *p, size_t plen) -> bool {
       si++;
       pi++;
     } else if (star_pi != std::string::npos) {
-      pi = star_pi + 1;   // the last '%' absorbs one more string byte and we retry
+      pi = star_pi + 1;  // the last '%' absorbs one more string byte and we retry
       si = ++star_si;
     } else {
       return false;
@@ -221,7 +219,7 @@ auto LikeMatch(const char *s, size_t slen, const char *p, size_t plen) -> bool {
 /** @brief Evaluate `input [NOT] LIKE pattern` -> BOOLEAN. Reads both string operands through
  * Orrify so any encoding (flat, dictionary, constant, sequence) is handled by one loop; a NULL
  * operand yields false (never matches in a WHERE, mirroring how a NULL comparison selects nothing). */
-auto RunLike(bool negated, Vector &input, Vector &pattern, idx_t count) -> Vector {
+static auto RunLike(bool negated, Vector &input, Vector &pattern, idx_t count) -> Vector {
   VectorData in;
   VectorData pat;
   input.Orrify(count, in);
@@ -250,7 +248,7 @@ auto RunLike(bool negated, Vector &input, Vector &pattern, idx_t count) -> Vecto
  * sorted list can answer membership by binary search. Floats are excluded (NaN has no total order)
  * and so are the variable-length types. DATE/TIMESTAMP/DECIMAL ride along on their integer
  * representation, which the cast to the comparison's common type has already normalized. */
-auto IsBinarySearchable(PhysicalType ptype) -> bool {
+static auto IsBinarySearchable(PhysicalType ptype) -> bool {
   switch (ptype) {
     case PhysicalType::TINYINT:
     case PhysicalType::SMALLINT:
@@ -268,15 +266,15 @@ auto IsBinarySearchable(PhysicalType ptype) -> bool {
 
 /** @brief Sort the raw `count` values of type T held in `bytes`. */
 template <class T>
-void SortRawValues(std::vector<uint8_t> &bytes, idx_t count) {
+static void SortRawValues(std::vector<uint8_t> &bytes, idx_t count) {
   auto *values = reinterpret_cast<T *>(bytes.data());
   std::sort(values, values + count);
 }
 
 /** @brief `tested [NOT] IN (<sorted constants>)`, one binary search per row. */
 template <class T>
-auto ProbeSortedIn(bool negated, VectorData &tv, const uint8_t *bytes, idx_t list_count, bool list_has_null,
-                   idx_t count) -> Vector {
+static auto ProbeSortedIn(bool negated, VectorData &tv, const uint8_t *bytes, idx_t list_count, bool list_has_null,
+                          idx_t count) -> Vector {
   const auto *values = reinterpret_cast<const T *>(bytes);
   const auto *end = values + list_count;
   const auto *data = reinterpret_cast<const T *>(tv.data_);
@@ -304,7 +302,7 @@ auto ProbeSortedIn(bool negated, VectorData &tv, const uint8_t *bytes, idx_t lis
  * SQL, which folds to 0 for BOTH polarities — that is why NOT IN needs the `null_seen` tracking
  * and cannot be an outer NOT over the IN result.
  */
-auto RunIn(bool negated, Vector &tested, std::vector<Vector> &list, idx_t count) -> Vector {
+static auto RunIn(bool negated, Vector &tested, std::vector<Vector> &list, idx_t count) -> Vector {
   VectorData tv;
   tested.Orrify(count, tv);
 
@@ -342,8 +340,6 @@ auto RunIn(bool negated, Vector &tested, std::vector<Vector> &list, idx_t count)
   }
   return result;
 }
-
-}  // namespace
 
 auto ExpressionExecutor::Evaluate(const AbstractExpression &expr, DataChunk &input, idx_t count) -> Vector {
   // Column reference: zero-copy view onto the input column.

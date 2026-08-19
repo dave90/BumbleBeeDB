@@ -60,6 +60,23 @@ class Schema {
   auto GetColumns() const -> const std::vector<Column> & { return columns_; }
 
   /**
+   * @brief The column types, in schema order.
+   *
+   * This is the shape every DataChunk-producing operator needs to size its output, so it is
+   * built here rather than re-derived per operator.
+   *
+   * @return std::vector<LogicalType> One entry per column.
+   */
+  [[nodiscard]] auto GetTypes() const -> std::vector<LogicalType> {
+    std::vector<LogicalType> types;
+    types.reserve(columns_.size());
+    for (const auto &col : columns_) {
+      types.push_back(col.GetType());
+    }
+    return types;
+  }
+
+  /**
    * @brief Get the column at `col_idx`.
    *
    * @param col_idx The column index.
@@ -86,7 +103,7 @@ class Schema {
    * @param col_name The column name.
    * @return std::optional<uint32_t> The index, or nullopt.
    */
-  auto TryGetColIdx(const std::string &col_name) const -> std::optional<uint32_t> {
+  [[nodiscard]] auto TryGetColIdx(const std::string &col_name) const -> std::optional<uint32_t> {
     for (uint32_t i = 0; i < columns_.size(); ++i) {
       if (columns_[i].GetName() == col_name) {
         return std::optional{i};
@@ -94,9 +111,6 @@ class Schema {
     }
     return std::nullopt;
   }
-
-  /** @return The indices of the columns whose payloads live outside the row. */
-  auto GetUnlinedColumns() const -> const std::vector<uint32_t> & { return uninlined_columns_; }
 
   /** @return The number of columns. */
   auto GetColumnCount() const -> uint32_t { return static_cast<uint32_t>(columns_.size()); }
@@ -144,8 +158,7 @@ struct fmt::formatter<T, std::enable_if_t<std::is_base_of<bumblebee::Schema, T>:
 };
 
 template <typename T>
-struct fmt::formatter<std::shared_ptr<T>,
-                      std::enable_if_t<std::is_base_of<bumblebee::Schema, T>::value, char>>
+struct fmt::formatter<std::shared_ptr<T>, std::enable_if_t<std::is_base_of<bumblebee::Schema, T>::value, char>>
     : fmt::formatter<std::string> {
   template <typename FormatCtx>
   auto format(const std::shared_ptr<T> &x, FormatCtx &ctx) const {

@@ -24,19 +24,6 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  types.reserve(schema.GetColumnCount());
-  for (const auto &col : schema.GetColumns()) {
-    types.push_back(col.GetType());
-  }
-  return types;
-}
-
-}  // namespace
-
 struct TopNGlobalSinkState : GlobalSinkState {
   std::mutex mu_;
   std::unique_ptr<TopNHeap> heap_;
@@ -60,7 +47,7 @@ auto PhysicalTopN::MakeHeap() const -> std::unique_ptr<TopNHeap> {
   for (const auto &ob : order_bys_) {
     key_types.push_back(std::get<2>(ob)->GetReturnType().GetType());
   }
-  return std::make_unique<TopNHeap>(TypesOf(*output_schema_), key_types, modifiers_, n_);
+  return std::make_unique<TopNHeap>(output_schema_->GetTypes(), key_types, modifiers_, n_);
 }
 
 auto PhysicalTopN::GetGlobalSinkState(ClientContext & /*context*/) const -> std::unique_ptr<GlobalSinkState> {

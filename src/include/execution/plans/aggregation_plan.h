@@ -25,7 +25,14 @@
 namespace bumblebee {
 
 /** The supported aggregate functions. */
-enum class AggregationType { CountStarAggregate, CountAggregate, SumAggregate, MinAggregate, MaxAggregate, AvgAggregate };
+enum class AggregationType {
+  CountStarAggregate,
+  CountAggregate,
+  SumAggregate,
+  MinAggregate,
+  MaxAggregate,
+  AvgAggregate
+};
 
 }  // namespace bumblebee
 
@@ -81,8 +88,7 @@ class AggregationPlanNode : public AbstractPlanNode {
    * @param aggregates The expressions being aggregated, one per aggregate.
    * @param agg_types The aggregate function for each of `aggregates`.
    */
-  AggregationPlanNode(SchemaRef output_schema, AbstractPlanNodeRef child,
-                      std::vector<AbstractExpressionRef> group_bys,
+  AggregationPlanNode(SchemaRef output_schema, AbstractPlanNodeRef child, std::vector<AbstractExpressionRef> group_bys,
                       std::vector<AbstractExpressionRef> aggregates, std::vector<AggregationType> agg_types)
       : AbstractPlanNode(std::move(output_schema), {std::move(child)}),
         group_bys_(std::move(group_bys)),
@@ -102,9 +108,6 @@ class AggregationPlanNode : public AbstractPlanNode {
 
   /** @return The group-by expressions. */
   auto GetGroupBys() const -> const std::vector<AbstractExpressionRef> & { return group_bys_; }
-
-  /** @return The aggregated expression at `idx`. */
-  auto GetAggregateAt(uint32_t idx) const -> const AbstractExpressionRef & { return aggregates_[idx]; }
 
   /** @return The aggregated expressions. */
   auto GetAggregates() const -> const std::vector<AbstractExpressionRef> & { return aggregates_; }

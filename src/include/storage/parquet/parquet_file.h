@@ -93,7 +93,7 @@ class BufferedSerializer : public Serializer {
   static constexpr idx_t INITIAL_SIZE = 1024;
 
   explicit BufferedSerializer(idx_t maximum_size = INITIAL_SIZE) : maximum_size_(maximum_size) {
-    blob_.data_ = std::unique_ptr<data_t[]>(new data_t[maximum_size]);
+    blob_.data_ = std::make_unique_for_overwrite<data_t[]>(maximum_size);
     blob_.size_ = 0;
     data_ = blob_.data_.get();
   }

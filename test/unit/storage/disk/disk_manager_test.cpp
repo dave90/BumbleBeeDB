@@ -23,15 +23,11 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TempDbPath(const std::string &name) -> std::filesystem::path {
+static auto TempDbPath(const std::string &name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() / name;
 }
 
-void FillPage(data_ptr_t buf, data_t value) { std::memset(buf, value, PAGE_SIZE); }
-
-}  // namespace
+static void FillPage(data_ptr_t buf, data_t value) { std::memset(buf, value, PAGE_SIZE); }
 
 TEST(SingleFileDiskManagerTest, WriteThenReadRoundTrips) {
   auto path = TempDbPath("bbdb_dm_roundtrip.db");

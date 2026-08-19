@@ -205,10 +205,6 @@ class Vector {
    */
   void Sequence(int64_t start, int64_t offset, int64_t stride, int64_t end);
 
-  /** @brief DEBUG-only consistency check. */
-  void Verify(idx_t count);
-  void Verify(const SelectionVector &sel, idx_t count);
-
   // -- Value access ---------------------------------------------------------
 
   /** @return The value of row `index`, carrying this vector's LogicalType. */
@@ -257,9 +253,6 @@ class Vector {
 
   /** @return The raw data. Meaningless for the sequence encodings. */
   auto GetData() -> data_ptr_t { return data_; }
-
-  /** @return The auxiliary manager: the string heap, or the child of a dictionary. */
-  auto GetAuxiliary() -> vector_data_mngr_ptr_t { return aux_data_mngr_; }
 
   /** @return The manager owning the data. */
   auto GetDataMngr() -> vector_data_mngr_ptr_t { return data_mngr_; }
@@ -391,16 +384,16 @@ class ArrayDataMngr : public VectorDataMngr {
 /** Accessors for a CONSTANT_VECTOR: a single value, logically repeated. */
 struct ConstantVector {
   static auto GetData(const Vector &vector) -> const_data_ptr_t {
-    BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::CONSTANT_VECTOR ||
-                         vector.GetVectorType() == VectorType::FLAT_VECTOR,
-                     "ConstantVector::GetData on a non constant/flat vector");
+    BUMBLEBEE_ASSERT(
+        vector.GetVectorType() == VectorType::CONSTANT_VECTOR || vector.GetVectorType() == VectorType::FLAT_VECTOR,
+        "ConstantVector::GetData on a non constant/flat vector");
     return vector.data_;
   }
 
   static auto GetData(Vector &vector) -> data_ptr_t {
-    BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::CONSTANT_VECTOR ||
-                         vector.GetVectorType() == VectorType::FLAT_VECTOR,
-                     "ConstantVector::GetData on a non constant/flat vector");
+    BUMBLEBEE_ASSERT(
+        vector.GetVectorType() == VectorType::CONSTANT_VECTOR || vector.GetVectorType() == VectorType::FLAT_VECTOR,
+        "ConstantVector::GetData on a non constant/flat vector");
     return vector.data_;
   }
 
@@ -486,15 +479,13 @@ struct FlatVector {
   }
 
   static void SetData(Vector &vector, data_ptr_t data) {
-    BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR,
-                     "FlatVector::SetData on a non flat vector");
+    BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR, "FlatVector::SetData on a non flat vector");
     vector.data_ = data;
   }
 
   template <class T>
   static auto GetValue(Vector &vector, idx_t idx) -> T {
-    BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR,
-                     "FlatVector::GetValue on a non flat vector");
+    BUMBLEBEE_ASSERT(vector.GetVectorType() == VectorType::FLAT_VECTOR, "FlatVector::GetValue on a non flat vector");
     return FlatVector::GetData<T>(vector)[idx];
   }
 

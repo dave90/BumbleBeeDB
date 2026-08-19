@@ -31,10 +31,9 @@ class QueryMemoryManager {
  public:
   void SetBudget(idx_t budget) { budget_ = budget; }
   auto Budget() const -> idx_t { return budget_; }
-  auto Used() const -> idx_t { return used_.load(std::memory_order_relaxed); }
 
   /** @brief Reserve `bytes` if that keeps us within budget; returns false (reserving nothing) if not. */
-  auto TryReserve(idx_t bytes) -> bool {
+  [[nodiscard]] auto TryReserve(idx_t bytes) -> bool {
     idx_t cur = used_.load(std::memory_order_relaxed);
     do {
       if (cur + bytes > budget_) {

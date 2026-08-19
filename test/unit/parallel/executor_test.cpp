@@ -28,13 +28,9 @@
 
 namespace bumblebee {
 
-namespace {
-
 const LogicalType kInt(LogicalTypeId::INTEGER);
 
-auto OneIntSchema() -> SchemaRef {
-  return std::make_shared<Schema>(std::vector<Column>{Column("v", kInt)});
-}
+static auto OneIntSchema() -> SchemaRef { return std::make_shared<Schema>(std::vector<Column>{Column("v", kInt)}); }
 
 /** @brief A source that emits `values` split into chunks of `chunk_size`, then FINISHED. */
 class MockScan : public PhysicalOperator {
@@ -56,8 +52,8 @@ class MockScan : public PhysicalOperator {
     return std::make_unique<LocalState>();
   }
 
-  auto GetData(ExecutionContext & /*ctx*/, DataChunk &output, GlobalSourceState & /*g*/,
-               LocalSourceState &lstate) const -> SourceResultType override {
+  auto GetData(ExecutionContext & /*ctx*/, DataChunk &output, GlobalSourceState & /*g*/, LocalSourceState &lstate) const
+      -> SourceResultType override {
     auto &ls = static_cast<LocalState &>(lstate);
     if (ls.cursor_ >= values_.size()) {
       return SourceResultType::FINISHED;
@@ -187,8 +183,8 @@ class MockBreaker : public PhysicalOperator {
   auto GetLocalSinkState(ExecutionContext & /*ctx*/) const -> std::unique_ptr<LocalSinkState> override {
     return std::make_unique<LocalSinkState>();
   }
-  auto Sink(ExecutionContext & /*ctx*/, DataChunk & /*input*/, GlobalSinkState & /*g*/,
-            LocalSinkState & /*l*/) const -> SinkResultType override {
+  auto Sink(ExecutionContext & /*ctx*/, DataChunk & /*input*/, GlobalSinkState & /*g*/, LocalSinkState & /*l*/) const
+      -> SinkResultType override {
     return SinkResultType::NEED_MORE_INPUT;
   }
   auto GetData(ExecutionContext & /*ctx*/, DataChunk & /*output*/, GlobalSourceState & /*g*/,
@@ -208,8 +204,6 @@ struct Harness {
   TransactionManager txn_mgr{catalog.get()};
   ClientContext client{*catalog, txn_mgr};
 };
-
-}  // namespace
 
 TEST(ExecutorTest, SourceToSinkCollectsEveryRow) {
   Harness h;

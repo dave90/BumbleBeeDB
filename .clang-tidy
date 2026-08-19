@@ -1,0 +1,76 @@
+# clang-tidy configuration for BumbleBeeDB.
+#
+# Selection principle: enable what the codebase already satisfies, so the check starts GREEN and
+# any red is a real regression. Every disabled check below records why. Re-enabling one is a
+# deliberate piece of work, not a config tweak — several are tied to workstreams in refactor.md.
+#
+# NOTE: run this on Linux/CI. Homebrew's clang-tidy cannot parse Apple's SDK headers
+# (`missing '(' after '__has_feature'`), which is a toolchain mismatch, not a code problem.
+
+Checks: >
+  bugprone-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  google-explicit-constructor,
+  -bugprone-easily-swappable-parameters,
+  -readability-identifier-length,
+  -readability-convert-member-functions-to-static,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-braces-around-statements,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -modernize-use-nodiscard
+
+# Why each check above is off:
+#
+#   bugprone-easily-swappable-parameters
+#       29 hits in the sample. The vector kernels legitimately take runs of same-typed arguments
+#       (count / offset / col_no / cnt_off / val_off). Silencing it needs wrapper types on the
+#       hottest paths in the engine. Tracked as S1 in refactor.md — re-enable after that lands.
+#
+#   readability-identifier-length
+#       46 hits. `i`, `a`, `n`, `p` are the idiom in the vectorized loops and are clearer there
+#       than long names. Not worth churning the hot code for.
+#
+#   readability-convert-member-functions-to-static
+#       51 hits. Turning member functions into statics changes the public API surface, which the
+#       refactoring brief freezes.
+#
+#   readability-magic-numbers
+#       Concentrated in page geometry and date/time tables where the literal IS the specification.
+#       A constant-extraction pass is a separate, deliberate change.
+#
+#   readability-function-cognitive-complexity
+#       Duplicates W3 (splitting the 13 functions over 100 lines). Enable once W3 is done, so it
+#       becomes a ratchet instead of a wall of pre-existing noise.
+#
+#   readability-braces-around-statements
+#       The codebase already braces consistently; the check also fires on single-line lambdas and
+#       `if constexpr` chains where it hurts readability.
+#
+#   modernize-use-trailing-return-type
+#       DEVELOP.MD mandates trailing return types and **every non-lambda function already
+#       complies** — verified: all 11 sample hits were lambdas, where `[&](const X &x) { ... }` is
+#       the clearer form. The check cannot exclude lambdas, so it is off; the convention itself is
+#       upheld in review and by the surrounding code.
+#
+#   modernize-avoid-c-arrays
+#       The date lookup tables and on-disk page layouts use C arrays deliberately for control over
+#       storage layout. std::array would change nothing but the spelling.
+#
+#   modernize-use-nodiscard
+#       Applying [[nodiscard]] belongs in W5, targeted at observers and Try* functions, not applied
+#       blanket-wide by a tool.
+
+# Only diagnose our own headers, never third_party/ or the SDK.
+HeaderFilterRegex: '.*/src/include/.*'
+
+# Start advisory. Flip to a non-empty list (or '*') once CI confirms a clean baseline on the
+# Linux toolchain — see refactor.md W1.
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key: readability-implicit-bool-conversion.AllowPointerConditions
+    value: 'true'

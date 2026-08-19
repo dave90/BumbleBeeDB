@@ -29,19 +29,6 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  types.reserve(schema.GetColumnCount());
-  for (const auto &col : schema.GetColumns()) {
-    types.push_back(col.GetType());
-  }
-  return types;
-}
-
-}  // namespace
-
 struct SortGlobalSinkState : GlobalSinkState {
   std::mutex mu_;
   ChunkCollection data_;         // the unsorted input; dropped once `sorted_data_` is built
@@ -123,7 +110,7 @@ auto PhysicalSort::Finalize(ClientContext & /*context*/, GlobalSinkState &gstate
                    [](const SortEntry &a, const SortEntry &b) { return a.key_ < b.key_; });
 
   // Materialize the sorted order once, one vectorized gather per output chunk.
-  const auto types = TypesOf(*output_schema_);
+  const auto types = output_schema_->GetTypes();
   for (idx_t pos = 0; pos < n; pos += STANDARD_VECTOR_SIZE) {
     const idx_t count = std::min<idx_t>(STANDARD_VECTOR_SIZE, n - pos);
     auto out = std::make_unique<DataChunk>();

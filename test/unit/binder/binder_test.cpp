@@ -27,16 +27,14 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Bind `query` against the standard test catalog. */
-auto Bind(const std::string &query) -> std::vector<std::unique_ptr<BoundStatement>> {
+static auto Bind(const std::string &query) -> std::vector<std::unique_ptr<BoundStatement>> {
   auto catalog = MakeTestCatalog();
   return TryBind(*catalog, query);
 }
 
 /** @brief Bind `query` and assert it produced exactly one statement of type `type`. Returns its ToString(). */
-auto BindOne(const std::string &query, StatementType type) -> std::string {
+static auto BindOne(const std::string &query, StatementType type) -> std::string {
   auto statements = Bind(query);
   EXPECT_EQ(statements.size(), 1U) << query;
   EXPECT_EQ(statements[0]->type_, type) << query;
@@ -44,14 +42,12 @@ auto BindOne(const std::string &query, StatementType type) -> std::string {
 }
 
 /** @brief gtest predicate: does `haystack` contain `needle`? */
-auto Contains(const std::string &haystack, const std::string &needle) -> testing::AssertionResult {
+static auto Contains(const std::string &haystack, const std::string &needle) -> testing::AssertionResult {
   if (StringUtil::Contains(haystack, needle)) {
     return testing::AssertionSuccess();
   }
   return testing::AssertionFailure() << "expected to find `" << needle << "` in:\n" << haystack;
 }
-
-}  // namespace
 
 // ===--------------------------------------------------------------------=== //
 // SELECT
@@ -188,8 +184,8 @@ TEST(BinderTest, BindLeftJoin) {
 }
 
 TEST(BinderTest, BindThreeWayJoin) {
-  auto out = BindOne("select * from a inner join b on a.x = b.x inner join y on a.x = y.x",
-                     StatementType::SELECT_STATEMENT);
+  auto out =
+      BindOne("select * from a inner join b on a.x = b.x inner join y on a.x = y.x", StatementType::SELECT_STATEMENT);
   // A left-deep tree: (a join b) join y.
   EXPECT_TRUE(Contains(out, "BoundJoin"));
   EXPECT_TRUE(Contains(out, "condition=(a.x=b.x)"));
@@ -379,8 +375,8 @@ TEST(BinderTest, BindExplain) {
   const auto &explain = dynamic_cast<const ExplainStatement &>(*statements[0]);
   EXPECT_EQ(explain.statement_->type_, StatementType::SELECT_STATEMENT);
   // With no options given, EXPLAIN prints every stage.
-  EXPECT_EQ(explain.options_, ExplainOptions::BINDER | ExplainOptions::PLANNER | ExplainOptions::OPTIMIZER |
-                                  ExplainOptions::SCHEMA);
+  EXPECT_EQ(explain.options_,
+            ExplainOptions::BINDER | ExplainOptions::PLANNER | ExplainOptions::OPTIMIZER | ExplainOptions::SCHEMA);
   EXPECT_TRUE(Contains(explain.ToString(), "BoundExplain"));
   EXPECT_TRUE(Contains(explain.ToString(), "BoundSelect"));
 }
@@ -422,15 +418,11 @@ TEST(BinderTest, AmbiguousColumnInJoin) {
   EXPECT_THROW(Bind("select x from a inner join b on a.x = b.x"), BinderException);
 }
 
-TEST(BinderTest, InsertIntoUnknownTable) {
-  EXPECT_THROW(Bind("insert into nonexistent values (1)"), BinderException);
-}
+TEST(BinderTest, InsertIntoUnknownTable) { EXPECT_THROW(Bind("insert into nonexistent values (1)"), BinderException); }
 
 TEST(BinderTest, DeleteFromUnknownTable) { EXPECT_THROW(Bind("delete from nonexistent"), BinderException); }
 
-TEST(BinderTest, SelectStarWithOtherExpressions) {
-  EXPECT_THROW(Bind("select *, x from y"), BinderException);
-}
+TEST(BinderTest, SelectStarWithOtherExpressions) { EXPECT_THROW(Bind("select *, x from y"), BinderException); }
 
 TEST(BinderTest, SyntaxError) { EXPECT_THROW(Bind("select from from"), ParserException); }
 

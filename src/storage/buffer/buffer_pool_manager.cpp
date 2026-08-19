@@ -45,9 +45,8 @@ void FrameHeader::Reset() {
 BufferPoolManager::BufferPoolManager(size_t num_frames, DiskManager *disk_manager, page_id_t initial_next_page_id)
     : num_frames_(num_frames),
       next_page_id_(initial_next_page_id),
-      latch_(std::make_shared<std::mutex>()),
-      replacer_(std::make_shared<ArcReplacer>(num_frames)),
-      disk_scheduler_(std::make_shared<DiskScheduler>(disk_manager)) {
+      replacer_(std::make_unique<ArcReplacer>(num_frames)),
+      disk_scheduler_(std::make_unique<DiskScheduler>(disk_manager)) {
   frames_.reserve(num_frames);
   page_table_.reserve(num_frames);
   for (size_t i = 0; i < num_frames; i++) {
@@ -84,7 +83,7 @@ void BufferPoolManager::SetFreePages(std::vector<page_id_t> free_pages) {
 
 auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
   {
-    std::lock_guard lk(*latch_);
+    std::lock_guard lk(latch_);
     auto it = page_table_.find(page_id);
     if (it != page_table_.end()) {
       auto frame_id = it->second;
@@ -163,7 +162,7 @@ auto BufferPoolManager::CheckedPage(page_id_t page_id, AccessType access_type) -
     std::optional<std::future<bool>> future = std::nullopt;
     std::shared_ptr<FrameHeader> frame;
     {
-      std::unique_lock<std::mutex> lk(*latch_);
+      std::unique_lock<std::mutex> lk(latch_);
       // If this page is being flushed out of the pool, wait until that finishes, then fetch it fresh.
       flush_cv_.wait(lk, [&] { return flushing_.find(page_id) == flushing_.end(); });
 
@@ -210,7 +209,7 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   if (frame == nullptr) {
     return std::nullopt;
   }
-  return WritePageGuard(page_id, frame, replacer_, latch_, disk_scheduler_);
+  return WritePageGuard(page_id, frame, replacer_.get(), &latch_, disk_scheduler_.get());
 }
 
 auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_type) -> std::optional<ReadPageGuard> {
@@ -218,7 +217,7 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
   if (frame == nullptr) {
     return std::nullopt;
   }
-  return ReadPageGuard(page_id, frame, replacer_, latch_, disk_scheduler_);
+  return ReadPageGuard(page_id, frame, replacer_.get(), &latch_, disk_scheduler_.get());
 }
 
 auto BufferPoolManager::WritePage(page_id_t page_id, AccessType access_type) -> WritePageGuard {
@@ -242,7 +241,7 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
 auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
   std::shared_ptr<FrameHeader> frame;
   {
-    std::lock_guard lk(*latch_);
+    std::lock_guard lk(latch_);
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {
       return false;
@@ -268,7 +267,7 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
   auto pin = frame->pin_count_.fetch_sub(1);
   BUMBLEBEE_ASSERT(pin > 0, "Pin underflow");
   if (pin == 1) {
-    std::lock_guard lk(*latch_);
+    std::lock_guard lk(latch_);
     if (frame->pin_count_ == 0) {
       replacer_->SetEvictable(frame->frame_id_, true);
     }
@@ -278,7 +277,7 @@ auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
 
 auto BufferPoolManager::GetAllPages() -> std::vector<page_id_t> {
   std::vector<page_id_t> pages;
-  std::lock_guard lk(*latch_);
+  std::lock_guard lk(latch_);
   pages.reserve(page_table_.size());
   for (auto &[pid, _] : page_table_) {
     pages.push_back(pid);
@@ -293,7 +292,7 @@ void BufferPoolManager::FlushAllPages() {
 }
 
 auto BufferPoolManager::GetPinCount(page_id_t page_id) -> std::optional<size_t> {
-  std::lock_guard lk(*latch_);
+  std::lock_guard lk(latch_);
   auto it = page_table_.find(page_id);
   if (it == page_table_.end()) {
     return std::nullopt;

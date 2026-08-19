@@ -30,31 +30,21 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TempDbPath(const std::string &name) -> std::filesystem::path {
+static auto TempDbPath(const std::string &name) -> std::filesystem::path {
   return std::filesystem::temp_directory_path() / name;
 }
 
-auto TwoColSchema() -> Schema {
+static auto TwoColSchema() -> Schema {
   return Schema{std::vector<Column>{
       Column("id", LogicalType(LogicalTypeId::INTEGER)),
       Column("name", LogicalType(LogicalTypeId::STRING), 128),
   }};
 }
 
-auto TypesOf(const Schema &s) -> std::vector<LogicalType> {
-  std::vector<LogicalType> t;
-  for (const auto &c : s.GetColumns()) {
-    t.push_back(c.GetType());
-  }
-  return t;
-}
-
-void AppendRows(TableStorage &storage, const Schema &schema,
-                const std::vector<std::pair<int32_t, std::string>> &rows) {
+static void AppendRows(TableStorage &storage, const Schema &schema,
+                       const std::vector<std::pair<int32_t, std::string>> &rows) {
   DataChunk chunk;
-  chunk.Initialize(TypesOf(schema));
+  chunk.Initialize(schema.GetTypes());
   for (idx_t i = 0; i < rows.size(); i++) {
     chunk.SetValue(0, i, Value(rows[i].first));
     chunk.SetValue(1, i, Value(rows[i].second));
@@ -64,10 +54,10 @@ void AppendRows(TableStorage &storage, const Schema &schema,
   storage.Append(chunk, rids);
 }
 
-auto ScanAll(TableStorage &storage, const Schema &schema) -> std::vector<std::pair<int32_t, std::string>> {
+static auto ScanAll(TableStorage &storage, const Schema &schema) -> std::vector<std::pair<int32_t, std::string>> {
   auto scan = storage.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(schema));
+  out.Initialize(schema.GetTypes());
   std::vector<std::pair<int32_t, std::string>> rows;
   while (scan->Next(out)) {
     for (idx_t i = 0; i < out.GetSize(); i++) {
@@ -76,8 +66,6 @@ auto ScanAll(TableStorage &storage, const Schema &schema) -> std::vector<std::pa
   }
   return rows;
 }
-
-}  // namespace
 
 // Tables, schemas, and rows written by one Database instance are recovered by a fresh instance on the
 // same file — the core durability proof.
@@ -141,8 +129,8 @@ TEST(PersistenceTest, FreeListSurvivesRestart) {
   page_id_t freed = INVALID_PAGE_ID;
   {
     Database db(path, 32);
-    freed = db.GetBufferPool().NewPage();   // a scratch page
-    db.GetBufferPool().DeletePage(freed);   // reclaim it
+    freed = db.GetBufferPool().NewPage();  // a scratch page
+    db.GetBufferPool().DeletePage(freed);  // reclaim it
     db.Close();
   }
   {
@@ -166,7 +154,7 @@ TEST(PersistenceTest, IndexSurvivesRestartAndIsFunctional) {
     auto ti = db.GetCatalog().CreateTable("t", TwoColSchema());
     // Insert ids 0..9 and capture their RIDs, then build an index on column 0.
     DataChunk chunk;
-    chunk.Initialize(TypesOf(ti->schema_));
+    chunk.Initialize(ti->schema_.GetTypes());
     for (int i = 0; i < 10; i++) {
       chunk.SetValue(0, i, Value(i));
       chunk.SetValue(1, i, Value(std::string("n") + std::to_string(i)));
@@ -297,7 +285,7 @@ TEST(PersistenceTest, CommittedRowsVisibleThroughMvccScanAfterRestart) {
 
   auto one_row = [](const Schema &schema, int32_t id, const std::string &name) {
     DataChunk chunk;
-    chunk.Initialize(TypesOf(schema));
+    chunk.Initialize(schema.GetTypes());
     chunk.SetValue(0, 0, Value(id));
     chunk.SetValue(1, 0, Value(name));
     chunk.SetCardinality(1);
@@ -330,7 +318,7 @@ TEST(PersistenceTest, CommittedRowsVisibleThroughMvccScanAfterRestart) {
     auto *reader = tm.Begin();  // read_ts must be restored to >= the persisted rows' commit ts
     auto scan = heap.MakeMvccScan(&tm, reader, ti->oid_, {});
     DataChunk out;
-    out.Initialize(TypesOf(ti->schema_));
+    out.Initialize(ti->schema_.GetTypes());
     std::vector<std::pair<int32_t, std::string>> rows;
     while (scan->Next(out)) {
       for (idx_t i = 0; i < out.GetSize(); i++) {
@@ -357,7 +345,7 @@ TEST(PersistenceTest, OpenTransactionAbortedOnClose) {
 
   auto one_row = [](const Schema &schema, int32_t id, const std::string &name) {
     DataChunk chunk;
-    chunk.Initialize(TypesOf(schema));
+    chunk.Initialize(schema.GetTypes());
     chunk.SetValue(0, 0, Value(id));
     chunk.SetValue(1, 0, Value(name));
     chunk.SetCardinality(1);

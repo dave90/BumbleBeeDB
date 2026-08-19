@@ -12,6 +12,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
+
 #include "storage/parquet/templated_column_reader.h"
 
 namespace bumblebee {
@@ -48,8 +51,12 @@ struct DecimalParquetValueConversion {
   }
 
   static auto DictRead(ByteBuffer &dict, uint32_t &offset, ColumnReader &reader) -> PHYSICAL_TYPE {
-    auto *dict_ptr = reinterpret_cast<PHYSICAL_TYPE *>(dict.ptr_);
-    return dict_ptr[offset];
+    // memcpy rather than a reinterpret_cast dereference: the dictionary page is a byte buffer with
+    // no alignment guarantee, and loading a PHYSICAL_TYPE straight out of it is undefined. On the
+    // architectures we target this lowers to the same load.
+    PHYSICAL_TYPE value;
+    std::memcpy(&value, dict.ptr_ + (static_cast<idx_t>(offset) * sizeof(PHYSICAL_TYPE)), sizeof(PHYSICAL_TYPE));
+    return value;
   }
 
   static auto PlainRead(ByteBuffer &plain_data, ColumnReader &reader) -> PHYSICAL_TYPE {
@@ -60,9 +67,18 @@ struct DecimalParquetValueConversion {
     plain_data.Available(byte_len);
     if (plain_read) {
       // INT32/INT64 storage: the value is already little-endian two's complement.
-      auto *direct = reinterpret_cast<PHYSICAL_TYPE *>(plain_data.ptr_);
+      //
+      // memcpy rather than a reinterpret_cast dereference — the page buffer carries no alignment
+      // guarantee, so the direct load was undefined (UBSan flags it). Copying `byte_len` rather
+      // than `sizeof(PHYSICAL_TYPE)` also keeps the read inside the bound `Available(byte_len)`
+      // just checked: PHYSICAL_TYPE comes from the DECIMAL's *declared* width while `byte_len`
+      // comes from the *file's* schema type, so the two can differ, and the old direct load of a
+      // BIGINT-declared decimal stored as parquet INT32 read four bytes past the checked bound.
+      // Where the widths agree — every case the corpus exercises — this is bit-identical.
+      PHYSICAL_TYPE direct = 0;
+      std::memcpy(&direct, plain_data.ptr_, std::min<idx_t>(byte_len, sizeof(PHYSICAL_TYPE)));
       plain_data.Inc(byte_len);
-      return *direct;
+      return direct;
     }
     auto *res_ptr = reinterpret_cast<uint8_t *>(&res);
 

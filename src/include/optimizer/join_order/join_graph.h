@@ -52,8 +52,8 @@ struct RelationSet {
 struct JoinRelation {
   idx_t id_{0};
   double cardinality_{1};
-  AbstractPlanNodeRef plan_;    // the leaf subplan (may be null in isolated unit tests)
-  idx_t base_col_offset_{0};    // this relation's first column in the region's flat schema
+  AbstractPlanNodeRef plan_;  // the leaf subplan (may be null in isolated unit tests)
+  idx_t base_col_offset_{0};  // this relation's first column in the region's flat schema
   idx_t col_count_{0};
 };
 
@@ -63,7 +63,7 @@ struct JoinRelation {
  * tables) are edges too — that is what lets the search consider joining them.
  */
 struct JoinEdge {
-  RelationSet relations_;         // every base relation this predicate references
+  RelationSet relations_;  // every base relation this predicate references
   AbstractExpressionRef predicate_;
   bool is_equi_{false};
   /** For an equi edge: the join key's distinct-value count, approximated as the smallest row count
@@ -93,7 +93,7 @@ class JoinGraph {
   }
 
   auto Relations() const -> const std::vector<JoinRelation> & { return relations_; }
-  auto Edges() const -> const std::vector<JoinEdge> & { return edges_; }
+
   auto RelationCount() const -> idx_t { return relations_.size(); }
 
   /** @return Every edge that first becomes evaluable at the join of `a` and `b`. */

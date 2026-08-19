@@ -171,6 +171,39 @@ void Planner::AddAggCallToContext(BoundExpression &expr) {
   throw PlannerException(fmt::format("the expression type {} cannot be planned", expr.type_));
 }
 
+auto Planner::PlanScalarSubqueryExpression(const BoundSubqueryExpr &subquery_expr) -> AbstractExpressionRef {
+  // A correlated scalar that decorrelation already turned into a join reads its value straight
+  // from the join output.
+  if (auto it = resolved_subqueries_.find(&subquery_expr); it != resolved_subqueries_.end()) {
+    return it->second;
+  }
+  // IN/EXISTS subqueries plan as SEMI/ANTI joins, which only PlanSelect's WHERE handling can
+  // build — reaching this point means the subquery sits somewhere a join cannot express.
+  if (subquery_expr.kind_ != SubqueryKind::SCALAR) {
+    throw NotImplementedException("an IN/EXISTS subquery is only supported as a top-level WHERE conjunct");
+  }
+  if (subquery_expr.correlated_) {
+    throw NotImplementedException("a correlated scalar subquery is only supported inside a WHERE comparison");
+  }
+  // A fresh planner: the subquery's aggregates/CTEs live in their own scope. The eval hook
+  // propagates so a subquery nested inside this one pre-executes the same way.
+  Planner sub_planner(catalog_);
+  sub_planner.subquery_eval_ = subquery_eval_;
+  sub_planner.PlanQuery(*subquery_expr.subquery_);
+  auto subplan = sub_planner.plan_;
+  const auto &schema = subplan->OutputSchema();
+  if (schema.GetColumnCount() != 1) {
+    throw PlannerException("scalar subquery must return exactly one column");
+  }
+  const auto result_type = schema.GetColumn(0).GetType();
+  if (subquery_eval_) {
+    // Execution path: run the subquery now and substitute its single value as a constant.
+    return std::make_shared<ConstantValueExpression>(subquery_eval_(subplan));
+  }
+  // EXPLAIN path: nothing may run, so keep the planned subquery behind a placeholder.
+  return std::make_shared<SubqueryExpression>(subplan, Column::Make("<subquery>", result_type));
+}
+
 auto Planner::PlanExpression(const BoundExpression &expr, const std::vector<AbstractPlanNodeRef> &children)
     -> std::tuple<std::string, AbstractExpressionRef> {
   switch (expr.type_) {
@@ -216,43 +249,9 @@ auto Planner::PlanExpression(const BoundExpression &expr, const std::vector<Abst
       return std::make_tuple(UNNAMED_COLUMN,
                              std::make_shared<InExpression>(std::move(in_children), in_expr.negated_));
     }
-    case ExpressionType::SUBQUERY: {
-      const auto &subquery_expr = dynamic_cast<const BoundSubqueryExpr &>(expr);
-      // A correlated scalar that decorrelation already turned into a join reads its value straight
-      // from the join output.
-      if (auto it = resolved_subqueries_.find(&expr); it != resolved_subqueries_.end()) {
-        return std::make_tuple(UNNAMED_COLUMN, it->second);
-      }
-      // IN/EXISTS subqueries plan as SEMI/ANTI joins, which only PlanSelect's WHERE handling can
-      // build — reaching this point means the subquery sits somewhere a join cannot express.
-      if (subquery_expr.kind_ != SubqueryKind::SCALAR) {
-        throw NotImplementedException(
-            "an IN/EXISTS subquery is only supported as a top-level WHERE conjunct");
-      }
-      if (subquery_expr.correlated_) {
-        throw NotImplementedException(
-            "a correlated scalar subquery is only supported inside a WHERE comparison");
-      }
-      // A fresh planner: the subquery's aggregates/CTEs live in their own scope. The eval hook
-      // propagates so a subquery nested inside this one pre-executes the same way.
-      Planner sub_planner(catalog_);
-      sub_planner.subquery_eval_ = subquery_eval_;
-      sub_planner.PlanQuery(*subquery_expr.subquery_);
-      auto subplan = sub_planner.plan_;
-      const auto &schema = subplan->OutputSchema();
-      if (schema.GetColumnCount() != 1) {
-        throw PlannerException("scalar subquery must return exactly one column");
-      }
-      const auto result_type = schema.GetColumn(0).GetType();
-      if (subquery_eval_) {
-        // Execution path: run the subquery now and substitute its single value as a constant.
-        return std::make_tuple(UNNAMED_COLUMN,
-                               std::make_shared<ConstantValueExpression>(subquery_eval_(subplan)));
-      }
-      // EXPLAIN path: nothing may run, so keep the planned subquery behind a placeholder.
-      return std::make_tuple(UNNAMED_COLUMN, std::make_shared<SubqueryExpression>(
-                                                 subplan, Column::Make("<subquery>", result_type)));
-    }
+    case ExpressionType::SUBQUERY:
+      return std::make_tuple(UNNAMED_COLUMN,
+                             PlanScalarSubqueryExpression(dynamic_cast<const BoundSubqueryExpr &>(expr)));
     case ExpressionType::OUTER_COLUMN_REF:
       // Decorrelation consumes the supported outer refs (an equality in the subquery WHERE);
       // one surviving to this point marks a correlation shape the engine cannot flatten.

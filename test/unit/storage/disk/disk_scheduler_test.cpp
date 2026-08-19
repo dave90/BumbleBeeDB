@@ -24,8 +24,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief A disk manager whose WritePage always throws. */
 class ThrowingDiskManager : public DiskManager {
  public:
@@ -50,14 +48,12 @@ class FailingDiskManager : public DiskManager {
   auto DeletePage(page_id_t /*page_id*/) -> void override {}
 };
 
-auto Submit(DiskScheduler &scheduler, bool is_write, page_id_t page_id, data_ptr_t data) -> std::future<bool> {
+static auto Submit(DiskScheduler &scheduler, bool is_write, page_id_t page_id, data_ptr_t data) -> std::future<bool> {
   DiskRequest request{is_write, data, page_id, scheduler.CreatePromise()};
   auto future = request.callback_.get_future();
   scheduler.Schedule(request);
   return future;
 }
-
-}  // namespace
 
 // Many client threads submit reads/writes to disjoint pages at once. The DiskScheduler funnels them
 // through one MPMC channel drained by several workers; every future must resolve and each page must

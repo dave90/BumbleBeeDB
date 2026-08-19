@@ -32,10 +32,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Flatten an AND-tree of predicates into its conjuncts (a non-AND expr is one conjunct). */
-void FlattenConjuncts(const AbstractExpressionRef &expr, std::vector<AbstractExpressionRef> &out) {
+static void FlattenConjuncts(const AbstractExpressionRef &expr, std::vector<AbstractExpressionRef> &out) {
   if (const auto *logic = dynamic_cast<const LogicExpression *>(expr.get());
       logic != nullptr && logic->logic_type_ == LogicType::And) {
     FlattenConjuncts(logic->GetChildAt(0), out);
@@ -47,7 +45,7 @@ void FlattenConjuncts(const AbstractExpressionRef &expr, std::vector<AbstractExp
 
 /** @brief Gather every flat column index an expression references. Returns false if any reference is
  * not tuple 0 (i.e. the expression is not in the region's flat frame — bail out of reordering). */
-auto CollectFlatColumns(const AbstractExpressionRef &expr, std::vector<uint32_t> &cols) -> bool {
+static auto CollectFlatColumns(const AbstractExpressionRef &expr, std::vector<uint32_t> &cols) -> bool {
   if (const auto *col = dynamic_cast<const ColumnValueExpression *>(expr.get()); col != nullptr) {
     if (col->GetTupleIdx() != 0) {
       return false;
@@ -64,8 +62,8 @@ auto CollectFlatColumns(const AbstractExpressionRef &expr, std::vector<uint32_t>
 }
 
 /** @brief Clone `expr`, rewriting each flat `#0.f` column reference via `remap(f) -> (tuple, col)`. */
-auto Reindex(const AbstractExpressionRef &expr,
-             const std::function<std::pair<uint32_t, uint32_t>(uint32_t)> &remap) -> AbstractExpressionRef {
+static auto Reindex(const AbstractExpressionRef &expr,
+                    const std::function<std::pair<uint32_t, uint32_t>(uint32_t)> &remap) -> AbstractExpressionRef {
   if (const auto *col = dynamic_cast<const ColumnValueExpression *>(expr.get()); col != nullptr) {
     const auto [tuple, idx] = remap(col->GetColIdx());
     return std::make_shared<ColumnValueExpression>(tuple, idx, col->GetReturnType());
@@ -79,7 +77,7 @@ auto Reindex(const AbstractExpressionRef &expr,
 }
 
 /** @brief Conjoin a list of predicates with AND (empty ⇒ nullptr). */
-auto ConjoinAll(std::vector<AbstractExpressionRef> preds) -> AbstractExpressionRef {
+static auto ConjoinAll(std::vector<AbstractExpressionRef> preds) -> AbstractExpressionRef {
   if (preds.empty()) {
     return nullptr;
   }
@@ -91,7 +89,7 @@ auto ConjoinAll(std::vector<AbstractExpressionRef> preds) -> AbstractExpressionR
 }
 
 /** @brief Is `p` a comparison `<column> = <column>` between two DIFFERENT leaves (an equi edge)? */
-auto IsEquiEdge(const AbstractExpressionRef &pred, const std::vector<uint32_t> &cols) -> bool {
+static auto IsEquiEdge(const AbstractExpressionRef &pred, const std::vector<uint32_t> &cols) -> bool {
   const auto *cmp = dynamic_cast<const ComparisonExpression *>(pred.get());
   if (cmp == nullptr || cmp->comp_type_ != ComparisonType::Equal) {
     return false;
@@ -101,7 +99,7 @@ auto IsEquiEdge(const AbstractExpressionRef &pred, const std::vector<uint32_t> &
 }
 
 /** @brief The plan's cost: the sum of every internal join's estimated output cardinality (C_out). */
-auto SumInternalCardinalities(const JoinTreeNode *node) -> double {
+static auto SumInternalCardinalities(const JoinTreeNode *node) -> double {
   if (node == nullptr || node->IsLeaf()) {
     return 0;
   }
@@ -110,7 +108,7 @@ auto SumInternalCardinalities(const JoinTreeNode *node) -> double {
 }
 
 /** @brief The cost of the planner's FROM-order left-deep join, under the same estimator. */
-auto LeftDeepCost(const JoinGraph &graph, const CardinalityEstimator &estimator) -> double {
+static auto LeftDeepCost(const JoinGraph &graph, const CardinalityEstimator &estimator) -> double {
   const auto &relations = graph.Relations();
   if (relations.size() < 2) {
     return 0;
@@ -135,7 +133,8 @@ struct Emitted {
 };
 
 /** @brief The output position, within `emitted`, of the region-flat column `flat_col`. */
-auto LocalPosition(const Emitted &emitted, const std::vector<JoinRelation> &relations, uint32_t flat_col) -> uint32_t {
+static auto LocalPosition(const Emitted &emitted, const std::vector<JoinRelation> &relations, uint32_t flat_col)
+    -> uint32_t {
   uint32_t pos = 0;
   for (const auto leaf_id : emitted.leaf_order_) {
     const auto &rel = relations[leaf_id];
@@ -149,7 +148,7 @@ auto LocalPosition(const Emitted &emitted, const std::vector<JoinRelation> &rela
 }
 
 /** @brief The relation that owns region-flat column `flat_col`. */
-auto OwnerLeaf(const std::vector<JoinRelation> &relations, uint32_t flat_col) -> idx_t {
+static auto OwnerLeaf(const std::vector<JoinRelation> &relations, uint32_t flat_col) -> idx_t {
   for (const auto &rel : relations) {
     if (flat_col >= rel.base_col_offset_ && flat_col < rel.base_col_offset_ + rel.col_count_) {
       return rel.id_;
@@ -160,7 +159,7 @@ auto OwnerLeaf(const std::vector<JoinRelation> &relations, uint32_t flat_col) ->
 }
 
 /** @brief The concatenation of two schemas' columns (the output of joining them, left then right). */
-auto ConcatSchemas(const Schema &left, const Schema &right) -> SchemaRef {
+static auto ConcatSchemas(const Schema &left, const Schema &right) -> SchemaRef {
   std::vector<Column> cols = left.GetColumns();
   for (const auto &c : right.GetColumns()) {
     cols.push_back(c);
@@ -168,7 +167,169 @@ auto ConcatSchemas(const Schema &left, const Schema &right) -> SchemaRef {
   return std::make_shared<Schema>(cols);
 }
 
-}  // namespace
+/** @brief A join edge waiting for its key-NDV annotation before entering the graph. */
+struct PendingEdge {
+  RelationSet refs_;
+  AbstractExpressionRef pred_;
+  bool is_equi_;
+  uint32_t a_;  // the two equi-key flat columns (meaningful only when is_equi_)
+  uint32_t b_;
+};
+
+/** @brief Collect a region's leaves in left-to-right (flat-schema) order, descending only through
+ * inner cross-product joins. Anything else (outer join, formed join, aggregate, ...) is an opaque
+ * leaf. */
+static void CollectRegionLeaves(const AbstractPlanNodeRef &n, std::vector<AbstractPlanNodeRef> &leaves) {
+  if (n->GetType() == PlanType::NestedLoopJoin) {
+    const auto &nlj = dynamic_cast<const NestedLoopJoinPlanNode &>(*n);
+    if (nlj.GetJoinType() == JoinType::INNER && Optimizer::IsPredicateTrue(nlj.Predicate())) {
+      CollectRegionLeaves(nlj.GetLeftPlan(), leaves);
+      CollectRegionLeaves(nlj.GetRightPlan(), leaves);
+      return;
+    }
+  }
+  leaves.push_back(n);
+}
+
+/**
+ * @brief Split the region's WHERE conjuncts into per-leaf local filters and cross-leaf join edges.
+ *
+ * @return False when a conjunct is not the clean flat-frame shape the rewrite expects — the
+ *         caller must then leave the whole region untouched.
+ */
+static auto ClassifyRegionConjuncts(const std::vector<AbstractExpressionRef> &conjuncts,
+                                    const std::vector<JoinRelation> &relations,
+                                    std::vector<std::vector<AbstractExpressionRef>> &single_filters,
+                                    std::vector<PendingEdge> &pending) -> bool {
+  for (const auto &conjunct : conjuncts) {
+    std::vector<uint32_t> cols;
+    if (!CollectFlatColumns(conjunct, cols)) {
+      return false;
+    }
+    RelationSet refs;
+    for (const auto c : cols) {
+      refs = refs.Union(RelationSet::Singleton(OwnerLeaf(relations, c)));
+    }
+    if (refs.Count() <= 1) {
+      // A single-table (or constant) predicate: attach it to its leaf (or the first leaf if constant).
+      const idx_t leaf = cols.empty() ? 0 : OwnerLeaf(relations, cols.front());
+      single_filters[leaf].push_back(conjunct);
+      continue;
+    }
+    PendingEdge edge{refs, conjunct, IsEquiEdge(conjunct, cols), 0, 0};
+    if (edge.is_equi_) {  // record the two key columns for the NDV equivalence classes
+      const auto &cmp = dynamic_cast<const ComparisonExpression &>(*conjunct);
+      edge.a_ = dynamic_cast<const ColumnValueExpression &>(*cmp.GetChildAt(0)).GetColIdx();
+      edge.b_ = dynamic_cast<const ColumnValueExpression &>(*cmp.GetChildAt(1)).GetColIdx();
+    }
+    pending.push_back(std::move(edge));
+  }
+  return true;
+}
+
+/**
+ * @brief Enter the pending edges into the graph, annotating each equi edge with its key NDV.
+ *
+ * Join-key NDV from row counts alone: union the flat columns joined by equality, then each
+ * class's distinct count ≈ the smallest table row count in it (the PK/dimension side bounds the
+ * key). This is what makes a low-cardinality key (nationkey ≈ 25) read as near-cartesian without
+ * any scan.
+ */
+static void AddEdgesWithKeyNdv(JoinGraph &graph, const std::vector<PendingEdge> &pending,
+                               const std::vector<JoinRelation> &relations, idx_t flat_width) {
+  std::vector<uint32_t> uf(flat_width);
+  std::iota(uf.begin(), uf.end(), 0U);
+  std::function<uint32_t(uint32_t)> find = [&](uint32_t x) {
+    while (uf[x] != x) {
+      uf[x] = uf[uf[x]];
+      x = uf[x];
+    }
+    return x;
+  };
+  for (const auto &e : pending) {
+    if (e.is_equi_) {
+      uf[find(e.a_)] = find(e.b_);
+    }
+  }
+  std::unordered_map<uint32_t, double> class_ndv;
+  auto note_ndv = [&](uint32_t flat) {
+    const auto root = find(flat);
+    const double card = relations[OwnerLeaf(relations, flat)].cardinality_;
+    const auto it = class_ndv.find(root);
+    class_ndv[root] = it == class_ndv.end() ? card : std::min(it->second, card);
+  };
+  for (const auto &e : pending) {
+    if (e.is_equi_) {
+      note_ndv(e.a_);
+      note_ndv(e.b_);
+    }
+  }
+  for (const auto &e : pending) {
+    graph.AddEdge(e.refs_, e.pred_, e.is_equi_, e.is_equi_ ? class_ndv[find(e.a_)] : 0.0);
+  }
+}
+
+/**
+ * @brief Materialize the chosen join tree back into plan nodes.
+ *
+ * Leaves get their local filters re-indexed onto themselves; every internal node builds the
+ * smaller side (child 0 — the INNER hash-join build side by convention) and re-indexes each
+ * crossing predicate from the flat frame into its own #0/#1 spaces.
+ */
+static auto EmitJoinTree(const JoinTreeNode *tree_node, const JoinGraph &graph,
+                         const std::vector<JoinRelation> &relations,
+                         const std::vector<std::vector<AbstractExpressionRef>> &single_filters) -> Emitted {
+  if (tree_node->IsLeaf()) {
+    const auto leaf_id = tree_node->leaf_id_;
+    auto leaf_plan = relations[leaf_id].plan_;
+    if (!single_filters[leaf_id].empty()) {
+      const auto base = relations[leaf_id].base_col_offset_;
+      auto pred = Reindex(ConjoinAll(single_filters[leaf_id]),
+                          [base](uint32_t f) { return std::make_pair<uint32_t, uint32_t>(0, f - base); });
+      leaf_plan = std::make_shared<FilterPlanNode>(leaf_plan->output_schema_, std::move(pred), leaf_plan);
+    }
+    return Emitted{leaf_plan, {leaf_id}};
+  }
+
+  Emitted left = EmitJoinTree(tree_node->left_.get(), graph, relations, single_filters);
+  Emitted right = EmitJoinTree(tree_node->right_.get(), graph, relations, single_filters);
+  // Build the smaller side (child 0 — the INNER hash-join build side by convention).
+  if (tree_node->left_->cardinality_ > tree_node->right_->cardinality_) {
+    std::swap(left, right);
+  }
+
+  RelationSet left_set;
+  for (const auto id : left.leaf_order_) {
+    left_set = left_set.Union(RelationSet::Singleton(id));
+  }
+  RelationSet right_set;
+  for (const auto id : right.leaf_order_) {
+    right_set = right_set.Union(RelationSet::Singleton(id));
+  }
+
+  // Re-index each crossing predicate from the flat frame into this join's #0 (left) / #1 (right).
+  std::vector<AbstractExpressionRef> preds;
+  for (const auto *edge : graph.EdgesCrossing(left_set, right_set)) {
+    preds.push_back(Reindex(edge->predicate_, [&](uint32_t f) -> std::pair<uint32_t, uint32_t> {
+      const auto owner = OwnerLeaf(relations, f);
+      if (left_set.Contains(owner)) {
+        return {0, LocalPosition(left, relations, f)};
+      }
+      return {1, LocalPosition(right, relations, f)};
+    }));
+  }
+  auto predicate = ConjoinAll(std::move(preds));
+  if (predicate == nullptr) {
+    predicate = std::make_shared<ConstantValueExpression>(Value(true));  // disconnected: cross product
+  }
+
+  auto out_schema = ConcatSchemas(left.plan_->OutputSchema(), right.plan_->OutputSchema());
+  auto join = std::make_shared<NestedLoopJoinPlanNode>(out_schema, left.plan_, right.plan_, std::move(predicate),
+                                                       JoinType::INNER);
+  std::vector<idx_t> order = left.leaf_order_;
+  order.insert(order.end(), right.leaf_order_.begin(), right.leaf_order_.end());
+  return Emitted{join, std::move(order)};
+}
 
 auto Optimizer::OptimizeJoinOrder(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef {
   // Bottom-up: optimize children first so nested regions (and barrier subtrees) are already done.
@@ -186,21 +347,8 @@ auto Optimizer::OptimizeJoinOrder(const AbstractPlanNodeRef &plan) -> AbstractPl
   const auto &filter = dynamic_cast<const FilterPlanNode &>(*node);
   BUMBLEBEE_ENSURE(node->children_.size() == 1, "Filter has exactly one child");
 
-  // Collect the region's leaves in left-to-right (flat-schema) order, descending only through inner
-  // cross-product joins. Anything else (outer join, formed join, aggregate, ...) is an opaque leaf.
   std::vector<AbstractPlanNodeRef> leaves;
-  std::function<void(const AbstractPlanNodeRef &)> collect = [&](const AbstractPlanNodeRef &n) {
-    if (n->GetType() == PlanType::NestedLoopJoin) {
-      const auto &nlj = dynamic_cast<const NestedLoopJoinPlanNode &>(*n);
-      if (nlj.GetJoinType() == JoinType::INNER && IsPredicateTrue(nlj.Predicate())) {
-        collect(nlj.GetLeftPlan());
-        collect(nlj.GetRightPlan());
-        return;
-      }
-    }
-    leaves.push_back(n);
-  };
-  collect(node->children_[0]);
+  CollectRegionLeaves(node->children_[0], leaves);
 
   // A 2-leaf region has exactly one join order but still one real decision — which side BUILDS
   // (the physical INNER hash join always builds child 0, and the planner emits FROM order, so
@@ -233,76 +381,15 @@ auto Optimizer::OptimizeJoinOrder(const AbstractPlanNodeRef &plan) -> AbstractPl
   const auto &relations = graph.Relations();
 
   // Split the WHERE predicate into conjuncts; collect join edges (with equi key endpoints) and
-  // single-table filters.
+  // single-table filters, then enter the edges annotated with their key NDV.
   std::vector<AbstractExpressionRef> conjuncts;
   FlattenConjuncts(filter.GetPredicate(), conjuncts);
   std::vector<std::vector<AbstractExpressionRef>> single_filters(leaves.size());  // per-leaf local filters
-  struct PendingEdge {
-    RelationSet refs_;
-    AbstractExpressionRef pred_;
-    bool is_equi_;
-    uint32_t a_;  // the two equi-key flat columns (meaningful only when is_equi_)
-    uint32_t b_;
-  };
   std::vector<PendingEdge> pending;
-
-  for (const auto &conjunct : conjuncts) {
-    std::vector<uint32_t> cols;
-    if (!CollectFlatColumns(conjunct, cols)) {
-      return node;  // not the clean flat-frame shape we expect — leave the region untouched
-    }
-    RelationSet refs;
-    for (const auto c : cols) {
-      refs = refs.Union(RelationSet::Singleton(OwnerLeaf(relations, c)));
-    }
-    if (refs.Count() <= 1) {
-      // A single-table (or constant) predicate: attach it to its leaf (or the first leaf if constant).
-      const idx_t leaf = cols.empty() ? 0 : OwnerLeaf(relations, cols.front());
-      single_filters[leaf].push_back(conjunct);
-      continue;
-    }
-    PendingEdge edge{refs, conjunct, IsEquiEdge(conjunct, cols), 0, 0};
-    if (edge.is_equi_) {  // record the two key columns for the NDV equivalence classes
-      const auto &cmp = dynamic_cast<const ComparisonExpression &>(*conjunct);
-      edge.a_ = dynamic_cast<const ColumnValueExpression &>(*cmp.GetChildAt(0)).GetColIdx();
-      edge.b_ = dynamic_cast<const ColumnValueExpression &>(*cmp.GetChildAt(1)).GetColIdx();
-    }
-    pending.push_back(std::move(edge));
+  if (!ClassifyRegionConjuncts(conjuncts, relations, single_filters, pending)) {
+    return node;  // not the clean flat-frame shape we expect — leave the region untouched
   }
-
-  // Join-key NDV from row counts alone: union the flat columns joined by equality, then each class's
-  // distinct count ≈ the smallest table row count in it (the PK/dimension side bounds the key). This
-  // is what makes a low-cardinality key (nationkey ≈ 25) read as near-cartesian without any scan.
-  std::vector<uint32_t> uf(offset);
-  std::iota(uf.begin(), uf.end(), 0U);
-  std::function<uint32_t(uint32_t)> find = [&](uint32_t x) {
-    while (uf[x] != x) {
-      uf[x] = uf[uf[x]];
-      x = uf[x];
-    }
-    return x;
-  };
-  for (const auto &e : pending) {
-    if (e.is_equi_) {
-      uf[find(e.a_)] = find(e.b_);
-    }
-  }
-  std::unordered_map<uint32_t, double> class_ndv;
-  auto note_ndv = [&](uint32_t flat) {
-    const auto root = find(flat);
-    const double card = relations[OwnerLeaf(relations, flat)].cardinality_;
-    const auto it = class_ndv.find(root);
-    class_ndv[root] = it == class_ndv.end() ? card : std::min(it->second, card);
-  };
-  for (const auto &e : pending) {
-    if (e.is_equi_) {
-      note_ndv(e.a_);
-      note_ndv(e.b_);
-    }
-  }
-  for (const auto &e : pending) {
-    graph.AddEdge(e.refs_, e.pred_, e.is_equi_, e.is_equi_ ? class_ndv[find(e.a_)] : 0.0);
-  }
+  AddEdgesWithKeyNdv(graph, pending, relations, offset);
 
   const CardinalityEstimator estimator;
   std::unique_ptr<JoinTreeNode> tree;
@@ -342,60 +429,7 @@ auto Optimizer::OptimizeJoinOrder(const AbstractPlanNodeRef &plan) -> AbstractPl
     }
   }
 
-  std::function<Emitted(const JoinTreeNode *)> emit = [&](const JoinTreeNode *tree_node) -> Emitted {
-    if (tree_node->IsLeaf()) {
-      const auto leaf_id = tree_node->leaf_id_;
-      auto leaf_plan = relations[leaf_id].plan_;
-      if (!single_filters[leaf_id].empty()) {
-        const auto base = relations[leaf_id].base_col_offset_;
-        auto pred = Reindex(ConjoinAll(single_filters[leaf_id]),
-                            [base](uint32_t f) { return std::make_pair<uint32_t, uint32_t>(0, f - base); });
-        leaf_plan = std::make_shared<FilterPlanNode>(leaf_plan->output_schema_, std::move(pred), leaf_plan);
-      }
-      return Emitted{leaf_plan, {leaf_id}};
-    }
-
-    Emitted left = emit(tree_node->left_.get());
-    Emitted right = emit(tree_node->right_.get());
-    // Build the smaller side (child 0 — the INNER hash-join build side by convention).
-    if (tree_node->left_->cardinality_ > tree_node->right_->cardinality_) {
-      std::swap(left, right);
-    }
-
-    RelationSet left_set;
-    for (const auto id : left.leaf_order_) {
-      left_set = left_set.Union(RelationSet::Singleton(id));
-    }
-    RelationSet right_set;
-    for (const auto id : right.leaf_order_) {
-      right_set = right_set.Union(RelationSet::Singleton(id));
-    }
-
-    // Re-index each crossing predicate from the flat frame into this join's #0 (left) / #1 (right).
-    std::vector<AbstractExpressionRef> preds;
-    for (const auto *edge : graph.EdgesCrossing(left_set, right_set)) {
-      preds.push_back(Reindex(edge->predicate_, [&](uint32_t f) -> std::pair<uint32_t, uint32_t> {
-        const auto owner = OwnerLeaf(relations, f);
-        if (left_set.Contains(owner)) {
-          return {0, LocalPosition(left, relations, f)};
-        }
-        return {1, LocalPosition(right, relations, f)};
-      }));
-    }
-    auto predicate = ConjoinAll(std::move(preds));
-    if (predicate == nullptr) {
-      predicate = std::make_shared<ConstantValueExpression>(Value(true));  // disconnected: cross product
-    }
-
-    auto out_schema = ConcatSchemas(left.plan_->OutputSchema(), right.plan_->OutputSchema());
-    auto join = std::make_shared<NestedLoopJoinPlanNode>(out_schema, left.plan_, right.plan_,
-                                                         std::move(predicate), JoinType::INNER);
-    std::vector<idx_t> order = left.leaf_order_;
-    order.insert(order.end(), right.leaf_order_.begin(), right.leaf_order_.end());
-    return Emitted{join, std::move(order)};
-  };
-
-  Emitted root = emit(tree.get());
+  Emitted root = EmitJoinTree(tree.get(), graph, relations, single_filters);
 
   // The region reordered its columns; restore the original flat order the region's parent expects,
   // with a projection selecting each original column from its new position in the emitted output.

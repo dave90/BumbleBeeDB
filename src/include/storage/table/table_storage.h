@@ -60,7 +60,10 @@ class TableStorage {
  public:
   TableStorage() = default;
   virtual ~TableStorage() = default;
-  DISALLOW_COPY_AND_MOVE(TableStorage);
+  TableStorage(const TableStorage &) = delete;
+  auto operator=(const TableStorage &) -> TableStorage & = delete;
+  TableStorage(TableStorage &&) = delete;
+  auto operator=(TableStorage &&) -> TableStorage & = delete;
 
   virtual auto GetFormat() const -> StorageFormat = 0;
 

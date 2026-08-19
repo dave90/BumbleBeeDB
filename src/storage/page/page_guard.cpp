@@ -21,14 +21,13 @@
 
 namespace bumblebee {
 
-ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame,
-                             std::shared_ptr<ArcReplacer> replacer, std::shared_ptr<std::mutex> bpm_latch,
-                             std::shared_ptr<DiskScheduler> disk_scheduler)
+ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, ArcReplacer *replacer,
+                             std::mutex *bpm_latch, DiskScheduler *disk_scheduler)
     : page_id_(page_id),
       frame_(std::move(frame)),
-      replacer_(std::move(replacer)),
-      bpm_latch_(std::move(bpm_latch)),
-      disk_scheduler_(std::move(disk_scheduler)) {
+      replacer_(replacer),
+      bpm_latch_(bpm_latch),
+      disk_scheduler_(disk_scheduler) {
   is_valid_ = true;
   frame_->rwlatch_.lock_shared();
 }
@@ -36,9 +35,9 @@ ReadPageGuard::ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> fra
 ReadPageGuard::ReadPageGuard(ReadPageGuard &&that) noexcept {
   page_id_ = that.page_id_;
   frame_ = std::move(that.frame_);
-  replacer_ = std::move(that.replacer_);
-  bpm_latch_ = std::move(that.bpm_latch_);
-  disk_scheduler_ = std::move(that.disk_scheduler_);
+  replacer_ = that.replacer_;
+  bpm_latch_ = that.bpm_latch_;
+  disk_scheduler_ = that.disk_scheduler_;
   is_valid_ = that.is_valid_;
   that.is_valid_ = false;
 }
@@ -50,9 +49,9 @@ auto ReadPageGuard::operator=(ReadPageGuard &&that) noexcept -> ReadPageGuard & 
   Drop();
   page_id_ = that.page_id_;
   frame_ = std::move(that.frame_);
-  replacer_ = std::move(that.replacer_);
-  bpm_latch_ = std::move(that.bpm_latch_);
-  disk_scheduler_ = std::move(that.disk_scheduler_);
+  replacer_ = that.replacer_;
+  bpm_latch_ = that.bpm_latch_;
+  disk_scheduler_ = that.disk_scheduler_;
   is_valid_ = that.is_valid_;
   that.is_valid_ = false;
   return *this;
@@ -95,14 +94,13 @@ ReadPageGuard::~ReadPageGuard() { Drop(); }
 
 /**********************************************************************************************************************/
 
-WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame,
-                               std::shared_ptr<ArcReplacer> replacer, std::shared_ptr<std::mutex> bpm_latch,
-                               std::shared_ptr<DiskScheduler> disk_scheduler)
+WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, ArcReplacer *replacer,
+                               std::mutex *bpm_latch, DiskScheduler *disk_scheduler)
     : page_id_(page_id),
       frame_(std::move(frame)),
-      replacer_(std::move(replacer)),
-      bpm_latch_(std::move(bpm_latch)),
-      disk_scheduler_(std::move(disk_scheduler)) {
+      replacer_(replacer),
+      bpm_latch_(bpm_latch),
+      disk_scheduler_(disk_scheduler) {
   frame_->rwlatch_.lock();
   is_valid_ = true;
 }
@@ -110,9 +108,9 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
 WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {
   page_id_ = that.page_id_;
   frame_ = std::move(that.frame_);
-  replacer_ = std::move(that.replacer_);
-  bpm_latch_ = std::move(that.bpm_latch_);
-  disk_scheduler_ = std::move(that.disk_scheduler_);
+  replacer_ = that.replacer_;
+  bpm_latch_ = that.bpm_latch_;
+  disk_scheduler_ = that.disk_scheduler_;
   is_valid_ = that.is_valid_;
   that.is_valid_ = false;
 }
@@ -124,9 +122,9 @@ auto WritePageGuard::operator=(WritePageGuard &&that) noexcept -> WritePageGuard
   Drop();
   page_id_ = that.page_id_;
   frame_ = std::move(that.frame_);
-  replacer_ = std::move(that.replacer_);
-  bpm_latch_ = std::move(that.bpm_latch_);
-  disk_scheduler_ = std::move(that.disk_scheduler_);
+  replacer_ = that.replacer_;
+  bpm_latch_ = that.bpm_latch_;
+  disk_scheduler_ = that.disk_scheduler_;
   is_valid_ = that.is_valid_;
   that.is_valid_ = false;
   return *this;

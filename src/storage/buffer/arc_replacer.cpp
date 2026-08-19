@@ -73,10 +73,8 @@ auto ArcReplacer::Evict() -> std::optional<frame_id_t> {
   return UnsafeEvict();
 }
 
-namespace {
-
-auto UpdateMruTargetSize(ArcStatus arc_status, size_t mru_ghost_size, size_t mfu_ghost_size,
-                         size_t mru_target_size) -> size_t {
+static auto UpdateMruTargetSize(ArcStatus arc_status, size_t mru_ghost_size, size_t mfu_ghost_size,
+                                size_t mru_target_size) -> size_t {
   if (arc_status == ArcStatus::MRU_GHOST) {
     if (mru_ghost_size >= mfu_ghost_size) {
       mru_target_size += 1;
@@ -93,8 +91,6 @@ auto UpdateMruTargetSize(ArcStatus arc_status, size_t mru_ghost_size, size_t mfu
   }
   return mru_target_size;
 }
-
-}  // namespace
 
 void ArcReplacer::AccessHits(frame_id_t frame_id, FrameStatus &status) {
   BUMBLEBEE_ASSERT(status.arc_status_ == ArcStatus::MFU || status.arc_status_ == ArcStatus::MRU,

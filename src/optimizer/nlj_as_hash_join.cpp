@@ -25,8 +25,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 /**
  * @brief Pull the equi-join keys out of a join predicate.
  *
@@ -40,8 +38,8 @@ namespace {
  * @param predicate The join predicate.
  * @return bool True if the entire predicate reduced to equi-join keys.
  */
-auto ExtractKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<AbstractExpressionRef> &right_keys,
-                 const AbstractExpressionRef &predicate) -> bool {
+static auto ExtractKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<AbstractExpressionRef> &right_keys,
+                        const AbstractExpressionRef &predicate) -> bool {
   if (const auto *logic = dynamic_cast<const LogicExpression *>(predicate.get()); logic != nullptr) {
     // The caller has already rejected predicates containing an OR.
     BUMBLEBEE_ASSERT(logic->logic_type_ == LogicType::And, "OR in a join predicate reached ExtractKeys");
@@ -78,8 +76,6 @@ auto ExtractKeys(std::vector<AbstractExpressionRef> &left_keys, std::vector<Abst
   return true;
 }
 
-}  // namespace
-
 /**
  * @brief Turn a NestedLoopJoin whose predicate is a conjunction of equalities into a HashJoin.
  *
@@ -113,9 +109,8 @@ auto Optimizer::OptimizeNLJAsHashJoin(const AbstractPlanNodeRef &plan) -> Abstra
     return optimized_plan;
   }
 
-  return std::make_shared<HashJoinPlanNode>(std::make_shared<Schema>(nlj_plan.OutputSchema()),
-                                            nlj_plan.children_[0], nlj_plan.children_[1], left_keys, right_keys,
-                                            nlj_plan.GetJoinType());
+  return std::make_shared<HashJoinPlanNode>(std::make_shared<Schema>(nlj_plan.OutputSchema()), nlj_plan.children_[0],
+                                            nlj_plan.children_[1], left_keys, right_keys, nlj_plan.GetJoinType());
 }
 
 }  // namespace bumblebee

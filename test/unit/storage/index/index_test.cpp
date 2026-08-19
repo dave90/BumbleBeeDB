@@ -27,32 +27,27 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto MakeSchema() -> Schema {
+static auto MakeSchema() -> Schema {
   return Schema{std::vector<Column>{
       Column("id", LogicalType(LogicalTypeId::INTEGER)),
       Column("v", LogicalType(LogicalTypeId::INTEGER)),
   }};
 }
 
-auto TypesOf(const Schema &s) -> std::vector<LogicalType> {
-  std::vector<LogicalType> t;
-  for (const auto &c : s.GetColumns()) {
-    t.push_back(c.GetType());
-  }
-  return t;
-}
-
-}  // namespace
-
 // Bug #9: SetFromKey rejects a key longer than KeySize (ASan proves no overflow write).
+//
+// The rejection is a BUMBLEBEE_ASSERT, i.e. a plain `assert`, so it only exists where NDEBUG is
+// not set. Release builds compile the check out and the call simply returns, so the death
+// expectation is guarded — otherwise this test could never pass in Release. The Debug and ASan
+// builds (the ones the bug was found under) still run it.
 TEST(GenericKeyTest, SetFromKeyRejectsOverlongKey) {
   GenericKey<8> key;
   std::vector<data_t> ok(8, 1);
   key.SetFromKey(ok.data(), 8);  // exactly fits
+#ifndef NDEBUG
   std::vector<data_t> too_long(16, 1);
   EXPECT_DEATH_IF_SUPPORTED(key.SetFromKey(too_long.data(), 16), "");
+#endif
 }
 
 TEST(GenericComparatorTest, OrdersIntegerKeys) {
@@ -78,7 +73,7 @@ TEST(CatalogIndexTest, CreateIndexSkipsDeletedRowsAndScans) {
 
   // Insert ids 0..9 (with v = id * 10).
   DataChunk chunk;
-  chunk.Initialize(TypesOf(schema));
+  chunk.Initialize(schema.GetTypes());
   for (int i = 0; i < 10; i++) {
     chunk.SetValue(0, i, Value(i));
     chunk.SetValue(1, i, Value(i * 10));
@@ -131,7 +126,7 @@ TEST(CatalogIndexTest, CompositeKeyIndexBuildsAndScans) {
   ASSERT_NE(table->storage_, nullptr);
 
   DataChunk chunk;
-  chunk.Initialize(TypesOf(schema));
+  chunk.Initialize(schema.GetTypes());
   const int n = 40;
   for (int i = 0; i < n; i++) {
     chunk.SetValue(0, i, Value(i));

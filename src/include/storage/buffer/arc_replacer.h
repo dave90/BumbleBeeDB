@@ -51,7 +51,10 @@ class ArcReplacer {
  public:
   explicit ArcReplacer(size_t num_frames);
 
-  DISALLOW_COPY_AND_MOVE(ArcReplacer);
+  ArcReplacer(const ArcReplacer &) = delete;
+  auto operator=(const ArcReplacer &) -> ArcReplacer & = delete;
+  ArcReplacer(ArcReplacer &&) = delete;
+  auto operator=(ArcReplacer &&) -> ArcReplacer & = delete;
 
   ~ArcReplacer() = default;
 

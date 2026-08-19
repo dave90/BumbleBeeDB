@@ -134,6 +134,19 @@ class Planner {
   auto PlanExpression(const BoundExpression &expr, const std::vector<AbstractPlanNodeRef> &children)
       -> std::tuple<std::string, AbstractExpressionRef>;
 
+  /**
+   * @brief Plan a scalar subquery expression: pre-execute it to a constant, or keep it behind a
+   * placeholder on the EXPLAIN path.
+   *
+   * A correlated scalar that decorrelation already flattened resolves (by bound-expression
+   * pointer identity, via `resolved_subqueries_`) to its join output column instead. IN/EXISTS
+   * or still-correlated subqueries reaching this point are unsupported shapes and throw.
+   *
+   * @param subquery_expr The bound subquery expression.
+   * @return AbstractExpressionRef The expression standing in for the subquery's value.
+   */
+  auto PlanScalarSubqueryExpression(const BoundSubqueryExpr &subquery_expr) -> AbstractExpressionRef;
+
   auto PlanBinaryOp(const BoundBinaryOp &expr, const std::vector<AbstractPlanNodeRef> &children)
       -> AbstractExpressionRef;
 
@@ -177,6 +190,33 @@ class Planner {
    * @return AbstractPlanNodeRef The plan with the conjunct applied.
    */
   auto PlanSubqueryPredicate(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer) -> AbstractPlanNodeRef;
+
+  /**
+   * @brief Rewrite a correlated `[NOT] EXISTS` into a SEMI/ANTI hash join on its correlation keys.
+   *
+   * The `inner = outer` equalities are pulled out of the subquery WHERE, the inner sides become
+   * the subquery's output, and the enclosing plan SEMI/ANTI-joins against it on those keys.
+   *
+   * @param subquery The correlated EXISTS conjunct.
+   * @param outer The plan the conjunct filters.
+   * @return AbstractPlanNodeRef The SEMI (EXISTS) or ANTI (NOT EXISTS) join.
+   */
+  auto PlanCorrelatedExists(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer) -> AbstractPlanNodeRef;
+
+  /**
+   * @brief Resolve an uncorrelated `[NOT] EXISTS`: one bit for the whole statement.
+   *
+   * Reduces `subplan` to `count(*) LIMIT 1` and pre-executes it, then either passes `outer`
+   * through untouched (predicate holds) or caps it with an always-false filter. On the EXPLAIN
+   * path (no eval hook) the count plan stays visible behind a placeholder filter.
+   *
+   * @param subquery The uncorrelated EXISTS conjunct.
+   * @param outer The plan the conjunct filters.
+   * @param subplan The already-planned subquery.
+   * @return AbstractPlanNodeRef The resulting plan.
+   */
+  auto PlanUncorrelatedExists(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer, AbstractPlanNodeRef subplan)
+      -> AbstractPlanNodeRef;
 
   /**
    * @brief Decorrelate a correlated scalar-aggregate subquery into a LEFT join on `outer`.
@@ -266,7 +306,10 @@ class Planner {
     }
     ~ContextGuard() { *ctx_ptr_ = std::move(old_ctx_); }
 
-    DISALLOW_COPY_AND_MOVE(ContextGuard);
+    ContextGuard(const ContextGuard &) = delete;
+    auto operator=(const ContextGuard &) -> ContextGuard & = delete;
+    ContextGuard(ContextGuard &&) = delete;
+    auto operator=(ContextGuard &&) -> ContextGuard & = delete;
 
    private:
     PlannerContext old_ctx_;

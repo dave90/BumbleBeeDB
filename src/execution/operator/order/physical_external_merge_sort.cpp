@@ -31,21 +31,10 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  types.reserve(schema.GetColumnCount());
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
-
 /** @brief Sort `batch` by its encoded ORDER BY key and write it, in order, as one `[key, cols...]` run. */
-void FlushRun(BufferPoolManager *bpm, const SchemaRef &run_schema, const std::vector<OrderModifiers> &mods,
-              ExpressionExecutor &key_exec, const std::vector<LogicalType> &key_types, ChunkCollection &batch,
-              std::vector<std::unique_ptr<SpillCollection>> &runs) {
+static void FlushRun(BufferPoolManager *bpm, const SchemaRef &run_schema, const std::vector<OrderModifiers> &mods,
+                     ExpressionExecutor &key_exec, const std::vector<LogicalType> &key_types, ChunkCollection &batch,
+                     std::vector<std::unique_ptr<SpillCollection>> &runs) {
   const idx_t n = batch.GetCount();
   if (n == 0) {
     return;
@@ -75,7 +64,7 @@ void FlushRun(BufferPoolManager *bpm, const SchemaRef &run_schema, const std::ve
   // columns with one batched selection copy per (source chunk, column).
   auto run = std::make_unique<SpillCollection>(bpm, run_schema);
   DataChunk out;
-  out.Initialize(TypesOf(*run_schema));
+  out.Initialize(run_schema->GetTypes());
   for (idx_t pos = 0; pos < n; pos += STANDARD_VECTOR_SIZE) {
     const idx_t count = std::min<idx_t>(STANDARD_VECTOR_SIZE, n - pos);
     out.Reset();
@@ -112,8 +101,6 @@ struct MergeEntry {
 struct MergeEntryGreater {
   auto operator()(const MergeEntry &a, const MergeEntry &b) const -> bool { return b.key_ < a.key_; }
 };
-
-}  // namespace
 
 struct EmsGlobalSinkState : GlobalSinkState {
   std::mutex mu_;
@@ -184,7 +171,7 @@ auto PhysicalExternalMergeSort::Sink(ExecutionContext &context, DataChunk &input
     mem.Release(ls.reserved_);
     ls.reserved_ = 0;
     FlushRun(context.client_.bpm_, run_schema_, modifiers_, *ls.key_exec_, ls.key_types_, ls.batch_, ls.runs_);
-    mem.TryReserve(bytes);  // best effort for the incoming chunk
+    (void)mem.TryReserve(bytes);  // best effort for the incoming chunk
   }
   ls.reserved_ += bytes;
   ls.batch_.Append(input);
@@ -216,7 +203,7 @@ auto PhysicalExternalMergeSort::GetData(ExecutionContext & /*context*/, DataChun
                                         LocalSourceState & /*lstate*/) const -> SourceResultType {
   auto &src = static_cast<EmsGlobalSourceState &>(gstate);
   auto &sink = *static_cast<EmsGlobalSinkState *>(src.sink_);
-  const auto run_types = TypesOf(*run_schema_);
+  const auto run_types = run_schema_->GetTypes();
 
   // The current key of a run's cursor: a string_t into the resident chunk's key column (col 0).
   auto key_at = [](RunCursor &rc) -> string_t { return FlatVector::GetData<string_t>(rc.chunk_->data_[0])[rc.pos_]; };

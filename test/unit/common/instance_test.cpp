@@ -22,17 +22,13 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Run a statement and return everything the instance wrote. */
-auto RunSql(BumbleBeeInstance &instance, const std::string &sql) -> std::string {
+static auto RunSql(BumbleBeeInstance &instance, const std::string &sql) -> std::string {
   std::stringstream ss;
   SimpleStreamWriter writer(ss);
   instance.ExecuteSql(sql, writer);
   return ss.str();
 }
-
-}  // namespace
 
 TEST(InstanceTest, CreateTable) {
   BumbleBeeInstance instance;
@@ -91,8 +87,7 @@ TEST(InstanceTest, TheWholePipelineOnOneQuery) {
   RunSql(instance, "CREATE TABLE t2(v3 INT, v4 INT);");
   // Join/sort/limit operators are not lowered yet, so check the optimizer output via EXPLAIN.
   auto out = RunSql(
-      instance,
-      "EXPLAIN (optimizer,schema) SELECT v1, v4 FROM t1, t2 WHERE v2 = v3 AND v1 > 10 ORDER BY v1 LIMIT 5;");
+      instance, "EXPLAIN (optimizer,schema) SELECT v1, v4 FROM t1, t2 WHERE v2 = v3 AND v1 > 10 ORDER BY v1 LIMIT 5;");
 
   // Sort + Limit collapsed into a TopN.
   EXPECT_NE(out.find("TopN { n=5"), std::string::npos);

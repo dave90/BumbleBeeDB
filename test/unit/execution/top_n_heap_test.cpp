@@ -22,8 +22,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 using OptInt = std::optional<int32_t>;
 
 constexpr LogicalTypeId INT = LogicalTypeId::INTEGER;
@@ -32,7 +30,7 @@ const OrderModifiers ASC{OrderType::ASCENDING};
 const OrderModifiers DESC{OrderType::DESCENDING};
 
 /** A two-column chunk (INTEGER, STRING) where row i's string tags its int, to catch misalignment. */
-auto MakeChunk(const std::vector<OptInt> &ints) -> DataChunk {
+static auto MakeChunk(const std::vector<OptInt> &ints) -> DataChunk {
   DataChunk chunk;
   chunk.Initialize(std::vector<LogicalType>{INT, STR});
   for (idx_t i = 0; i < ints.size(); i++) {
@@ -49,14 +47,14 @@ auto MakeChunk(const std::vector<OptInt> &ints) -> DataChunk {
 }
 
 /** Sink `input` ordering by its column 0, the way the operator would feed the heap. */
-void SinkByCol0(TopNHeap &heap, DataChunk &input) {
+static void SinkByCol0(TopNHeap &heap, DataChunk &input) {
   DataChunk keys;
   keys.InitAndReference(input, {0});
   heap.Sink(input, keys);
 }
 
 /** Drain the finalized heap and return (col0, col1) of every emitted row, in emission order. */
-auto Drain(TopNHeap &heap) -> std::vector<std::pair<OptInt, std::string>> {
+static auto Drain(TopNHeap &heap) -> std::vector<std::pair<OptInt, std::string>> {
   std::vector<std::pair<OptInt, std::string>> rows;
   DataChunk out;
   out.Initialize(std::vector<LogicalType>{INT, STR});
@@ -74,11 +72,9 @@ auto Drain(TopNHeap &heap) -> std::vector<std::pair<OptInt, std::string>> {
   return rows;
 }
 
-auto IntHeap(const OrderModifiers &mod, idx_t limit) -> TopNHeap {
+static auto IntHeap(const OrderModifiers &mod, idx_t limit) -> TopNHeap {
   return TopNHeap{std::vector<LogicalType>{INT, STR}, std::vector<LogicalType>{INT}, {mod}, limit};
 }
-
-}  // namespace
 
 TEST(TopNHeapTest, KeepsSmallestAscendingAcrossChunks) {
   auto heap = IntHeap(ASC, 5);
@@ -164,8 +160,7 @@ TEST(TopNHeapTest, StringKeysWithTies) {
   TopNHeap heap{std::vector<LogicalType>{STR, INT}, std::vector<LogicalType>{STR}, {ASC}, 3};
   DataChunk chunk;
   chunk.Initialize(std::vector<LogicalType>{STR, INT});
-  const std::vector<std::string> names{"pear", "apple", "apple", "banana, a long string that is not inlined",
-                                       "cherry"};
+  const std::vector<std::string> names{"pear", "apple", "apple", "banana, a long string that is not inlined", "cherry"};
   for (idx_t i = 0; i < names.size(); i++) {
     chunk.SetValue(0, i, Value(names[i]));
     chunk.SetValue(1, i, Value(static_cast<int32_t>(i)));

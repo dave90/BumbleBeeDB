@@ -38,16 +38,14 @@
 
 namespace bumblebee {
 
-namespace {
-
 // SQL-created tables carry an auto BIGINT `_id` at column 0, so a (k, v) table is [_id, k, v]. We seed
 // the heap directly (bypassing the INSERT executor) and fill `_id` with a sequential value.
 const std::vector<LogicalType> kIdTwoInt{LogicalType(LogicalTypeId::BIGINT), LogicalType(LogicalTypeId::INTEGER),
                                          LogicalType(LogicalTypeId::INTEGER)};
 
 /** @brief Append `n` rows of (k = fk(i), v = fv(i)) into `name`'s heap, spanning many pages. */
-void SeedHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fk,
-              const std::function<int(int)> &fv) {
+static void SeedHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fk,
+                     const std::function<int(int)> &fv) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -70,14 +68,13 @@ void SeedHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::
 }
 
 /** @brief Force intra-query parallelism: several workers and one heap page per parallel-scan morsel. */
-void ConfigureParallel(BumbleBeeInstance &db) {
+static void ConfigureParallel(BumbleBeeInstance &db) {
   db.max_threads_ = 8;   // clamped to [1, MAX_THREADS]; spawns this many query workers
   db.morsel_pages_ = 1;  // one page per morsel => many morsels => real parallel build
 }
 
 /** @brief Run `sql` and collect the result as `num_cols`-wide integer rows. */
-auto RunIntRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
-    -> std::vector<std::vector<int>> {
+static auto RunIntRows(BumbleBeeInstance &db, const std::string &sql, int num_cols) -> std::vector<std::vector<int>> {
   StringVectorWriter w;
   db.ExecuteSql(sql, w);
   std::vector<std::vector<int>> out;
@@ -95,8 +92,8 @@ auto RunIntRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
 
 /** @brief Append `n` rows of (g = fg(i), s = fs(i)) into `name`'s heap, spanning many pages.
  *  The chunk types come from the table's own schema, so the VARCHAR column matches exactly. */
-void SeedStringHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fg,
-                    const std::function<std::string(int)> &fs) {
+static void SeedStringHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fg,
+                           const std::function<std::string(int)> &fs) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -123,7 +120,7 @@ void SeedStringHeap(BumbleBeeInstance &db, const std::string &name, int n, const
 }
 
 /** @brief Run `sql` and collect `num_cols`-wide string rows, stripping the printer's surrounding quotes. */
-auto RunStringRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
+static auto RunStringRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
     -> std::vector<std::vector<std::string>> {
   StringVectorWriter w;
   db.ExecuteSql(sql, w);
@@ -143,8 +140,6 @@ auto RunStringRows(BumbleBeeInstance &db, const std::string &sql, int num_cols)
   }
   return out;
 }
-
-}  // namespace
 
 // Parallel hash join: build + probe run across workers, matches merge into the shared hash table /
 // output. The multiset of (a.v, b.v) pairs must equal the serial join on every repeat.

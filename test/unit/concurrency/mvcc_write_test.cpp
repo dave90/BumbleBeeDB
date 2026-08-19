@@ -34,16 +34,6 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
-
 /** A minimal MVCC test rig: a buffer pool, a one-table catalog, and a transaction manager. */
 struct MvccFixture {
   MemoryDiskManager dm{256};
@@ -65,7 +55,7 @@ struct MvccFixture {
 
   auto OneRow(int32_t id, const std::string &name) -> DataChunk {
     DataChunk c;
-    c.Initialize(TypesOf(table->schema_));
+    c.Initialize(table->schema_.GetTypes());
     c.SetValue(0, 0, Value(id));
     c.SetValue(1, 0, Value(name));
     c.SetCardinality(1);
@@ -83,7 +73,7 @@ struct MvccFixture {
   /** Build a chunk of many (id, name) rows. */
   auto ManyRows(const std::vector<std::pair<int32_t, std::string>> &rows) -> DataChunk {
     DataChunk c;
-    c.Initialize(TypesOf(table->schema_));
+    c.Initialize(table->schema_.GetTypes());
     for (idx_t i = 0; i < rows.size(); i++) {
       c.SetValue(0, i, Value(rows[i].first));
       c.SetValue(1, i, Value(rows[i].second));
@@ -145,7 +135,7 @@ struct MvccFixture {
   auto ScanAll(Transaction *txn) -> std::vector<std::pair<int32_t, std::string>> {
     auto scan = Heap().MakeMvccScan(&tm, txn, Oid());
     DataChunk out;
-    out.Initialize(TypesOf(table->schema_));
+    out.Initialize(table->schema_.GetTypes());
     std::vector<std::pair<int32_t, std::string>> rows;
     while (scan->Next(out)) {
       for (idx_t i = 0; i < out.GetSize(); i++) {
@@ -160,7 +150,7 @@ struct MvccFixture {
     Vector rids{LogicalType{LogicalTypeId::BIGINT}};
     FlatVector::GetData<int64_t>(rids)[0] = rid.Get();
     DataChunk out;
-    out.Initialize(TypesOf(table->schema_));
+    out.Initialize(table->schema_.GetTypes());
     auto n = MvccFetch(&tm, txn, Heap(), rids, 1, out);
     if (n == 0) {
       return std::nullopt;
@@ -168,8 +158,6 @@ struct MvccFixture {
     return std::make_pair(out.GetValue(0, 0).GetAs<int32_t>(), out.GetValue(1, 0).GetString());
   }
 };
-
-}  // namespace
 
 // A txn sees its own uncommitted insert and its own subsequent update.
 TEST(MvccWriteTest, OwnWritesVisibleToSelf) {
@@ -296,7 +284,7 @@ TEST(MvccWriteTest, DeleteHidesRowRespectingSnapshots) {
 TEST(MvccWriteTest, SizeChangingUpdateIsVersioned) {
   MvccFixture f;
   auto *seed = f.tm.Begin();
-  auto a = f.Insert(seed, 1, "ab");            // short
+  auto a = f.Insert(seed, 1, "ab");  // short
   auto neighbour = f.Insert(seed, 2, "keepme");
   ASSERT_TRUE(f.tm.Commit(seed));
 

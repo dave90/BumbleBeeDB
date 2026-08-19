@@ -49,6 +49,10 @@ class Optimizer {
    */
   auto Optimize(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef;
 
+  /** @return True if `expr` is the constant `true`. Public static: reads no optimizer state, and
+   * the join-order pass's file-local region walk calls it without an instance. */
+  static auto IsPredicateTrue(const AbstractExpressionRef &expr) -> bool;
+
  private:
   /** Collapse a projection that just re-emits its child's columns unchanged. */
   auto OptimizeMergeProjection(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef;
@@ -113,9 +117,6 @@ class Optimizer {
    */
   auto RewriteExpressionForJoin(const AbstractExpressionRef &expr, size_t left_column_cnt, size_t right_column_cnt)
       -> AbstractExpressionRef;
-
-  /** @return True if `expr` is the constant `true`. */
-  auto IsPredicateTrue(const AbstractExpressionRef &expr) -> bool;
 
   /**
    * @brief A rough row count for a table, inferred from its name.

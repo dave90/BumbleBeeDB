@@ -31,13 +31,11 @@
 
 namespace bumblebee {
 
-namespace {
-
 // Every physical representation the row-storage engine supports, plus the logical types that reduce
 // to them (BOOLEAN→TINYINT, DECIMAL→BIGINT, DATE→INTEGER, TIMESTAMP→BIGINT). Row bytes are entirely
 // determined by the physical type, so covering every width here covers every logical type that maps
 // to it — and it exercises the same Scatter/FullScan path the MVCC engine uses.
-auto AllTypesSchema() -> SchemaRef {
+static auto AllTypesSchema() -> SchemaRef {
   std::vector<Column> cols{
       Column("b", LogicalType(LogicalTypeId::BOOLEAN)),
       Column("i8", LogicalType(LogicalTypeId::TINYINT)),
@@ -58,16 +56,6 @@ auto AllTypesSchema() -> SchemaRef {
   return std::make_shared<Schema>(cols);
 }
 
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
-
-}  // namespace
-
 // Round-trip a DataChunk holding one column of every supported type through TableHeap append + scan
 // (the real storage path). Covers distinctive values, boundary min/max per width, and a NULL in every
 // column (per-type validity), asserting cell-for-cell equality after the round-trip.
@@ -76,7 +64,7 @@ TEST(AllTypesStorageTest, EveryTypeRoundTripsThroughTableHeap) {
   BufferPoolManager bpm(16, &dm);
   auto schema = AllTypesSchema();
   TableHeap heap(&bpm, schema);
-  const auto types = TypesOf(*schema);
+  const auto types = schema->GetTypes();
 
   DataChunk in;
   in.Initialize(types);
@@ -95,8 +83,8 @@ TEST(AllTypesStorageTest, EveryTypeRoundTripsThroughTableHeap) {
   in.SetValue(col++, 0, Value(static_cast<float>(1.5F)));
   in.SetValue(col++, 0, Value(static_cast<double>(2.5)));
   in.SetValue(col++, 0, Value(std::string("hello types")));
-  in.SetValue(col++, 0, Value(static_cast<int64_t>(12345)));   // DECIMAL backing (123.45)
-  in.SetValue(col++, 0, Value(static_cast<int32_t>(19000)));   // DATE (days since epoch)
+  in.SetValue(col++, 0, Value(static_cast<int64_t>(12345)));             // DECIMAL backing (123.45)
+  in.SetValue(col++, 0, Value(static_cast<int32_t>(19000)));             // DATE (days since epoch)
   in.SetValue(col++, 0, Value(static_cast<int64_t>(1700000000000000)));  // TIMESTAMP (micros)
 
   // Row 1: a NULL in every column (per-type validity prefix must survive).

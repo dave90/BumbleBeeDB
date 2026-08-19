@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cmath>
+#include <type_traits>
 
 #include "common/limits.h"
 #include "type/bumble_string.h"
@@ -24,13 +25,37 @@ namespace bumblebee {
 //
 // A functor, not a function: the execution templates take it as a type parameter so the
 // per-row call inlines away and the loop stays branch-free.
+//
+// SIGNED OVERFLOW. `left + right` on a signed integer is undefined on overflow, and UBSan
+// caught all three of +, * and - doing exactly that on the existing test corpus
+// (INT_MIN + INT_MIN, INT_MIN * 5, INT_MIN - 5). The engine already depended on these wrapping,
+// silently, because that is what the hardware does — but the optimiser is entitled to assume
+// overflow cannot happen, so the code was one inlining decision away from misbehaving.
+//
+// Doing the arithmetic in the matching unsigned type and converting back is fully defined in
+// C++20 (two's complement is mandated, and narrowing conversion to a signed type is modular).
+// It produces bit-for-bit the same result as the wraparound relied on before, and lowers to the
+// identical instruction — the cast is a no-op at the machine level.
+//
+// `if constexpr` rather than a helper so the discarded branch is never instantiated: these
+// templates are also instantiated for float, double and string_t, where make_unsigned_t is
+// ill-formed.
 //===--------------------------------------------------------------------===//
 
-/** @brief `left + right`. */
+/** @brief True when `T` is a signed integer, whose overflow would otherwise be undefined. */
+template <class T>
+inline constexpr bool IS_SIGNED_INTEGER = std::is_integral_v<T> && std::is_signed_v<T>;
+
+/** @brief `left + right`, wrapping rather than overflowing for signed integers. */
 struct Sum {
   template <class T>
   static inline auto Operation(T left, T right) -> T {
-    return left + right;
+    if constexpr (IS_SIGNED_INTEGER<T>) {
+      using U = std::make_unsigned_t<T>;
+      return static_cast<T>(static_cast<U>(left) + static_cast<U>(right));
+    } else {
+      return left + right;
+    }
   }
 };
 
@@ -42,19 +67,29 @@ struct Division {
   }
 };
 
-/** @brief `left * right`. */
+/** @brief `left * right`, wrapping rather than overflowing for signed integers. */
 struct Dot {
   template <class T>
   static inline auto Operation(T left, T right) -> T {
-    return left * right;
+    if constexpr (IS_SIGNED_INTEGER<T>) {
+      using U = std::make_unsigned_t<T>;
+      return static_cast<T>(static_cast<U>(left) * static_cast<U>(right));
+    } else {
+      return left * right;
+    }
   }
 };
 
-/** @brief `left - right`. */
+/** @brief `left - right`, wrapping rather than overflowing for signed integers. */
 struct Difference {
   template <class T>
   static inline auto Operation(T left, T right) -> T {
-    return left - right;
+    if constexpr (IS_SIGNED_INTEGER<T>) {
+      using U = std::make_unsigned_t<T>;
+      return static_cast<T>(static_cast<U>(left) - static_cast<U>(right));
+    } else {
+      return left - right;
+    }
   }
 };
 

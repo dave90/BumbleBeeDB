@@ -18,19 +18,15 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto Parse(const std::string &s, timestamp_t &out) -> bool {
+static auto Parse(const std::string &s, timestamp_t &out) -> bool {
   return Timestamp::TryConvertTimestamp(s.data(), s.size(), out);
 }
 
-auto MustParse(const std::string &s) -> timestamp_t {
+static auto MustParse(const std::string &s) -> timestamp_t {
   timestamp_t ts = 0;
   EXPECT_TRUE(Parse(s, ts)) << s;
   return ts;
 }
-
-}  // namespace
 
 TEST(TimestampParseTest, ParsesDateAndTimeForms) {
   // A bare date is midnight.
@@ -45,19 +41,19 @@ TEST(TimestampParseTest, ParsesDateAndTimeForms) {
   // Extra fractional digits truncate rather than fail.
   EXPECT_EQ(MustParse("1970-01-01 00:00:00.1234567"), 123456);
   // Round trip against the epoch converters.
-  EXPECT_EQ(MustParse("2024-01-01 08:00:00"),
-            Timestamp::FromDatetime(MustParse("2024-01-01") / Timestamp::MICROS_PER_DAY) +
-                8 * Timestamp::MICROS_PER_HOUR);
+  EXPECT_EQ(
+      MustParse("2024-01-01 08:00:00"),
+      Timestamp::FromDatetime(MustParse("2024-01-01") / Timestamp::MICROS_PER_DAY) + 8 * Timestamp::MICROS_PER_HOUR);
 }
 
 TEST(TimestampParseTest, RejectsMalformedInput) {
   timestamp_t ts = 0;
   EXPECT_FALSE(Parse("", ts));
   EXPECT_FALSE(Parse("garbage", ts));
-  EXPECT_FALSE(Parse("2024-01-01 25:00:00", ts));  // hour out of range
-  EXPECT_FALSE(Parse("2024-01-01 10:61:00", ts));  // minute out of range
-  EXPECT_FALSE(Parse("2024-01-01 10:00:61", ts));  // second out of range
-  EXPECT_FALSE(Parse("2024-01-01 10", ts));        // truncated time
+  EXPECT_FALSE(Parse("2024-01-01 25:00:00", ts));    // hour out of range
+  EXPECT_FALSE(Parse("2024-01-01 10:61:00", ts));    // minute out of range
+  EXPECT_FALSE(Parse("2024-01-01 10:00:61", ts));    // second out of range
+  EXPECT_FALSE(Parse("2024-01-01 10", ts));          // truncated time
   EXPECT_FALSE(Parse("2024-01-01 10:00:00 x", ts));  // trailing junk
   EXPECT_FALSE(Parse("2024-01-01 10:00:00.", ts));   // dot with no digits
 }

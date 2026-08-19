@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "parallel/pipeline.h"
 #include "parallel/pipeline_builder.h"
@@ -27,22 +28,6 @@
 #include "type/vector/vector.h"
 
 namespace bumblebee {
-
-namespace {
-
-auto ResolveHeap(ClientContext &context, table_oid_t oid) -> TableHeap * {
-  auto info = context.catalog_.GetTable(oid);
-  if (info == NULL_TABLE_INFO || info->storage_ == nullptr) {
-    throw ExecutionException("Delete: table has no storage backend");
-  }
-  auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
-  if (heap == nullptr) {
-    throw ExecutionException("Delete: table is not a row-format heap");
-  }
-  return heap;
-}
-
-}  // namespace
 
 struct DeleteGlobalSinkState : GlobalSinkState {
   std::atomic<idx_t> count_{0};
@@ -79,7 +64,7 @@ auto PhysicalDelete::Sink(ExecutionContext & /*context*/, DataChunk &input, Glob
 
 void PhysicalDelete::Combine(ExecutionContext &context, GlobalSinkState &gstate, LocalSinkState &lstate) const {
   auto &ls = static_cast<DeleteLocalSinkState &>(lstate);
-  auto *heap = ResolveHeap(context.client_, table_oid_);
+  auto *heap = ResolveTableStorage<TableHeap>(context.client_, table_oid_, "Delete", "a row-format heap");
   const idx_t total = ls.rids_.size();
   for (idx_t off = 0; off < total; off += STANDARD_VECTOR_SIZE) {
     const idx_t n = std::min<idx_t>(STANDARD_VECTOR_SIZE, total - off);

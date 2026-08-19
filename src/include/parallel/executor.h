@@ -54,7 +54,7 @@ class Executor {
 
   auto Context() -> ClientContext & { return context_; }
   auto MaxThreads() const -> idx_t { return context_.config_.max_threads_; }
-  auto NumOperators() const -> idx_t { return num_operators_; }
+
   auto HasError() const -> bool { return has_error_.load(std::memory_order_acquire); }
 
   /**
@@ -75,7 +75,6 @@ class Executor {
 
   /** @brief Fold one finished task's per-operator profile into the query-wide profile (thread-safe). */
   void MergeThreadProfiler(const ThreadProfiler &tp);
-  auto QueryProfile() const -> const std::vector<OperatorProfile> & { return query_profile_; }
 
   // ---- the counter-based scheduling protocol, driven by PipelineTask -----------------------------
   /** @brief Arm `p.tasks_remaining_` and append `p`'s tasks to `out` (before they can be observed). */

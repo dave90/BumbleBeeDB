@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT
@@ -33,19 +34,13 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
-
 /** Read column 0 (an INTEGER) straight out of a row's RowLayout bytes. */
-auto ReadIntColumn(const RowLayout &layout, const_data_ptr_t row) -> int32_t {
-  return *reinterpret_cast<const int32_t *>(row + layout.GetOffsets()[0]);
+static auto ReadIntColumn(const RowLayout &layout, const_data_ptr_t row) -> int32_t {
+  // memcpy, not a reinterpret_cast dereference: a row buffer offset carries no alignment
+  // guarantee, so the direct load is undefined (UBSan flags it).
+  int32_t value;
+  std::memcpy(&value, row + layout.GetOffsets()[0], sizeof(value));
+  return value;
 }
 
 /** A one-column (INTEGER v) MVCC table with a transaction manager, for serializable tests. */
@@ -66,7 +61,7 @@ struct SerFixture {
 
   auto OneRow(int32_t v) -> DataChunk {
     DataChunk c;
-    c.Initialize(TypesOf(table->schema_));
+    c.Initialize(table->schema_.GetTypes());
     c.SetValue(0, 0, Value(v));
     c.SetCardinality(1);
     return c;
@@ -94,8 +89,6 @@ struct SerFixture {
   }
 };
 
-}  // namespace
-
 // Write-skew: two serializable txns each read the rows matching a predicate and flip one of them.
 // Committing both would break the invariant, so the second to commit must be rejected.
 TEST(SerializableTest, WriteSkewRejectsSecondCommitter) {
@@ -122,7 +115,7 @@ TEST(SerializableTest, WriteSkewRejectsSecondCommitter) {
   auto *reader = f.tm.Begin();
   auto scan = f.Heap().MakeMvccScan(&f.tm, reader, f.Oid());
   DataChunk out;
-  out.Initialize(TypesOf(f.table->schema_));
+  out.Initialize(f.table->schema_.GetTypes());
   int ones = 0;
   int zeroes = 0;
   while (scan->Next(out)) {
@@ -147,7 +140,7 @@ TEST(SerializableTest, NonConflictingSerializableCommits) {
   f.RecordReadWhereEquals(t2, 1);  // t2 read {v==1} = {a}
   f.RecordReadWhereEquals(t3, 2);  // t3 read {v==2} = {b}
   f.Update(t2, a, 10);             // t2 modifies a (which t3 did not read)
-  f.Update(t3, b, 20);            // t3 modifies b (which t2 did not read)
+  f.Update(t3, b, 20);             // t3 modifies b (which t2 did not read)
 
   EXPECT_TRUE(f.tm.Commit(t2));
   EXPECT_TRUE(f.tm.Commit(t3)) << "disjoint read/write sets are serializable";
@@ -167,7 +160,7 @@ TEST(SerializableTest, ScanAutoRegistersReadPredicate) {
   {
     auto scan = f.Heap().MakeMvccScan(&f.tm, t2, f.Oid());
     DataChunk out;
-    out.Initialize(TypesOf(f.table->schema_));
+    out.Initialize(f.table->schema_.GetTypes());
     while (scan->Next(out)) {
     }
   }
@@ -244,10 +237,11 @@ TEST(SerializableTest, ScanPredicateFiltersRows) {
 
   // Scan only the rows where v == 1 (a snapshot reader, so no serializable bookkeeping).
   auto *reader = f.tm.Begin();
-  auto scan = f.Heap().MakeMvccScan(&f.tm, reader, f.Oid(),
-                                    [](const RowLayout &layout, const_data_ptr_t row) { return ReadIntColumn(layout, row) == 1; });
+  auto scan = f.Heap().MakeMvccScan(&f.tm, reader, f.Oid(), [](const RowLayout &layout, const_data_ptr_t row) {
+    return ReadIntColumn(layout, row) == 1;
+  });
   DataChunk out;
-  out.Initialize(TypesOf(f.table->schema_));
+  out.Initialize(f.table->schema_.GetTypes());
   int rows = 0;
   while (scan->Next(out)) {
     for (idx_t i = 0; i < out.GetSize(); i++) {
@@ -270,10 +264,11 @@ TEST(SerializableTest, FilteredScanPredicateIsPrecise) {
   auto *t2 = f.tm.Begin(IsolationLevel::SERIALIZABLE);
   // t2 scans only {v==1} — the filtered scan auto-registers exactly that predicate as its read set.
   {
-    auto scan = f.Heap().MakeMvccScan(&f.tm, t2, f.Oid(),
-                                      [](const RowLayout &layout, const_data_ptr_t row) { return ReadIntColumn(layout, row) == 1; });
+    auto scan = f.Heap().MakeMvccScan(&f.tm, t2, f.Oid(), [](const RowLayout &layout, const_data_ptr_t row) {
+      return ReadIntColumn(layout, row) == 1;
+    });
     DataChunk out;
-    out.Initialize(TypesOf(f.table->schema_));
+    out.Initialize(f.table->schema_.GetTypes());
     while (scan->Next(out)) {
     }
   }

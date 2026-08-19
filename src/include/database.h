@@ -42,7 +42,10 @@ class Database {
                     duration_t txn_timeout = DEFAULT_TXN_TIMEOUT);
   ~Database();
 
-  DISALLOW_COPY_AND_MOVE(Database);
+  Database(const Database &) = delete;
+  auto operator=(const Database &) -> Database & = delete;
+  Database(Database &&) = delete;
+  auto operator=(Database &&) -> Database & = delete;
 
   auto GetCatalog() -> Catalog & { return *catalog_; }
   auto GetBufferPool() -> BufferPoolManager & { return *bpm_; }

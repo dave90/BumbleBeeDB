@@ -26,8 +26,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** The state a cast loop threads through: where to put strings, and where to report errors. */
 struct VectorTryCastData {
   VectorTryCastData(Vector &result, std::string *error_message) : result_(result), error_message_(error_message) {}
@@ -111,14 +109,13 @@ struct DecimalCastOperator {
   static auto Operation(INPUT_TYPE input, void *dataptr) -> RESULT_TYPE {
     auto *data = reinterpret_cast<DecimalCastInput *>(dataptr);
     if (data->scale_ < 0) {
-      return static_cast<RESULT_TYPE>(std::llround(static_cast<long double>(input) /
-                                                   static_cast<long double>(
-                                                       NumericHelper::POWERS_OF_TEN[std::abs(data->scale_)])));
+      return static_cast<RESULT_TYPE>(
+          std::llround(static_cast<long double>(input) /
+                       static_cast<long double>(NumericHelper::POWERS_OF_TEN[std::abs(data->scale_)])));
     }
     if (data->scale_ > 0) {
-      return static_cast<RESULT_TYPE>(
-          std::llround(static_cast<long double>(input) *
-                       static_cast<long double>(NumericHelper::POWERS_OF_TEN[data->scale_])));
+      return static_cast<RESULT_TYPE>(std::llround(
+          static_cast<long double>(input) * static_cast<long double>(NumericHelper::POWERS_OF_TEN[data->scale_])));
     }
     return static_cast<RESULT_TYPE>(input);
   }
@@ -142,7 +139,7 @@ struct DecimalToFloatCastOp {
 };
 
 template <class SRC, class DST, class OP>
-auto VectorCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto VectorCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   VectorTryCastData input(result, error_message);
   // The index-aware variant so a per-row failure can mark that row NULL in the result.
   UnaryExecution::GenericExecuteWithIndex<SRC, DST, VectorTryCastOperator<OP>>(source, result, count, &input);
@@ -150,18 +147,17 @@ auto VectorCastLoop(Vector &source, Vector &result, idx_t count, std::string *er
 }
 
 template <class SRC, class DST, class OP>
-auto VectorStringCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto VectorStringCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   VectorTryCastData input(result, error_message);
   UnaryExecution::GenericExecute<SRC, DST, VectorStringCastOperator<OP>>(source, result, count, &input);
   return input.all_converted_;
 }
 
 template <class SRC, class DST>
-auto VectorDecimalCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto VectorDecimalCastLoop(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   (void)error_message;
-  int source_scale = source.GetLogicalTypeId() == LogicalTypeId::DECIMAL
-                         ? source.GetLogicalType().GetDecimalData().scale_
-                         : 0;
+  int source_scale =
+      source.GetLogicalTypeId() == LogicalTypeId::DECIMAL ? source.GetLogicalType().GetDecimalData().scale_ : 0;
   int scale = result.GetLogicalType().GetDecimalData().scale_ - source_scale;
   DecimalCastInput input(result, result.GetLogicalType().GetDecimalData().width_, scale);
   UnaryExecution::GenericExecute<SRC, DST, DecimalCastOperator>(source, result, count, &input);
@@ -170,7 +166,7 @@ auto VectorDecimalCastLoop(Vector &source, Vector &result, idx_t count, std::str
 
 /** @brief Cast a numeric source to whatever `result` is typed as. */
 template <class SRC>
-auto NumericCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto NumericCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   switch (result.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       return VectorCastLoop<SRC, int8_t, NumericTryCast>(source, result, count, error_message);
@@ -251,7 +247,7 @@ struct TryStringToTimestampCast {
 };
 
 /** @brief Parse a STRING source into whatever `result` is typed as. */
-auto StringCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto StringCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   // DATE and TIMESTAMP share physical types with plain integers; dispatch on the LOGICAL type
   // first so "2024-01-01" parses as a calendar date instead of failing as an integer literal.
   switch (result.GetLogicalTypeId()) {
@@ -291,7 +287,7 @@ auto StringCastSwitch(Vector &source, Vector &result, idx_t count, std::string *
 
 /** @brief Cast a DECIMAL source to whatever `result` is typed as. */
 template <class INPUT_TYPE>
-auto DecimalCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto DecimalCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   BUMBLEBEE_ASSERT(source.GetLogicalTypeId() == LogicalTypeId::DECIMAL, "the source must be a DECIMAL");
 
   switch (result.GetLogicalTypeId()) {
@@ -342,7 +338,7 @@ struct StringCastFromDateOperator {
   }
 };
 
-auto DateCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto DateCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   VectorTryCastData input(result, error_message);
   if (result.GetLogicalTypeId() == LogicalTypeId::STRING) {
     UnaryExecution::GenericExecute<int32_t, string_t, StringCastFromDateOperator>(source, result, count, &input);
@@ -361,7 +357,7 @@ struct StringCastFromTimestampOperator {
   }
 };
 
-auto TimestampCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
+static auto TimestampCastSwitch(Vector &source, Vector &result, idx_t count, std::string *error_message) -> bool {
   VectorTryCastData input(result, error_message);
   if (result.GetLogicalTypeId() == LogicalTypeId::STRING) {
     UnaryExecution::GenericExecute<int64_t, string_t, StringCastFromTimestampOperator>(source, result, count, &input);
@@ -371,11 +367,9 @@ auto TimestampCastSwitch(Vector &source, Vector &result, idx_t count, std::strin
       fmt::format("cast: cannot cast a TIMESTAMP to {}", LogicalType::NameOf(result.GetLogicalTypeId())));
 }
 
-}  // namespace
-
 void VectorOperations::Cast(Vector &source, Vector &target, idx_t source_count) {
   if (source.GetLogicalType() != target.GetLogicalType()) {
-    TryCast(source, target, source_count, nullptr);
+    (void)TryCast(source, target, source_count, nullptr);  // non-strict: failed rows are already NULLed
   } else {
     // Same type: nothing to convert, just move the bytes.
     Copy(source, target, source_count, 0, 0);

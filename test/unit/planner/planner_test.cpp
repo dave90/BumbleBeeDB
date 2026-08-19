@@ -30,18 +30,14 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Bind and plan a query, without optimizing it. */
-auto TryPlan(const Catalog &catalog, const std::string &query) -> AbstractPlanNodeRef {
+static auto TryPlan(const Catalog &catalog, const std::string &query) -> AbstractPlanNodeRef {
   auto statements = TryBind(catalog, query);
   EXPECT_EQ(statements.size(), 1U);
   Planner planner(catalog);
   planner.PlanQuery(*statements[0]);
   return planner.plan_;
 }
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // SELECT
@@ -343,8 +339,7 @@ TEST(PlannerTest, CorrelatedExistsDecorrelatesToSemiJoin) {
 
 TEST(PlannerTest, CorrelatedScalarAggregateDecorrelatesToLeftJoin) {
   auto catalog = MakeTestCatalog();
-  auto plan =
-      TryPlan(*catalog, "SELECT a.x FROM a WHERE a.x > (SELECT max(v1) FROM t1_1k WHERE v2 = a.y)");
+  auto plan = TryPlan(*catalog, "SELECT a.x FROM a WHERE a.x > (SELECT max(v1) FROM t1_1k WHERE v2 = a.y)");
 
   // The subquery became `... GROUP BY v2` LEFT-joined on the correlation key, with the comparison
   // filtering the join output (whose schema is the outer columns plus key + aggregate).
@@ -367,8 +362,7 @@ TEST(PlannerTest, CorrelatedScalarRestrictsSubqueryToTheProbedKeys) {
   auto catalog = MakeTestCatalog();
   // `a.y = 5` narrows the outer query to a handful of correlation keys, so the decorrelated
   // aggregate must not group the WHOLE of t1_1k: a SEMI join against those keys goes under it.
-  auto plan = TryPlan(*catalog,
-                      "SELECT a.x FROM a WHERE a.y = 5 AND a.x > (SELECT max(v1) FROM t1_1k WHERE v2 = a.y)");
+  auto plan = TryPlan(*catalog, "SELECT a.x FROM a WHERE a.y = 5 AND a.x > (SELECT max(v1) FROM t1_1k WHERE v2 = a.y)");
 
   auto join = FindPlanNode(plan, PlanType::HashJoin);
   ASSERT_NE(join, nullptr);

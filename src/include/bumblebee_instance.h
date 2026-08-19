@@ -125,8 +125,7 @@ class SimpleStreamWriter : public ResultWriter {
   auto MaxDisplayRows() const -> idx_t override { return max_display_rows_; }
 
   void WriteTruncationNotice(idx_t shown, idx_t total) override {
-    stream_ << "-- showing first " << shown << " of " << total << " rows (--max-rows 0 to show all) --"
-            << std::endl;
+    stream_ << "-- showing first " << shown << " of " << total << " rows (--max-rows 0 to show all) --" << std::endl;
   }
 
   bool disable_header_;
@@ -195,9 +194,6 @@ class BumbleBeeInstance {
 
   /** @brief Register a few tables so a fresh shell has something to query. */
   void GenerateMockTable();
-
-  /** @return The owning Database in durable mode, or nullptr for an in-memory instance. */
-  auto GetDatabase() -> Database * { return db_.get(); }
 
   /** The catalog (non-owning): the in-memory one, or the durable Database's. */
   Catalog *catalog_;

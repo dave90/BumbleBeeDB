@@ -26,26 +26,16 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto MakeSchema() -> SchemaRef {
+static auto MakeSchema() -> SchemaRef {
   return std::make_shared<Schema>(std::vector<Column>{
       Column("id", LogicalType(LogicalTypeId::INTEGER)),
       Column("v", LogicalType(LogicalTypeId::DOUBLE)),
   });
 }
 
-auto TypesOf(const Schema &s) -> std::vector<LogicalType> {
-  std::vector<LogicalType> t;
-  for (const auto &c : s.GetColumns()) {
-    t.push_back(c.GetType());
-  }
-  return t;
-}
-
-void AppendOne(TableHeap &heap, const Schema &schema, int32_t id, double v) {
+static void AppendOne(TableHeap &heap, const Schema &schema, int32_t id, double v) {
   DataChunk chunk;
-  chunk.Initialize(TypesOf(schema));
+  chunk.Initialize(schema.GetTypes());
   chunk.SetValue(0, 0, Value(id));
   chunk.SetValue(1, 0, Value(v));
   chunk.SetCardinality(1);
@@ -53,18 +43,16 @@ void AppendOne(TableHeap &heap, const Schema &schema, int32_t id, double v) {
   heap.Append(chunk, rids);
 }
 
-auto CountScan(TableHeap &heap, const Schema &schema) -> int {
+static auto CountScan(TableHeap &heap, const Schema &schema) -> int {
   auto scan = heap.MakeScan();
   DataChunk out;
-  out.Initialize(TypesOf(schema));
+  out.Initialize(schema.GetTypes());
   int seen = 0;
   while (scan->Next(out)) {
     seen += static_cast<int>(out.GetSize());
   }
   return seen;
 }
-
-}  // namespace
 
 // Phase 0.2 — Halloween fix: a scan opened before further appends must NOT see the later rows.
 TEST(TableHeapConcurrentTest, ScanStopBoundExcludesLaterAppends) {
@@ -82,7 +70,7 @@ TEST(TableHeapConcurrentTest, ScanStopBoundExcludesLaterAppends) {
     AppendOne(heap, *schema, i, i);
   }
   DataChunk out;
-  out.Initialize(TypesOf(*schema));
+  out.Initialize(schema->GetTypes());
   int seen = 0;
   while (scan->Next(out)) {
     seen += static_cast<int>(out.GetSize());

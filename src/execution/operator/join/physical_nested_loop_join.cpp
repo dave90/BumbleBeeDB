@@ -25,8 +25,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 /**
  * @brief Rewrite the two-sided join predicate onto the combined `left ++ right` chunk.
  *
@@ -34,7 +32,7 @@ namespace {
  * `col_idx` alone, so a right-side reference (`tuple_idx == 1`) is remapped to `left_cols + col_idx`;
  * a left-side reference keeps its index. Every other node is cloned with its children rewritten.
  */
-auto RemapOntoCombined(const AbstractExpression &expr, idx_t left_cols) -> AbstractExpressionRef {
+static auto RemapOntoCombined(const AbstractExpression &expr, idx_t left_cols) -> AbstractExpressionRef {
   if (const auto *col = dynamic_cast<const ColumnValueExpression *>(&expr)) {
     const auto idx = col->GetTupleIdx() == 0 ? col->GetColIdx() : left_cols + col->GetColIdx();
     return std::make_shared<ColumnValueExpression>(0, static_cast<uint32_t>(idx), col->GetReturnType());
@@ -46,8 +44,6 @@ auto RemapOntoCombined(const AbstractExpression &expr, idx_t left_cols) -> Abstr
   }
   return expr.CloneWithChildren(std::move(children));
 }
-
-}  // namespace
 
 struct NljGlobalSinkState : GlobalSinkState {
   std::mutex mu_;
@@ -81,7 +77,8 @@ auto PhysicalNestedLoopJoin::GetGlobalSinkState(ClientContext & /*context*/) con
   return std::make_unique<NljGlobalSinkState>();
 }
 
-auto PhysicalNestedLoopJoin::GetLocalSinkState(ExecutionContext & /*context*/) const -> std::unique_ptr<LocalSinkState> {
+auto PhysicalNestedLoopJoin::GetLocalSinkState(ExecutionContext & /*context*/) const
+    -> std::unique_ptr<LocalSinkState> {
   return std::make_unique<NljLocalSinkState>();
 }
 

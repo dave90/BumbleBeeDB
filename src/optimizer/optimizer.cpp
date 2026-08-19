@@ -20,17 +20,13 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Add every node type in the tree to `present`. */
-void CollectPlanTypes(const AbstractPlanNodeRef &plan, std::unordered_set<PlanType> &present) {
+static void CollectPlanTypes(const AbstractPlanNodeRef &plan, std::unordered_set<PlanType> &present) {
   present.insert(plan->GetType());
   for (const auto &child : plan->GetChildren()) {
     CollectPlanTypes(child, present);
   }
 }
-
-}  // namespace
 
 auto Optimizer::Optimize(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef {
   auto p = plan;
@@ -45,8 +41,7 @@ auto Optimizer::Optimize(const AbstractPlanNodeRef &plan) -> AbstractPlanNodeRef
   CollectPlanTypes(p, present);
   const auto has = [&present](PlanType t) { return present.find(t) != present.end(); };
   const bool joins_or_filters = has(PlanType::Filter) || has(PlanType::NestedLoopJoin);
-  const bool prunable =
-      has(PlanType::SeqScan) || has(PlanType::HashJoin) || has(PlanType::NestedLoopJoin);
+  const bool prunable = has(PlanType::SeqScan) || has(PlanType::HashJoin) || has(PlanType::NestedLoopJoin);
 
   // Order matters. MergeFilterNLJ must run before NLJAsHashJoin, because the
   // planner emits a cross product plus a separate Filter, and the join predicate

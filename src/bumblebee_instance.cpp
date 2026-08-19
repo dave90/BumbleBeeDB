@@ -52,14 +52,12 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** Backing store size for an in-memory instance: 4096 pages (32 MiB) is plenty for the test suites. */
 constexpr size_t kInMemoryDiskPages = 4096;
 constexpr size_t kInMemoryFrames = 1024;
 
 /** @brief Stream a result collector's gathered chunks to `writer` as a table. */
-void WriteResultTable(const PhysicalOperator &root, GlobalSinkState *sink_state, ResultWriter &writer) {
+static void WriteResultTable(const PhysicalOperator &root, GlobalSinkState *sink_state, ResultWriter &writer) {
   auto *gs = dynamic_cast<ResultCollectorGlobalState *>(sink_state);
   writer.BeginTable(true);
   writer.BeginHeader();
@@ -101,8 +99,6 @@ void WriteResultTable(const PhysicalOperator &root, GlobalSinkState *sink_state,
   writer.EndTable();
 }
 
-}  // namespace
-
 BumbleBeeInstance::BumbleBeeInstance(duration_t txn_timeout)
     : mem_disk_(std::make_unique<MemoryDiskManager>(kInMemoryDiskPages)),
       owned_bpm_(std::make_unique<BufferPoolManager>(kInMemoryFrames, mem_disk_.get())),
@@ -113,8 +109,7 @@ BumbleBeeInstance::BumbleBeeInstance(duration_t txn_timeout)
   txn_mgr_ = owned_txn_mgr_.get();
 }
 
-BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames,
-                                     duration_t txn_timeout)
+BumbleBeeInstance::BumbleBeeInstance(const std::filesystem::path &db_file, size_t num_frames, duration_t txn_timeout)
     : db_(std::make_unique<Database>(db_file, num_frames, txn_timeout)) {
   // The catalog, buffer pool and transaction manager all live inside the Database (which owns the disk);
   // ~Database (via the db_ member) flushes and persists on shutdown.
@@ -359,9 +354,8 @@ void BumbleBeeInstance::HandleCreateExternalTable(const CreateStatement &stmt, R
       }
       schema = Schema(columns);
     } else if (!ExternalSchemaMatches(*schema, reader.names_, reader.return_types_)) {
-      throw Exception(fmt::format(
-          "external table '{}': parquet file '{}' does not match the {} schema", stmt.table_, entry.file_name_,
-          stmt.columns_.empty() ? "inferred" : "declared"));
+      throw Exception(fmt::format("external table '{}': parquet file '{}' does not match the {} schema", stmt.table_,
+                                  entry.file_name_, stmt.columns_.empty() ? "inferred" : "declared"));
     }
     entry.row_count_ = reader.NumRows();
   }
@@ -390,8 +384,7 @@ void BumbleBeeInstance::CmdVacuumExternal(const std::string &table_name, ResultW
   }
   auto *parquet = dynamic_cast<ParquetTable *>(info->storage_.get());
   if (parquet == nullptr) {
-    throw Exception(fmt::format("\\vacuum only applies to external parquet tables ('{}' is row-format)",
-                                table_name));
+    throw Exception(fmt::format("\\vacuum only applies to external parquet tables ('{}' is row-format)", table_name));
   }
   const auto &dir = parquet->GetPath();
 
@@ -415,8 +408,7 @@ void BumbleBeeInstance::CmdVacuumExternal(const std::string &table_name, ResultW
     }
     const auto name = entry.path().filename().string();
     const bool orphan_part = name.ends_with(".parquet") && !live.contains(name);
-    const bool old_manifest =
-        name.starts_with(ParquetManifestIO::MANIFEST_PREFIX) && name != newest_manifest;
+    const bool old_manifest = name.starts_with(ParquetManifestIO::MANIFEST_PREFIX) && name != newest_manifest;
     if (orphan_part || old_manifest) {
       std::error_code ec;
       if (fs::remove(entry.path(), ec)) {

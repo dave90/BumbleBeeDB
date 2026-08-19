@@ -58,10 +58,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Break a bound WHERE clause into its AND-ed conjuncts. */
-void SplitBoundConjuncts(const BoundExpression &expr, std::vector<const BoundExpression *> &out) {
+static void SplitBoundConjuncts(const BoundExpression &expr, std::vector<const BoundExpression *> &out) {
   if (expr.type_ == ExpressionType::BINARY_OP) {
     if (const auto &binary_op = dynamic_cast<const BoundBinaryOp &>(expr); binary_op.op_name_ == "and") {
       SplitBoundConjuncts(*binary_op.larg_, out);
@@ -73,7 +71,7 @@ void SplitBoundConjuncts(const BoundExpression &expr, std::vector<const BoundExp
 }
 
 /** @brief True for an IN/EXISTS subquery conjunct, which plans as a join rather than a predicate. */
-auto IsSubqueryPredicate(const BoundExpression &expr) -> bool {
+static auto IsSubqueryPredicate(const BoundExpression &expr) -> bool {
   if (expr.type_ != ExpressionType::SUBQUERY) {
     return false;
   }
@@ -81,94 +79,87 @@ auto IsSubqueryPredicate(const BoundExpression &expr) -> bool {
   return subquery.kind_ == SubqueryKind::ANY || subquery.kind_ == SubqueryKind::EXISTS;
 }
 
-/** @brief Does this expression contain a reference to an ENCLOSING query's column? A nested
- * subquery counts through its correlated flag (its own internals are its own business). */
-auto ContainsOuterRef(const BoundExpression &expr) -> bool {
+/**
+ * @brief Invoke `fn(child)` on each direct sub-expression of `expr`.
+ *
+ * The three walks below — "does this mention an outer column", "collect the correlated scalars",
+ * "is this a plain re-evaluable predicate" — differ only in what they do at a node, not in the
+ * shape of the tree. Keeping the shape here means a new ExpressionType is taught to descend once
+ * instead of being silently dropped by whichever switch forgot it.
+ *
+ * @param expr The expression whose children to visit.
+ * @param fn Invoked once per direct child.
+ * @return bool True if `expr` is a composite node, i.e. its children were visited; false for a
+ *         leaf (constant, column ref, star) or a node this walk deliberately does not descend.
+ */
+template <class FN>
+static auto VisitChildren(const BoundExpression &expr, FN &&fn) -> bool {
   switch (expr.type_) {
-    case ExpressionType::OUTER_COLUMN_REF:
-      return true;
     case ExpressionType::BINARY_OP: {
       const auto &binary_op = dynamic_cast<const BoundBinaryOp &>(expr);
-      return ContainsOuterRef(*binary_op.larg_) || ContainsOuterRef(*binary_op.rarg_);
+      fn(*binary_op.larg_);
+      fn(*binary_op.rarg_);
+      return true;
     }
     case ExpressionType::UNARY_OP:
-      return ContainsOuterRef(*dynamic_cast<const BoundUnaryOp &>(expr).arg_);
+      fn(*dynamic_cast<const BoundUnaryOp &>(expr).arg_);
+      return true;
     case ExpressionType::ALIAS:
-      return ContainsOuterRef(*dynamic_cast<const BoundAlias &>(expr).child_);
+      fn(*dynamic_cast<const BoundAlias &>(expr).child_);
+      return true;
     case ExpressionType::TYPE_CAST:
-      return ContainsOuterRef(*dynamic_cast<const BoundTypeCast &>(expr).child_);
-    case ExpressionType::FUNC_CALL: {
-      const auto &func = dynamic_cast<const BoundFuncCall &>(expr);
-      return std::any_of(func.args_.begin(), func.args_.end(),
-                         [](const auto &arg) { return ContainsOuterRef(*arg); });
-    }
-    case ExpressionType::AGG_CALL: {
-      const auto &agg = dynamic_cast<const BoundAggCall &>(expr);
-      return std::any_of(agg.args_.begin(), agg.args_.end(),
-                         [](const auto &arg) { return ContainsOuterRef(*arg); });
-    }
+      fn(*dynamic_cast<const BoundTypeCast &>(expr).child_);
+      return true;
+    case ExpressionType::FUNC_CALL:
+      for (const auto &arg : dynamic_cast<const BoundFuncCall &>(expr).args_) {
+        fn(*arg);
+      }
+      return true;
+    case ExpressionType::AGG_CALL:
+      for (const auto &arg : dynamic_cast<const BoundAggCall &>(expr).args_) {
+        fn(*arg);
+      }
+      return true;
     case ExpressionType::IN_EXPR: {
       const auto &in_expr = dynamic_cast<const BoundInExpr &>(expr);
-      if (ContainsOuterRef(*in_expr.child_)) {
-        return true;
+      fn(*in_expr.child_);
+      for (const auto &item : in_expr.list_) {
+        fn(*item);
       }
-      return std::any_of(in_expr.list_.begin(), in_expr.list_.end(),
-                         [](const auto &item) { return ContainsOuterRef(*item); });
+      return true;
     }
-    case ExpressionType::SUBQUERY:
-      return dynamic_cast<const BoundSubqueryExpr &>(expr).correlated_;
     default:
-      return false;  // constants, in-scope column refs, star
+      // Leaves (constant, in-scope column ref, star, outer column ref) and SUBQUERY, whose
+      // internals belong to the subquery — every caller below decides about it for itself.
+      return false;
   }
+}
+
+/** @brief Does this expression contain a reference to an ENCLOSING query's column? A nested
+ * subquery counts through its correlated flag (its own internals are its own business). */
+static auto ContainsOuterRef(const BoundExpression &expr) -> bool {
+  if (expr.type_ == ExpressionType::OUTER_COLUMN_REF) {
+    return true;
+  }
+  if (expr.type_ == ExpressionType::SUBQUERY) {
+    return dynamic_cast<const BoundSubqueryExpr &>(expr).correlated_;
+  }
+  bool found = false;
+  VisitChildren(expr, [&found](const BoundExpression &child) { found = found || ContainsOuterRef(child); });
+  return found;
 }
 
 /** @brief Collect the correlated scalar subqueries inside `expr` (without descending into nested
  * subqueries — theirs are their own). */
-void CollectCorrelatedScalars(const BoundExpression &expr, std::vector<const BoundSubqueryExpr *> &out) {
-  switch (expr.type_) {
-    case ExpressionType::SUBQUERY: {
-      const auto &subquery = dynamic_cast<const BoundSubqueryExpr &>(expr);
-      if (subquery.kind_ == SubqueryKind::SCALAR && subquery.correlated_) {
-        out.push_back(&subquery);
-      }
-      return;
+static void CollectCorrelatedScalars(const BoundExpression &expr, std::vector<const BoundSubqueryExpr *> &out) {
+  if (expr.type_ == ExpressionType::SUBQUERY) {
+    const auto &subquery = dynamic_cast<const BoundSubqueryExpr &>(expr);
+    if (subquery.kind_ == SubqueryKind::SCALAR && subquery.correlated_) {
+      out.push_back(&subquery);
     }
-    case ExpressionType::BINARY_OP: {
-      const auto &binary_op = dynamic_cast<const BoundBinaryOp &>(expr);
-      CollectCorrelatedScalars(*binary_op.larg_, out);
-      CollectCorrelatedScalars(*binary_op.rarg_, out);
-      return;
-    }
-    case ExpressionType::UNARY_OP:
-      CollectCorrelatedScalars(*dynamic_cast<const BoundUnaryOp &>(expr).arg_, out);
-      return;
-    case ExpressionType::ALIAS:
-      CollectCorrelatedScalars(*dynamic_cast<const BoundAlias &>(expr).child_, out);
-      return;
-    case ExpressionType::TYPE_CAST:
-      CollectCorrelatedScalars(*dynamic_cast<const BoundTypeCast &>(expr).child_, out);
-      return;
-    case ExpressionType::FUNC_CALL:
-      for (const auto &arg : dynamic_cast<const BoundFuncCall &>(expr).args_) {
-        CollectCorrelatedScalars(*arg, out);
-      }
-      return;
-    case ExpressionType::AGG_CALL:
-      for (const auto &arg : dynamic_cast<const BoundAggCall &>(expr).args_) {
-        CollectCorrelatedScalars(*arg, out);
-      }
-      return;
-    case ExpressionType::IN_EXPR: {
-      const auto &in_expr = dynamic_cast<const BoundInExpr &>(expr);
-      CollectCorrelatedScalars(*in_expr.child_, out);
-      for (const auto &item : in_expr.list_) {
-        CollectCorrelatedScalars(*item, out);
-      }
-      return;
-    }
-    default:
-      return;
+    return;
   }
+  VisitChildren(expr, [&out](const BoundExpression &child) { CollectCorrelatedScalars(child, out); });
 }
 
 /**
@@ -179,39 +170,26 @@ void CollectCorrelatedScalars(const BoundExpression &expr, std::vector<const Bou
  * @param out The column references found so far. Meaningless when this returns false.
  * @return bool True if the whole expression is a plain, re-evaluable predicate.
  */
-auto CollectPlainColumnRefs(const BoundExpression &expr, std::vector<const BoundColumnRef *> &out) -> bool {
+static auto CollectPlainColumnRefs(const BoundExpression &expr, std::vector<const BoundColumnRef *> &out) -> bool {
   switch (expr.type_) {
     case ExpressionType::COLUMN_REF:
       out.push_back(&dynamic_cast<const BoundColumnRef &>(expr));
       return true;
     case ExpressionType::CONSTANT:
       return true;
-    case ExpressionType::BINARY_OP: {
-      const auto &binary_op = dynamic_cast<const BoundBinaryOp &>(expr);
-      return CollectPlainColumnRefs(*binary_op.larg_, out) && CollectPlainColumnRefs(*binary_op.rarg_, out);
-    }
-    case ExpressionType::UNARY_OP:
-      return CollectPlainColumnRefs(*dynamic_cast<const BoundUnaryOp &>(expr).arg_, out);
-    case ExpressionType::ALIAS:
-      return CollectPlainColumnRefs(*dynamic_cast<const BoundAlias &>(expr).child_, out);
-    case ExpressionType::TYPE_CAST:
-      return CollectPlainColumnRefs(*dynamic_cast<const BoundTypeCast &>(expr).child_, out);
-    case ExpressionType::FUNC_CALL: {
-      const auto &func = dynamic_cast<const BoundFuncCall &>(expr);
-      return std::all_of(func.args_.begin(), func.args_.end(),
-                         [&out](const auto &arg) { return CollectPlainColumnRefs(*arg, out); });
-    }
-    case ExpressionType::IN_EXPR: {
-      const auto &in_expr = dynamic_cast<const BoundInExpr &>(expr);
-      if (!CollectPlainColumnRefs(*in_expr.child_, out)) {
-        return false;
-      }
-      return std::all_of(in_expr.list_.begin(), in_expr.list_.end(),
-                         [&out](const auto &item) { return CollectPlainColumnRefs(*item, out); });
-    }
-    default:
+    case ExpressionType::AGG_CALL:
+      // Rejected rather than descended into (which VisitChildren would happily do): an aggregate
+      // is not a row-wise predicate, so a filter carrying one cannot be re-evaluated per row.
       return false;
+    default:
+      break;
   }
+  // `ok` is assigned first in the `&&` so the recursion always runs on every child; a composite
+  // node is plain only if all of its children are, and any other node is not plain at all.
+  bool ok = true;
+  const bool composite =
+      VisitChildren(expr, [&ok, &out](const BoundExpression &child) { ok = CollectPlainColumnRefs(child, out) && ok; });
+  return composite && ok;
 }
 
 /**
@@ -225,7 +203,7 @@ auto CollectPlainColumnRefs(const BoundExpression &expr, std::vector<const Bound
  * @param col_name The qualified column name.
  * @return const BoundBaseTableRef* The base table, or null (a subquery/CTE/VALUES supplies it).
  */
-auto FindKeyBaseTable(const BoundTableRef &table_ref, const std::string &col_name) -> const BoundBaseTableRef * {
+static auto FindKeyBaseTable(const BoundTableRef &table_ref, const std::string &col_name) -> const BoundBaseTableRef * {
   switch (table_ref.type_) {
     case TableReferenceType::BASE_TABLE: {
       const auto &base = dynamic_cast<const BoundBaseTableRef &>(table_ref);
@@ -267,8 +245,8 @@ auto FindKeyBaseTable(const BoundTableRef &table_ref, const std::string &col_nam
  * @param key_col_idx The key's column index in `key_source`'s schema.
  * @return AbstractPlanNodeRef The rewritten plan, or null if the shape did not match.
  */
-auto RestrictAggregateInput(const AbstractPlanNodeRef &plan, uint32_t group_idx, AbstractPlanNodeRef key_source,
-                            uint32_t key_col_idx) -> AbstractPlanNodeRef {
+static auto RestrictAggregateInput(const AbstractPlanNodeRef &plan, uint32_t group_idx, AbstractPlanNodeRef key_source,
+                                   uint32_t key_col_idx) -> AbstractPlanNodeRef {
   if (plan->GetType() == PlanType::Aggregation) {
     const auto &agg = dynamic_cast<const AggregationPlanNode &>(*plan);
     if (group_idx >= agg.GetGroupBys().size()) {
@@ -282,8 +260,7 @@ auto RestrictAggregateInput(const AbstractPlanNodeRef &plan, uint32_t group_idx,
     }
     auto child = agg.GetChildAt(0);
     auto semi_join = std::make_shared<HashJoinPlanNode>(
-        child->output_schema_, child, std::move(key_source),
-        std::vector<AbstractExpressionRef>{group_key},
+        child->output_schema_, child, std::move(key_source), std::vector<AbstractExpressionRef>{group_key},
         std::vector<AbstractExpressionRef>{std::make_shared<ColumnValueExpression>(1, key_col_idx, key_col)},
         JoinType::SEMI);
     return plan->CloneWithChildren({std::move(semi_join)});
@@ -313,8 +290,8 @@ struct CorrelationPair {
  * in `remaining` (a conjunct that still holds an outer ref stays there and fails later with the
  * planner's clean unsupported-correlation error).
  */
-void ExtractCorrelation(std::unique_ptr<BoundExpression> expr, std::vector<CorrelationPair> &pairs,
-                        std::vector<std::unique_ptr<BoundExpression>> &remaining) {
+static void ExtractCorrelation(std::unique_ptr<BoundExpression> expr, std::vector<CorrelationPair> &pairs,
+                               std::vector<std::unique_ptr<BoundExpression>> &remaining) {
   if (expr->type_ == ExpressionType::BINARY_OP) {
     auto &binary_op = dynamic_cast<BoundBinaryOp &>(*expr);
     if (binary_op.op_name_ == "and") {
@@ -340,7 +317,7 @@ void ExtractCorrelation(std::unique_ptr<BoundExpression> expr, std::vector<Corre
 }
 
 /** @brief Rebuild a WHERE clause from conjuncts; empty means "no clause" (the INVALID sentinel). */
-auto ConjoinBound(std::vector<std::unique_ptr<BoundExpression>> conjuncts) -> std::unique_ptr<BoundExpression> {
+static auto ConjoinBound(std::vector<std::unique_ptr<BoundExpression>> conjuncts) -> std::unique_ptr<BoundExpression> {
   if (conjuncts.empty()) {
     return std::make_unique<BoundExpression>();
   }
@@ -358,21 +335,18 @@ auto ConjoinBound(std::vector<std::unique_ptr<BoundExpression>> conjuncts) -> st
  * @param clause_name "LIMIT" or "OFFSET", for the error message.
  * @return std::optional<size_t> The value, or nullopt if the clause is absent.
  */
-auto PlanLimitValue(const BoundExpression &expr, const char *clause_name) -> std::optional<size_t> {
+static auto PlanLimitValue(const BoundExpression &expr, const char *clause_name) -> std::optional<size_t> {
   if (expr.IsInvalid()) {
     return std::nullopt;
   }
   if (expr.type_ == ExpressionType::CONSTANT) {
     const auto &constant_expr = dynamic_cast<const BoundConstant &>(expr);
-    if (!constant_expr.val_.IsNull() &&
-        constant_expr.val_.GetType() == LogicalType(LogicalTypeId::INTEGER)) {
+    if (!constant_expr.val_.IsNull() && constant_expr.val_.GetType() == LogicalType(LogicalTypeId::INTEGER)) {
       return std::make_optional(static_cast<size_t>(constant_expr.val_.GetAs<int32_t>()));
     }
   }
   throw NotImplementedException(fmt::format("the {} clause must be an integer constant", clause_name));
 }
-
-}  // namespace
 
 auto Planner::PlanSelect(const SelectStatement &statement) -> AbstractPlanNodeRef {
   auto ctx_guard = NewContext();
@@ -414,10 +388,9 @@ auto Planner::PlanSelect(const SelectStatement &statement) -> AbstractPlanNodeRe
       exprs.emplace_back(std::move(expr));
       column_names.emplace_back(std::move(name));
     }
-    plan = std::make_shared<ProjectionPlanNode>(
-        std::make_shared<Schema>(
-            ProjectionPlanNode::RenameSchema(ProjectionPlanNode::InferProjectionSchema(exprs), column_names)),
-        std::move(exprs), std::move(plan));
+    plan = std::make_shared<ProjectionPlanNode>(std::make_shared<Schema>(ProjectionPlanNode::RenameSchema(
+                                                    ProjectionPlanNode::InferProjectionSchema(exprs), column_names)),
+                                                std::move(exprs), std::move(plan));
   }
 
   // DISTINCT is a group-by on every output column with no aggregates.
@@ -429,8 +402,7 @@ auto Planner::PlanSelect(const SelectStatement &statement) -> AbstractPlanNodeRe
       distinct_exprs.emplace_back(std::make_shared<ColumnValueExpression>(0, col_idx++, col));
     }
     plan = std::make_shared<AggregationPlanNode>(std::make_shared<Schema>(child->OutputSchema()), child,
-                                                 std::move(distinct_exprs),
-                                                 std::vector<AbstractExpressionRef>{},
+                                                 std::move(distinct_exprs), std::vector<AbstractExpressionRef>{},
                                                  std::vector<AggregationType>{});
   }
 
@@ -441,8 +413,7 @@ auto Planner::PlanSelect(const SelectStatement &statement) -> AbstractPlanNodeRe
       auto [_, expr] = PlanExpression(*order_by->expr_, {plan});
       order_bys.emplace_back(order_by->type_, order_by->null_order_, std::move(expr));
     }
-    plan = std::make_shared<SortPlanNode>(std::make_shared<Schema>(plan->OutputSchema()), plan,
-                                          std::move(order_bys));
+    plan = std::make_shared<SortPlanNode>(std::make_shared<Schema>(plan->OutputSchema()), plan, std::move(order_bys));
   }
 
   const auto limit = PlanLimitValue(*statement.limit_count_, "LIMIT");
@@ -458,8 +429,8 @@ auto Planner::PlanSelect(const SelectStatement &statement) -> AbstractPlanNodeRe
   return plan;
 }
 
-auto Planner::PlanWhere(const BoundExpression &where, AbstractPlanNodeRef plan,
-                        const SelectStatement *outer_statement) -> AbstractPlanNodeRef {
+auto Planner::PlanWhere(const BoundExpression &where, AbstractPlanNodeRef plan, const SelectStatement *outer_statement)
+    -> AbstractPlanNodeRef {
   // IN/EXISTS subquery conjuncts plan as SEMI/ANTI joins, not as filter predicates, so the WHERE
   // is split: the ordinary conjuncts stay a Filter (placed FIRST, directly over the FROM plan, so
   // the existing merge/pushdown/hash-join pipeline sees exactly the shape it always has), and each
@@ -496,8 +467,7 @@ auto Planner::PlanWhere(const BoundExpression &where, AbstractPlanNodeRef plan,
                       ? std::move(expr)
                       : std::make_shared<LogicExpression>(std::move(predicate), std::move(expr), LogicType::And);
     }
-    plan = std::make_shared<FilterPlanNode>(std::make_shared<Schema>(schema), std::move(predicate),
-                                            std::move(plan));
+    plan = std::make_shared<FilterPlanNode>(std::make_shared<Schema>(schema), std::move(predicate), std::move(plan));
   }
   for (const auto *subquery : subquery_conjuncts) {
     plan = PlanSubqueryPredicate(*subquery, std::move(plan));
@@ -524,53 +494,7 @@ auto Planner::PlanSubqueryPredicate(const BoundSubqueryExpr &subquery, AbstractP
     if (subquery.kind_ != SubqueryKind::EXISTS) {
       throw NotImplementedException("a correlated IN subquery is not supported (only correlated EXISTS)");
     }
-    // Correlated [NOT] EXISTS: pull the `inner = outer` equalities out of the subquery WHERE,
-    // make the inner sides the subquery's output, and SEMI/ANTI-join the enclosing plan against
-    // it on those keys. Any remaining outer reference fails with the planner's clean error.
-    auto &sq = *subquery.subquery_;
-    // Shapes the join rewrite would silently distort are refused: an ungrouped aggregate
-    // subquery yields one row even over zero input (EXISTS would be constantly true), and a
-    // LIMIT applies to the whole subquery, not per correlation key.
-    const bool has_agg =
-        std::any_of(sq.select_list_.begin(), sq.select_list_.end(),
-                    [](const auto &item) { return item->HasAggregation(); });
-    if (has_agg || !sq.group_by_.empty() || !sq.having_->IsInvalid() || !sq.limit_count_->IsInvalid()) {
-      throw NotImplementedException(
-          "correlated EXISTS does not support aggregation, GROUP BY, HAVING or LIMIT in the subquery");
-    }
-    std::vector<CorrelationPair> pairs;
-    std::vector<std::unique_ptr<BoundExpression>> remaining;
-    if (!sq.where_->IsInvalid()) {
-      ExtractCorrelation(std::move(sq.where_), pairs, remaining);
-    }
-    if (pairs.empty()) {
-      throw NotImplementedException(
-          "correlated EXISTS requires an equality with an outer column in the subquery WHERE clause");
-    }
-    sq.where_ = ConjoinBound(std::move(remaining));
-    sq.select_list_.clear();
-    for (auto &pair : pairs) {
-      sq.select_list_.push_back(std::move(pair.inner_));
-    }
-
-    Planner sub_planner(catalog_);
-    sub_planner.subquery_eval_ = subquery_eval_;
-    sub_planner.PlanQuery(sq);
-    auto subplan = sub_planner.plan_;
-
-    std::vector<AbstractExpressionRef> left_keys;
-    std::vector<AbstractExpressionRef> right_keys;
-    for (size_t i = 0; i < pairs.size(); i++) {
-      auto [_, outer_key] = PlanExpression(*pairs[i].outer_, {outer});
-      left_keys.push_back(std::move(outer_key));
-      right_keys.push_back(std::make_shared<ColumnValueExpression>(
-          1, i, subplan->OutputSchema().GetColumn(static_cast<uint32_t>(i))));
-    }
-    // EXISTS semantics, NOT null-aware: a NULL key row simply never matches (so NOT EXISTS keeps
-    // NULL-keyed outer rows — their per-row subquery result is empty, which is exactly EXISTS=false).
-    return std::make_shared<HashJoinPlanNode>(outer->output_schema_, outer, std::move(subplan),
-                                              std::move(left_keys), std::move(right_keys),
-                                              subquery.negated_ ? JoinType::ANTI : JoinType::SEMI);
+    return PlanCorrelatedExists(subquery, std::move(outer));
   }
 
   // The subquery plans in its own scope; the eval hook propagates so nested scalar subqueries
@@ -590,17 +514,69 @@ auto Planner::PlanSubqueryPredicate(const BoundSubqueryExpr &subquery, AbstractP
     auto right_key = std::make_shared<ColumnValueExpression>(1, 0, subplan->OutputSchema().GetColumn(0));
     auto join = std::make_shared<HashJoinPlanNode>(
         outer->output_schema_, outer, std::move(subplan), std::vector<AbstractExpressionRef>{std::move(tested)},
-        std::vector<AbstractExpressionRef>{std::move(right_key)},
-        subquery.negated_ ? JoinType::ANTI : JoinType::SEMI);
+        std::vector<AbstractExpressionRef>{std::move(right_key)}, subquery.negated_ ? JoinType::ANTI : JoinType::SEMI);
     join->null_aware_ = true;
     return join;
   }
 
   BUMBLEBEE_ASSERT(subquery.kind_ == SubqueryKind::EXISTS, "unexpected subquery kind");
-  // Uncorrelated [NOT] EXISTS: the answer is one bit for the whole statement. Reduce the subquery
-  // to `count(*) LIMIT 1` and pre-execute it (EXPLAIN keeps it behind a placeholder filter).
-  auto limited =
-      std::make_shared<LimitPlanNode>(subplan->output_schema_, std::move(subplan), /*limit=*/1);
+  return PlanUncorrelatedExists(subquery, std::move(outer), std::move(subplan));
+}
+
+auto Planner::PlanCorrelatedExists(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer)
+    -> AbstractPlanNodeRef {
+  // Pull the `inner = outer` equalities out of the subquery WHERE, make the inner sides the
+  // subquery's output, and SEMI/ANTI-join the enclosing plan against it on those keys. Any
+  // remaining outer reference fails with the planner's clean error.
+  auto &sq = *subquery.subquery_;
+  // Shapes the join rewrite would silently distort are refused: an ungrouped aggregate
+  // subquery yields one row even over zero input (EXISTS would be constantly true), and a
+  // LIMIT applies to the whole subquery, not per correlation key.
+  const bool has_agg = std::any_of(sq.select_list_.begin(), sq.select_list_.end(),
+                                   [](const auto &item) { return item->HasAggregation(); });
+  if (has_agg || !sq.group_by_.empty() || !sq.having_->IsInvalid() || !sq.limit_count_->IsInvalid()) {
+    throw NotImplementedException(
+        "correlated EXISTS does not support aggregation, GROUP BY, HAVING or LIMIT in the subquery");
+  }
+  std::vector<CorrelationPair> pairs;
+  std::vector<std::unique_ptr<BoundExpression>> remaining;
+  if (!sq.where_->IsInvalid()) {
+    ExtractCorrelation(std::move(sq.where_), pairs, remaining);
+  }
+  if (pairs.empty()) {
+    throw NotImplementedException(
+        "correlated EXISTS requires an equality with an outer column in the subquery WHERE clause");
+  }
+  sq.where_ = ConjoinBound(std::move(remaining));
+  sq.select_list_.clear();
+  for (auto &pair : pairs) {
+    sq.select_list_.push_back(std::move(pair.inner_));
+  }
+
+  Planner sub_planner(catalog_);
+  sub_planner.subquery_eval_ = subquery_eval_;
+  sub_planner.PlanQuery(sq);
+  auto subplan = sub_planner.plan_;
+
+  std::vector<AbstractExpressionRef> left_keys;
+  std::vector<AbstractExpressionRef> right_keys;
+  for (size_t i = 0; i < pairs.size(); i++) {
+    auto [_, outer_key] = PlanExpression(*pairs[i].outer_, {outer});
+    left_keys.push_back(std::move(outer_key));
+    right_keys.push_back(
+        std::make_shared<ColumnValueExpression>(1, i, subplan->OutputSchema().GetColumn(static_cast<uint32_t>(i))));
+  }
+  // EXISTS semantics, NOT null-aware: a NULL key row simply never matches (so NOT EXISTS keeps
+  // NULL-keyed outer rows — their per-row subquery result is empty, which is exactly EXISTS=false).
+  return std::make_shared<HashJoinPlanNode>(outer->output_schema_, outer, std::move(subplan), std::move(left_keys),
+                                            std::move(right_keys), subquery.negated_ ? JoinType::ANTI : JoinType::SEMI);
+}
+
+auto Planner::PlanUncorrelatedExists(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer,
+                                     AbstractPlanNodeRef subplan) -> AbstractPlanNodeRef {
+  // The answer is one bit for the whole statement. Reduce the subquery to `count(*) LIMIT 1` and
+  // pre-execute it (EXPLAIN keeps it behind a placeholder filter).
+  auto limited = std::make_shared<LimitPlanNode>(subplan->output_schema_, std::move(subplan), /*limit=*/1);
   std::vector<AbstractExpressionRef> count_args{
       std::make_shared<ConstantValueExpression>(Value{static_cast<int32_t>(1)})};
   std::vector<AggregationType> count_types{AggregationType::CountStarAggregate};
@@ -613,8 +589,7 @@ auto Planner::PlanSubqueryPredicate(const BoundSubqueryExpr &subquery, AbstractP
     // EXPLAIN path: nothing may run — a placeholder filter shows where the EXISTS would apply.
     return std::make_shared<FilterPlanNode>(
         std::make_shared<Schema>(outer->OutputSchema()),
-        std::make_shared<SubqueryExpression>(count_plan,
-                                             Column{"<exists>", LogicalType(LogicalTypeId::BOOLEAN)}),
+        std::make_shared<SubqueryExpression>(count_plan, Column{"<exists>", LogicalType(LogicalTypeId::BOOLEAN)}),
         std::move(outer));
   }
 
@@ -625,8 +600,7 @@ auto Planner::PlanSubqueryPredicate(const BoundSubqueryExpr &subquery, AbstractP
   }
   // The predicate is constantly false: an always-false filter empties the result.
   return std::make_shared<FilterPlanNode>(std::make_shared<Schema>(outer->OutputSchema()),
-                                          std::make_shared<ConstantValueExpression>(Value{false}),
-                                          std::move(outer));
+                                          std::make_shared<ConstantValueExpression>(Value{false}), std::move(outer));
 }
 
 auto Planner::EstimatedTableRows(const std::string &table_name) const -> idx_t {
@@ -706,10 +680,18 @@ auto Planner::BuildCorrelationKeySource(const SelectStatement &outer_statement, 
                                           std::move(scan));
 }
 
-auto Planner::PlanCorrelatedScalarSubquery(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer,
-                                           const SelectStatement &outer_statement) -> AbstractPlanNodeRef {
-  auto &sq = *subquery.subquery_;
-
+/**
+ * @brief Rewrite a correlated scalar subquery, in place, into the grouped aggregate its
+ * decorrelation joins against.
+ *
+ * The `inner = outer` equalities are pulled out of the WHERE; the inner keys become both the
+ * leading output columns and the GROUP BY, ahead of the aggregate. Shapes for which that rewrite
+ * would not be sound are refused.
+ *
+ * @param sq The subquery statement, mutated in place.
+ * @return The correlation pairs (outer side untouched, inner side consumed into the rewrite).
+ */
+static auto RewriteScalarSubqueryForDecorrelation(SelectStatement &sq) -> std::vector<CorrelationPair> {
   // Only the aggregate shape decorrelates soundly: the GROUP BY on the correlation key guarantees
   // one value per key, which is what a scalar subquery must produce per outer row.
   if (sq.select_list_.size() != 1 || !sq.select_list_[0]->HasAggregation() || !sq.group_by_.empty() ||
@@ -744,6 +726,29 @@ auto Planner::PlanCorrelatedScalarSubquery(const BoundSubqueryExpr &subquery, Ab
   }
   new_select_list.push_back(std::move(sq.select_list_[0]));
   sq.select_list_ = std::move(new_select_list);
+  return pairs;
+}
+
+/** @brief Wrap `subplan` in an identity projection renaming every column to `<tag>.cN` — the
+ * subquery usually reads the same tables as the enclosing query, so its column names would
+ * otherwise collide in the join schema. */
+static auto RenameSubqueryColumns(AbstractPlanNodeRef subplan, const std::string &tag) -> AbstractPlanNodeRef {
+  const auto &sub_cols = subplan->OutputSchema().GetColumns();
+  std::vector<AbstractExpressionRef> identity;
+  std::vector<std::string> names;
+  for (uint32_t i = 0; i < sub_cols.size(); i++) {
+    identity.push_back(std::make_shared<ColumnValueExpression>(0, i, sub_cols[i]));
+    names.push_back(fmt::format("{}.c{}", tag, i));
+  }
+  auto renamed_schema = ProjectionPlanNode::RenameSchema(ProjectionPlanNode::InferProjectionSchema(identity), names);
+  return std::make_shared<ProjectionPlanNode>(std::make_shared<Schema>(renamed_schema), std::move(identity),
+                                              std::move(subplan));
+}
+
+auto Planner::PlanCorrelatedScalarSubquery(const BoundSubqueryExpr &subquery, AbstractPlanNodeRef outer,
+                                           const SelectStatement &outer_statement) -> AbstractPlanNodeRef {
+  auto &sq = *subquery.subquery_;
+  auto pairs = RewriteScalarSubqueryForDecorrelation(sq);
 
   Planner sub_planner(catalog_);
   sub_planner.subquery_eval_ = subquery_eval_;
@@ -770,28 +775,16 @@ auto Planner::PlanCorrelatedScalarSubquery(const BoundSubqueryExpr &subquery, Ab
     }
   }
 
-  // The subquery usually reads the same tables as the enclosing query, so its output column names
-  // would collide in the join schema; a rename projection gives them unique names.
-  const auto subquery_tag = fmt::format("__corr#{}", universal_id_++);
-  const auto &sub_cols = subplan->OutputSchema().GetColumns();
-  std::vector<AbstractExpressionRef> identity;
-  std::vector<std::string> names;
-  for (uint32_t i = 0; i < sub_cols.size(); i++) {
-    identity.push_back(std::make_shared<ColumnValueExpression>(0, i, sub_cols[i]));
-    names.push_back(fmt::format("{}.c{}", subquery_tag, i));
-  }
-  auto renamed_schema =
-      ProjectionPlanNode::RenameSchema(ProjectionPlanNode::InferProjectionSchema(identity), names);
-  AbstractPlanNodeRef renamed = std::make_shared<ProjectionPlanNode>(
-      std::make_shared<Schema>(renamed_schema), std::move(identity), std::move(subplan));
+  auto renamed = RenameSubqueryColumns(std::move(subplan), fmt::format("__corr#{}", universal_id_++));
+  const auto &renamed_schema = renamed->OutputSchema();
 
   std::vector<AbstractExpressionRef> left_keys;
   std::vector<AbstractExpressionRef> right_keys;
   for (size_t i = 0; i < pairs.size(); i++) {
     auto [_, outer_key] = PlanExpression(*pairs[i].outer_, {outer});
     left_keys.push_back(std::move(outer_key));
-    right_keys.push_back(std::make_shared<ColumnValueExpression>(
-        1, i, renamed_schema.GetColumn(static_cast<uint32_t>(i))));
+    right_keys.push_back(
+        std::make_shared<ColumnValueExpression>(1, i, renamed_schema.GetColumn(static_cast<uint32_t>(i))));
   }
 
   // LEFT join: an outer row whose key has no group must see the scalar as NULL, not vanish.
@@ -803,9 +796,9 @@ auto Planner::PlanCorrelatedScalarSubquery(const BoundSubqueryExpr &subquery, Ab
     join_cols.push_back(col);
   }
   const auto outer_width = outer->OutputSchema().GetColumnCount();
-  auto join = std::make_shared<HashJoinPlanNode>(std::make_shared<Schema>(join_cols), std::move(outer),
-                                                 std::move(renamed), std::move(left_keys), std::move(right_keys),
-                                                 JoinType::LEFT);
+  auto join =
+      std::make_shared<HashJoinPlanNode>(std::make_shared<Schema>(join_cols), std::move(outer), std::move(renamed),
+                                         std::move(left_keys), std::move(right_keys), JoinType::LEFT);
 
   // From here on, this subquery's value IS the aggregate column of the join output.
   const auto value_idx = outer_width + static_cast<uint32_t>(pairs.size());

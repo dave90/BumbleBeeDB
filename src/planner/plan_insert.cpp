@@ -36,16 +36,13 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief The schema of a DML statement's result: how many rows it touched. */
-auto MakeDmlResultSchema(const char *column_name) -> SchemaRef {
-  return std::make_shared<Schema>(
-      std::vector{Column{column_name, LogicalType(LogicalTypeId::INTEGER)}});
+static auto MakeDmlResultSchema(const char *column_name) -> SchemaRef {
+  return std::make_shared<Schema>(std::vector{Column{column_name, LogicalType(LogicalTypeId::INTEGER)}});
 }
 
 /** @return Whether `t` is a number BumbleBee will implicitly widen between (integers, float, decimal). */
-auto IsNumericType(const LogicalType &t) -> bool {
+static auto IsNumericType(const LogicalType &t) -> bool {
   switch (t.GetTypeId()) {
     case LogicalTypeId::TINYINT:
     case LogicalTypeId::SMALLINT:
@@ -72,17 +69,14 @@ auto IsNumericType(const LogicalType &t) -> bool {
  * and cross-family assignments need an explicit CAST and are rejected. `CommonType(from, to) == to`
  * means `to` is the wider supertype.
  */
-auto CanAssign(const LogicalType &from, const LogicalType &to) -> bool {
+static auto CanAssign(const LogicalType &from, const LogicalType &to) -> bool {
   // String literals coerce into calendar columns by parsing ("2024-01-01" -> DATE); the cast is
   // strict, so a malformed literal errors instead of silently landing NULL.
-  const bool string_to_calendar =
-      from.GetTypeId() == LogicalTypeId::STRING &&
-      (to.GetTypeId() == LogicalTypeId::DATE || to.GetTypeId() == LogicalTypeId::TIMESTAMP);
+  const bool string_to_calendar = from.GetTypeId() == LogicalTypeId::STRING &&
+                                  (to.GetTypeId() == LogicalTypeId::DATE || to.GetTypeId() == LogicalTypeId::TIMESTAMP);
   return from == to || from.GetTypeId() == LogicalTypeId::UNKNOWN || string_to_calendar ||
          (IsNumericType(from) && IsNumericType(to) && LogicalType::CommonType(from, to) == to);
 }
-
-}  // namespace
 
 auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRef {
   auto select = PlanSelect(*statement.select_);
@@ -95,8 +89,7 @@ auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRe
   const size_t offset = auto_id ? 1 : 0;
 
   if (child_columns.size() != table_columns.size() - offset) {
-    throw PlannerException(
-        fmt::format("the values do not match the schema of table {}", statement.table_->table_));
+    throw PlannerException(fmt::format("the values do not match the schema of table {}", statement.table_->table_));
   }
 
   // Each supplied column must match its target column's type or widen losslessly to it. Where a widening
@@ -109,11 +102,9 @@ auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRe
     const auto &from = child_columns[c].GetType();
     const auto &to = table_columns[c + offset].GetType();
     if (!CanAssign(from, to)) {
-      throw PlannerException(
-          fmt::format("the values do not match the schema of table {}", statement.table_->table_));
+      throw PlannerException(fmt::format("the values do not match the schema of table {}", statement.table_->table_));
     }
-    AbstractExpressionRef col =
-        std::make_shared<ColumnValueExpression>(0, static_cast<uint32_t>(c), child_columns[c]);
+    AbstractExpressionRef col = std::make_shared<ColumnValueExpression>(0, static_cast<uint32_t>(c), child_columns[c]);
     if (from != to) {
       // Strict: the allowed coercions either cannot fail (lossless widenings, NULL broadcast) or
       // must error loudly when they do (string -> DATE/TIMESTAMP parses).
@@ -127,8 +118,8 @@ auto Planner::PlanInsert(const InsertStatement &statement) -> AbstractPlanNodeRe
     select = std::make_shared<ProjectionPlanNode>(std::move(proj_schema), std::move(proj_exprs), std::move(select));
   }
 
-  return std::make_shared<InsertPlanNode>(MakeDmlResultSchema("__bumblebee_internal.insert_rows"),
-                                          std::move(select), statement.table_->oid_);
+  return std::make_shared<InsertPlanNode>(MakeDmlResultSchema("__bumblebee_internal.insert_rows"), std::move(select),
+                                          statement.table_->oid_);
 }
 
 auto Planner::PlanDelete(const DeleteStatement &statement) -> AbstractPlanNodeRef {
@@ -139,8 +130,8 @@ auto Planner::PlanDelete(const DeleteStatement &statement) -> AbstractPlanNodeRe
   // lowering appends to the scan rides through untouched.
   auto rows = PlanWhere(*statement.expr_, std::move(table), /*outer_statement=*/nullptr);
 
-  return std::make_shared<DeletePlanNode>(MakeDmlResultSchema("__bumblebee_internal.delete_rows"),
-                                          std::move(rows), statement.table_->oid_);
+  return std::make_shared<DeletePlanNode>(MakeDmlResultSchema("__bumblebee_internal.delete_rows"), std::move(rows),
+                                          statement.table_->oid_);
 }
 
 auto Planner::PlanUpdate(const UpdateStatement &statement) -> AbstractPlanNodeRef {
@@ -167,8 +158,7 @@ auto Planner::PlanUpdate(const UpdateStatement &statement) -> AbstractPlanNodeRe
 
   for (size_t idx = 0; idx < target_exprs.size(); idx++) {
     if (target_exprs[idx] == nullptr) {
-      target_exprs[idx] =
-          std::make_shared<ColumnValueExpression>(0, idx, filter->output_schema_->GetColumn(idx));
+      target_exprs[idx] = std::make_shared<ColumnValueExpression>(0, idx, filter->output_schema_->GetColumn(idx));
     }
   }
 
@@ -190,8 +180,8 @@ auto Planner::PlanUpdate(const UpdateStatement &statement) -> AbstractPlanNodeRe
     target_exprs[idx] = std::make_shared<CastExpression>(std::move(target_exprs[idx]), to);
   }
 
-  return std::make_shared<UpdatePlanNode>(MakeDmlResultSchema("__bumblebee_internal.update_rows"),
-                                          std::move(filter), statement.table_->oid_, std::move(target_exprs));
+  return std::make_shared<UpdatePlanNode>(MakeDmlResultSchema("__bumblebee_internal.update_rows"), std::move(filter),
+                                          statement.table_->oid_, std::move(target_exprs));
 }
 
 }  // namespace bumblebee

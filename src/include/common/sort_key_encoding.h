@@ -41,12 +41,6 @@ namespace bumblebee {
  */
 struct SortKeyEncoding {
  public:
-  /** @return True if this machine is little-endian. */
-  static inline auto IsLittleEndian() -> bool {
-    int n = 1;
-    return *reinterpret_cast<char *>(&n) == 1;
-  }
-
   /** @brief Write the byte-comparable encoding of `value` at `dataptr`. */
   template <class T>
   static inline void EncodeData(data_ptr_t dataptr, T value) {

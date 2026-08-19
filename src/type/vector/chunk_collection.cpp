@@ -136,10 +136,6 @@ void ChunkCollection::Fuse(ChunkCollection &other) {
 
 void ChunkCollection::SwapChunks(idx_t index1, idx_t index2) { std::swap(chunks_[index1], chunks_[index2]); }
 
-void ChunkCollection::Verify() {
-  // TODO(milestone-2): a DEBUG-only structural check of the collection.
-}
-
 auto ChunkCollection::GetValue(idx_t column, idx_t index) -> Value {
   return GetChunkForRow(index).GetValue(column, index % STANDARD_VECTOR_SIZE);
 }

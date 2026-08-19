@@ -26,10 +26,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Collect the column indices `expr` reads from input tuple `tuple_idx`. */
-void CollectColumnRefs(const AbstractExpressionRef &expr, uint32_t tuple_idx, std::set<idx_t> &out) {
+static void CollectColumnRefs(const AbstractExpressionRef &expr, uint32_t tuple_idx, std::set<idx_t> &out) {
   if (expr == nullptr) {
     return;
   }
@@ -42,7 +40,7 @@ void CollectColumnRefs(const AbstractExpressionRef &expr, uint32_t tuple_idx, st
   }
 }
 
-auto AllColumnsOf(const AbstractPlanNode &node) -> std::set<idx_t> {
+static auto AllColumnsOf(const AbstractPlanNode &node) -> std::set<idx_t> {
   std::set<idx_t> all;
   for (idx_t i = 0; i < node.output_schema_->GetColumnCount(); i++) {
     all.insert(i);
@@ -59,7 +57,61 @@ auto AllColumnsOf(const AbstractPlanNode &node) -> std::set<idx_t> {
  * shape and simply never materializes the unreferenced columns (they surface as constant-NULL
  * vectors that, by construction of `required`, no operator ever reads).
  */
-auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> AbstractPlanNodeRef {
+static auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> AbstractPlanNodeRef;
+
+/** @brief Split a requirement over a join's `left ++ right` output at the seam, into per-side
+ * requirements in each side's own column space. */
+static auto SplitRequirementAtSeam(const std::set<idx_t> &required, idx_t left_count)
+    -> std::pair<std::set<idx_t>, std::set<idx_t>> {
+  std::pair<std::set<idx_t>, std::set<idx_t>> split;
+  for (auto i : required) {
+    if (i < left_count) {
+      split.first.insert(i);
+    } else {
+      split.second.insert(i - left_count);
+    }
+  }
+  return split;
+}
+
+/** @brief The hash-join rule: split the requirement at the seam, freeze the build side's live
+ * columns, add each side's key columns, and recurse. */
+static auto PruneHashJoin(const HashJoinPlanNode &join, const std::set<idx_t> &required) -> AbstractPlanNodeRef {
+  auto [left_req, right_req] = SplitRequirementAtSeam(required, join.GetLeftPlan()->output_schema_->GetColumnCount());
+  // The build side's layout only needs the columns some ancestor reads (captured BEFORE the
+  // key refs join in: keys live in their own layout slots, so storing their input columns too
+  // is only needed when the parent reads them). The build child mirrors the physical
+  // convention exactly — LEFT/SEMI/ANTI preserve the left child and build on the right;
+  // everything else (INNER, and the RIGHT/OUTER types that currently execute as INNER)
+  // builds on the left. SEMI/ANTI emit no build columns at all: their layout is keys-only.
+  const bool build_is_left = !(join.GetJoinType() == JoinType::LEFT || join.GetJoinType() == JoinType::SEMI ||
+                               join.GetJoinType() == JoinType::ANTI);
+  std::vector<idx_t> build_live;
+  if (join.GetJoinType() != JoinType::SEMI && join.GetJoinType() != JoinType::ANTI) {
+    const auto &req = build_is_left ? left_req : right_req;
+    build_live.assign(req.begin(), req.end());
+  }
+  // Key expressions are evaluated against their own side's chunk, but by convention the left
+  // keys are written as tuple 0 and the right keys as tuple 1; collect both spaces so either
+  // convention only ever over-collects.
+  for (const auto &k : join.LeftJoinKeyExpressions()) {
+    CollectColumnRefs(k, 0, left_req);
+    CollectColumnRefs(k, 1, left_req);
+  }
+  for (const auto &k : join.RightJoinKeyExpressions()) {
+    CollectColumnRefs(k, 0, right_req);
+    CollectColumnRefs(k, 1, right_req);
+  }
+  auto left = PruneColumns(join.GetLeftPlan(), std::move(left_req));
+  auto right = PruneColumns(join.GetRightPlan(), std::move(right_req));
+  auto pruned = std::make_shared<HashJoinPlanNode>(join);
+  pruned->children_ = {std::move(left), std::move(right)};
+  pruned->build_live_columns_ = std::move(build_live);
+  pruned->build_live_annotated_ = true;
+  return pruned;
+}
+
+static auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> AbstractPlanNodeRef {
   switch (plan->GetType()) {
     case PlanType::SeqScan: {
       const auto &scan = dynamic_cast<const SeqScanPlanNode &>(*plan);
@@ -133,66 +185,15 @@ auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> 
       auto child = PruneColumns(plan->GetChildAt(0), std::move(child_req));
       return plan->CloneWithChildren({std::move(child)});
     }
-    case PlanType::HashJoin: {
+    case PlanType::HashJoin:
       // Output = left columns ++ right columns: split the requirement at the seam and add each
       // side's join keys (key expressions are evaluated against their own side, tuple 0).
-      const auto &join = dynamic_cast<const HashJoinPlanNode &>(*plan);
-      const auto left_count = join.GetLeftPlan()->output_schema_->GetColumnCount();
-      std::set<idx_t> left_req;
-      std::set<idx_t> right_req;
-      for (auto i : required) {
-        if (i < left_count) {
-          left_req.insert(i);
-        } else {
-          right_req.insert(i - left_count);
-        }
-      }
-      // The build side's layout only needs the columns some ancestor reads (captured BEFORE the
-      // key refs join in: keys live in their own layout slots, so storing their input columns too
-      // is only needed when the parent reads them). The build child mirrors the physical
-      // convention exactly — LEFT/SEMI/ANTI preserve the left child and build on the right;
-      // everything else (INNER, and the RIGHT/OUTER types that currently execute as INNER)
-      // builds on the left. SEMI/ANTI emit no build columns at all: their layout is keys-only.
-      const bool build_is_left =
-          !(join.GetJoinType() == JoinType::LEFT || join.GetJoinType() == JoinType::SEMI ||
-            join.GetJoinType() == JoinType::ANTI);
-      std::vector<idx_t> build_live;
-      if (join.GetJoinType() != JoinType::SEMI && join.GetJoinType() != JoinType::ANTI) {
-        const auto &req = build_is_left ? left_req : right_req;
-        build_live.assign(req.begin(), req.end());
-      }
-      // Key expressions are evaluated against their own side's chunk, but by convention the left
-      // keys are written as tuple 0 and the right keys as tuple 1; collect both spaces so either
-      // convention only ever over-collects.
-      for (const auto &k : join.LeftJoinKeyExpressions()) {
-        CollectColumnRefs(k, 0, left_req);
-        CollectColumnRefs(k, 1, left_req);
-      }
-      for (const auto &k : join.RightJoinKeyExpressions()) {
-        CollectColumnRefs(k, 0, right_req);
-        CollectColumnRefs(k, 1, right_req);
-      }
-      auto left = PruneColumns(join.GetLeftPlan(), std::move(left_req));
-      auto right = PruneColumns(join.GetRightPlan(), std::move(right_req));
-      auto pruned = std::make_shared<HashJoinPlanNode>(join);
-      pruned->children_ = {std::move(left), std::move(right)};
-      pruned->build_live_columns_ = std::move(build_live);
-      pruned->build_live_annotated_ = true;
-      return pruned;
-    }
+      return PruneHashJoin(dynamic_cast<const HashJoinPlanNode &>(*plan), required);
     case PlanType::NestedLoopJoin: {
       // Same seam split; the predicate references the left as tuple 0 and the right as tuple 1.
       const auto &join = dynamic_cast<const NestedLoopJoinPlanNode &>(*plan);
-      const auto left_count = join.GetLeftPlan()->output_schema_->GetColumnCount();
-      std::set<idx_t> left_req;
-      std::set<idx_t> right_req;
-      for (auto i : required) {
-        if (i < left_count) {
-          left_req.insert(i);
-        } else {
-          right_req.insert(i - left_count);
-        }
-      }
+      auto [left_req, right_req] =
+          SplitRequirementAtSeam(required, join.GetLeftPlan()->output_schema_->GetColumnCount());
       CollectColumnRefs(join.Predicate(), 0, left_req);
       CollectColumnRefs(join.Predicate(), 1, right_req);
       auto left = PruneColumns(join.GetLeftPlan(), std::move(left_req));
@@ -211,8 +212,6 @@ auto PruneColumns(const AbstractPlanNodeRef &plan, std::set<idx_t> required) -> 
     }
   }
 }
-
-}  // namespace
 
 /**
  * @brief Projection pushdown into the scans: a column no operator above ever reads is never

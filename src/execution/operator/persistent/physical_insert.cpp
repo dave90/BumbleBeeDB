@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "execution/operator/persistent/index_maintenance.h"
 #include "fmt/format.h"
@@ -30,21 +31,7 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto ResolveHeap(ClientContext &context, table_oid_t oid) -> TableHeap * {
-  auto info = context.catalog_.GetTable(oid);
-  if (info == NULL_TABLE_INFO || info->storage_ == nullptr) {
-    throw ExecutionException("Insert: table has no storage backend");
-  }
-  auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
-  if (heap == nullptr) {
-    throw ExecutionException("Insert: table is not a row-format heap");
-  }
-  return heap;
-}
-
-auto SchemaTypes(const Schema &schema) -> std::vector<LogicalType> {
+static auto SchemaTypes(const Schema &schema) -> std::vector<LogicalType> {
   std::vector<LogicalType> types;
   types.reserve(schema.GetColumnCount());
   for (const auto &c : schema.GetColumns()) {
@@ -52,8 +39,6 @@ auto SchemaTypes(const Schema &schema) -> std::vector<LogicalType> {
   }
   return types;
 }
-
-}  // namespace
 
 /** @brief The running count of inserted rows (a per-task atomic add). */
 struct InsertGlobalSinkState : GlobalSinkState {
@@ -96,7 +81,7 @@ auto PhysicalInsert::Sink(ExecutionContext & /*context*/, DataChunk &input, Glob
 void PhysicalInsert::Combine(ExecutionContext &context, GlobalSinkState &gstate, LocalSinkState &lstate) const {
   auto &ls = static_cast<InsertLocalSinkState &>(lstate);
   auto info = context.client_.catalog_.GetTable(table_oid_);
-  auto *heap = ResolveHeap(context.client_, table_oid_);
+  auto *heap = ResolveTableStorage<TableHeap>(context.client_, table_oid_, "Insert", "a row-format heap");
   auto pk = FindPrimaryKeyIndex(context.client_.catalog_, *info);
 
   idx_t total = 0;

@@ -59,9 +59,6 @@ class ChunkCollection {
   /** @brief Exchange two chunks. */
   void SwapChunks(idx_t index1, idx_t index2);
 
-  /** @brief DEBUG-only consistency check. */
-  void Verify();
-
   /** @return The value of `column` at row `index`. */
   auto GetValue(idx_t column, idx_t index) -> Value;
 
@@ -134,7 +131,6 @@ class ChunkCollection {
       return;
     }
     for (auto &chunk : chunks_) {
-      // TODO(milestone-2 step 7): needs VectorOperations — DataChunk::Cast throws for now.
       chunk->Cast(new_types);
     }
   }

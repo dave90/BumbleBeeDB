@@ -18,8 +18,6 @@
 
 namespace bumblebee {
 
-#define MappingType std::pair<KeyType, ValueType>
-
 #define INDEX_TEMPLATE_ARGUMENTS template <typename KeyType, typename ValueType, typename KeyComparator>
 
 /** The kind of B+ tree page. */

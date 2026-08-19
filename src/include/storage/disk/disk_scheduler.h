@@ -54,7 +54,10 @@ class DiskScheduler {
   explicit DiskScheduler(DiskManager *disk_manager, size_t num_workers = DISK_SCHEDULER_WORKER_COUNT);
   ~DiskScheduler();
 
-  DISALLOW_COPY_AND_MOVE(DiskScheduler);
+  DiskScheduler(const DiskScheduler &) = delete;
+  auto operator=(const DiskScheduler &) -> DiskScheduler & = delete;
+  DiskScheduler(DiskScheduler &&) = delete;
+  auto operator=(DiskScheduler &&) -> DiskScheduler & = delete;
 
   /** @brief Schedule a batch of requests, in order. */
   void Schedule(std::vector<DiskRequest> &requests);

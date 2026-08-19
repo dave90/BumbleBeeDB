@@ -129,7 +129,7 @@ TEST_F(VectorOperationsArithTest, NegateDecimalVectors) {
 
   VectorOperations::Negate(v1, v3, values1.size());
   Vector v4(LogicalTypeId::STRING);
-  VectorOperations::TryCast(v3, v4, values1.size(), nullptr);
+  (void)VectorOperations::TryCast(v3, v4, values1.size(), nullptr);
   for (idx_t i = 0; i < values1.size(); i++) {
     EXPECT_EQ(Decimal::ToString(static_cast<int16_t>(values1[i] * -1), scale), v4.GetValue(i).GetString());
   }
@@ -147,7 +147,7 @@ TEST_F(VectorOperationsArithTest, DecimalMultiplyVectors) {
 
   VectorOperations::Dot(v1, v2, result_vec, values1.size());
   Vector result_string_vec(LogicalTypeId::STRING);
-  VectorOperations::TryCast(result_vec, result_string_vec, values1.size(), nullptr);
+  (void)VectorOperations::TryCast(result_vec, result_string_vec, values1.size(), nullptr);
   for (idx_t i = 0; i < values1.size(); i++) {
     // The raw product already carries scale1 + scale2 == result_scale, so no rescaling.
     EXPECT_EQ(Decimal::ToString(static_cast<int64_t>(values1[i]) * values2[i], result_scale),
@@ -173,7 +173,7 @@ TEST_F(VectorOperationsArithTest, DecimalDivisionDifferentScales) {
   VectorOperations::Division(v_left, v_right, v_out, left_vals.size());
 
   Vector out_str(LogicalTypeId::STRING);
-  VectorOperations::TryCast(v_out, out_str, left_vals.size(), nullptr);
+  (void)VectorOperations::TryCast(v_out, out_str, left_vals.size(), nullptr);
 
   for (idx_t i = 0; i < left_vals.size(); i++) {
     // expected_raw = (L * 10^(result_scale + right_scale - left_scale)) / R

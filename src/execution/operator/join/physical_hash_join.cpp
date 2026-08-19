@@ -28,11 +28,9 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief A fresh (empty) join table for `op`: the build-key columns first, then the LIVE build
  * columns (the pruning pass's annotation — dead build outputs are never stored or gathered). */
-auto MakeJoinTable(const PhysicalHashJoin &op) -> std::unique_ptr<PRLHashTable> {
+static auto MakeJoinTable(const PhysicalHashJoin &op) -> std::unique_ptr<PRLHashTable> {
   std::vector<LogicalType> layout_types;
   for (const auto &k : op.BuildKeys()) {
     layout_types.push_back(k->GetReturnType().GetType());
@@ -44,8 +42,6 @@ auto MakeJoinTable(const PhysicalHashJoin &op) -> std::unique_ptr<PRLHashTable> 
   }
   return std::make_unique<PRLHashTable>(std::move(layout_types), key_count, /*null_equal_keys=*/false);
 }
-
-}  // namespace
 
 struct HashJoinGlobalSinkState : GlobalSinkState {
   std::mutex mu_;
@@ -224,16 +220,14 @@ auto PhysicalHashJoin::GetLocalOperatorState(ExecutionContext & /*context*/) con
   return ls;
 }
 
-namespace {
-
 /**
  * @brief Key one probe chunk and collect its joined (build address, probe row) pairs in probe order.
  *
  * For LEFT the matches are merged with the unmatched probe rows, so every preserved row appears —
  * matched rows once per match, the rest (including NULL-keyed rows) once with a null address.
  */
-void CollectMatches(PRLHashTable &ht, HashJoinLocalOperatorState &ls, DataChunk &input, bool left,
-                    std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows) {
+static void CollectMatches(PRLHashTable &ht, HashJoinLocalOperatorState &ls, DataChunk &input, bool left,
+                           std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows) {
   const idx_t count = input.GetSize();
   auto &key_chunk = ls.key_chunk_;
   ls.key_exec_->Execute(input, key_chunk);
@@ -270,10 +264,10 @@ void CollectMatches(PRLHashTable &ht, HashJoinLocalOperatorState &ls, DataChunk 
  * null address NULL-pads — the LEFT case), the dead ones referencing shared constant NULLs, and
  * the probe columns sliced zero-copy from the probe chunk.
  */
-void EmitBatch(const PRLHashTable &ht, idx_t key_count, const std::vector<idx_t> &live_cols,
-               const HashJoinGlobalOperatorState &gop, DataChunk &input, DataChunk &output,
-               std::vector<data_ptr_t> &addrs, std::vector<sel_t> &rows, idx_t offset, idx_t n,
-               idx_t build_offset, idx_t probe_offset) {
+static void EmitBatch(const PRLHashTable &ht, idx_t key_count, const std::vector<idx_t> &live_cols,
+                      const HashJoinGlobalOperatorState &gop, DataChunk &input, DataChunk &output,
+                      std::vector<data_ptr_t> &addrs, std::vector<sel_t> &rows, idx_t offset, idx_t n,
+                      idx_t build_offset, idx_t probe_offset) {
   Vector addr_vec{LogicalType{LogicalTypeId::UBIGINT}, reinterpret_cast<data_ptr_t>(addrs.data() + offset)};
   SelectionVector probe_sel(rows.data() + offset);
   SelectionVector identity;
@@ -286,8 +280,6 @@ void EmitBatch(const PRLHashTable &ht, idx_t key_count, const std::vector<idx_t>
   }
   output.Slice(input, probe_sel, n, probe_offset);
 }
-
-}  // namespace
 
 auto PhysicalHashJoin::Execute(ExecutionContext & /*context*/, DataChunk &input, DataChunk &output,
                                GlobalOperatorState &gstate, LocalOperatorState &lstate) const -> OperatorResultType {
@@ -311,8 +303,7 @@ auto PhysicalHashJoin::Execute(ExecutionContext & /*context*/, DataChunk &input,
     if (ht.Count() > 0) {
       ls.probe_addrs_.clear();  // pair lists are unused: only the matched flags matter here
       ls.probe_rows_.clear();
-      ht.Probe(ls.probe_state_, ls.hashes_, key_chunk, valid_sel, n_valid, ls.probe_addrs_, ls.probe_rows_,
-               &matched);
+      ht.Probe(ls.probe_state_, ls.hashes_, key_chunk, valid_sel, n_valid, ls.probe_addrs_, ls.probe_rows_, &matched);
     }
 
     // A NULL probe key never matched anything, so ANTI would emit it — correct for NOT EXISTS, but

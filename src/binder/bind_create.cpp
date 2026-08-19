@@ -41,15 +41,13 @@
 
 namespace bumblebee {
 
-namespace {
-
 /**
  * @brief Read the single integer typmod of a type name, e.g. the `100` of `VARCHAR(100)`.
  *
  * @param typmods The PGTypeName's typmods list. May be null.
  * @return std::optional<int64_t> The modifier, or nullopt if there was none.
  */
-auto SingleTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> {
+static auto SingleTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> {
   if (typmods == nullptr || typmods->length < 1) {
     return std::nullopt;
   }
@@ -70,7 +68,7 @@ auto SingleTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> 
  * @param typmods The PGTypeName's typmods list. May be null.
  * @return std::optional<int64_t> The modifier, or nullopt if there was none.
  */
-auto SecondTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> {
+static auto SecondTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> {
   if (typmods == nullptr || typmods->length < 2) {
     return std::nullopt;
   }
@@ -91,7 +89,7 @@ auto SecondTypmod(duckdb_libpgquery::PGList *typmods) -> std::optional<int64_t> 
  * @param elem The option's PGDefElem.
  * @return The option value rendered as a string.
  */
-auto DefElemString(duckdb_libpgquery::PGDefElem *elem) -> std::string {
+static auto DefElemString(duckdb_libpgquery::PGDefElem *elem) -> std::string {
   if (elem->arg == nullptr) {
     throw BinderException(fmt::format("storage option '{}' needs a value", elem->defname));
   }
@@ -106,12 +104,10 @@ auto DefElemString(duckdb_libpgquery::PGDefElem *elem) -> std::string {
   }
 }
 
-}  // namespace
-
 auto Binder::ResolveTypeName(duckdb_libpgquery::PGTypeName *type_name) -> LogicalType {
   // The base type is the last part of the qualified type name: `pg_catalog.int4` -> `int4`.
-  const auto name = std::string(
-      reinterpret_cast<duckdb_libpgquery::PGValue *>(type_name->names->tail->data.ptr_value)->val.str);
+  const auto name =
+      std::string(reinterpret_cast<duckdb_libpgquery::PGValue *>(type_name->names->tail->data.ptr_value)->val.str);
 
   auto base_type = LogicalType::FromString(name);
   if (base_type.GetTypeId() == LogicalTypeId::UNKNOWN) {
@@ -162,8 +158,8 @@ auto Binder::BindColumnDefinition(duckdb_libpgquery::PGColumnDef *cdef) -> Colum
     if (bound != nullptr && bound->type == duckdb_libpgquery::T_PGInteger) {
       size = static_cast<int64_t>(bound->val.ival);
     }
-    auto array_type = size >= 0 ? LogicalType::Array(base_type, static_cast<idx_t>(size))
-                                : LogicalType::List(base_type);
+    auto array_type =
+        size >= 0 ? LogicalType::Array(base_type, static_cast<idx_t>(size)) : LogicalType::List(base_type);
     // LIST and ARRAY payloads live outside the row, so the column is variable-length.
     return Column{colname, array_type, 0};
   }
@@ -175,36 +171,90 @@ auto Binder::BindColumnDefinition(duckdb_libpgquery::PGColumnDef *cdef) -> Colum
   return Column::Make(colname, base_type);
 }
 
+/** @brief The bound `WITH (...)` storage options of a CREATE TABLE. */
+struct BoundStorageOptions {
+  StorageFormat format_{StorageFormat::ROW};
+  std::string location_;
+};
+
+/** @brief Bind the `WITH (format = 'parquet', location = '/path')` options list (may be null).
+ * Only those two options exist; anything else is a binder error. */
+static auto BindStorageOptions(duckdb_libpgquery::PGList *options) -> BoundStorageOptions {
+  BoundStorageOptions out;
+  if (options == nullptr) {
+    return out;
+  }
+  for (auto o = options->head; o != nullptr; o = lnext(o)) {
+    auto *elem = reinterpret_cast<duckdb_libpgquery::PGDefElem *>(o->data.ptr_value);
+    const auto option = StringUtil::Lower(elem->defname);
+    if (option == "format") {
+      const auto value = StringUtil::Lower(DefElemString(elem));
+      if (value != "parquet") {
+        throw BinderException(fmt::format("unsupported storage format '{}' (supported: parquet)", value));
+      }
+      out.format_ = StorageFormat::PARQUET;
+    } else if (option == "location") {
+      out.location_ = DefElemString(elem);
+    } else {
+      throw BinderException(fmt::format("unsupported storage option '{}'", option));
+    }
+  }
+  return out;
+}
+
+/** @brief Record `key_columns` as THE primary key; a second PRIMARY KEY anywhere in the statement
+ * is an error. */
+static void SetPrimaryKey(std::vector<std::string> key_columns, std::vector<std::string> &pk) {
+  if (!pk.empty()) {
+    throw NotImplementedException("cannot have two primary keys");
+  }
+  pk = std::move(key_columns);
+}
+
+/** @brief Bind one column definition's constraint list (only column-level PRIMARY KEY exists). */
+static void BindColumnConstraints(duckdb_libpgquery::PGColumnDef *cdef, const std::string &column_name,
+                                  std::vector<std::string> &pk) {
+  if (cdef->constraints == nullptr) {
+    return;
+  }
+  for (auto constr = cdef->constraints->head; constr != nullptr; constr = constr->next) {
+    auto *constraint = reinterpret_cast<duckdb_libpgquery::PGConstraint *>(constr->data.ptr_value);
+    if (constraint->contype != duckdb_libpgquery::PG_CONSTR_PRIMARY) {
+      throw NotImplementedException("unsupported constraint");
+    }
+    SetPrimaryKey({column_name}, pk);
+  }
+}
+
+/** @brief Bind a table-level constraint: `PRIMARY KEY (a, b, ...)`.
+ * Deliberately iterates from `cell` over the remaining tableElts cells, as the original code did —
+ * table-level constraints come last in the list, and keeping the shape keeps the behaviour. */
+static void BindTableConstraints(duckdb_libpgquery::PGListCell *cell, std::vector<std::string> &pk) {
+  for (auto con = cell; con != nullptr; con = con->next) {
+    auto *constraint = reinterpret_cast<duckdb_libpgquery::PGConstraint *>(con->data.ptr_value);
+    if (constraint->contype != duckdb_libpgquery::PG_CONSTR_PRIMARY) {
+      throw NotImplementedException("unsupported constraint");
+    }
+    std::vector<std::string> key_columns;
+    for (auto kc = constraint->keys->head; kc != nullptr; kc = kc->next) {
+      key_columns.emplace_back(reinterpret_cast<duckdb_libpgquery::PGValue *>(kc->data.ptr_value)->val.str);
+    }
+    SetPrimaryKey(std::move(key_columns), pk);
+  }
+}
+
 auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique_ptr<CreateStatement> {
   auto table = std::string(pg_stmt->relation->relname);
   auto columns = std::vector<Column>{};
   std::vector<std::string> pk;
 
   // Storage options: `WITH (format = 'parquet', location = '/path')` declares an external table.
-  auto format = StorageFormat::ROW;
-  std::string location;
-  if (pg_stmt->options != nullptr) {
-    for (auto o = pg_stmt->options->head; o != nullptr; o = lnext(o)) {
-      auto *elem = reinterpret_cast<duckdb_libpgquery::PGDefElem *>(o->data.ptr_value);
-      const auto option = StringUtil::Lower(elem->defname);
-      if (option == "format") {
-        const auto value = StringUtil::Lower(DefElemString(elem));
-        if (value != "parquet") {
-          throw BinderException(fmt::format("unsupported storage format '{}' (supported: parquet)", value));
-        }
-        format = StorageFormat::PARQUET;
-      } else if (option == "location") {
-        location = DefElemString(elem);
-      } else {
-        throw BinderException(fmt::format("unsupported storage option '{}'", option));
-      }
-    }
-  }
-  const bool external = format == StorageFormat::PARQUET;
-  if (external && location.empty()) {
+  auto storage = BindStorageOptions(pg_stmt->options);
+  const bool external = storage.format_ == StorageFormat::PARQUET;
+  if (external && storage.location_.empty()) {
     throw BinderException("external table needs a location: WITH (format='parquet', location='/path')");
   }
-  if (!external && !location.empty()) {
+  if (!external && !storage.location_.empty()) {
     throw BinderException("location is only valid together with format='parquet'");
   }
 
@@ -215,46 +265,13 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
       case duckdb_libpgquery::T_PGColumnDef: {
         auto *cdef = reinterpret_cast<duckdb_libpgquery::PGColumnDef *>(c->data.ptr_value);
         auto centry = BindColumnDefinition(cdef);
-        if (cdef->constraints != nullptr) {
-          for (auto constr = cdef->constraints->head; constr != nullptr; constr = constr->next) {
-            auto *constraint = reinterpret_cast<duckdb_libpgquery::PGConstraint *>(constr->data.ptr_value);
-            switch (constraint->contype) {
-              case duckdb_libpgquery::PG_CONSTR_PRIMARY: {
-                if (!pk.empty()) {
-                  throw NotImplementedException("cannot have two primary keys");
-                }
-                pk = {centry.GetName()};
-                break;
-              }
-              default:
-                throw NotImplementedException("unsupported constraint");
-            }
-          }
-        }
+        BindColumnConstraints(cdef, centry.GetName(), pk);
         columns.push_back(std::move(centry));
         break;
       }
-      case duckdb_libpgquery::T_PGConstraint: {
-        for (auto con = c; con != nullptr; con = con->next) {
-          auto *constraint = reinterpret_cast<duckdb_libpgquery::PGConstraint *>(con->data.ptr_value);
-          switch (constraint->contype) {
-            case duckdb_libpgquery::PG_CONSTR_PRIMARY: {
-              std::vector<std::string> key_columns;
-              for (auto kc = constraint->keys->head; kc != nullptr; kc = kc->next) {
-                key_columns.emplace_back(reinterpret_cast<duckdb_libpgquery::PGValue *>(kc->data.ptr_value)->val.str);
-              }
-              if (!pk.empty()) {
-                throw NotImplementedException("cannot have two primary keys");
-              }
-              pk = std::move(key_columns);
-              break;
-            }
-            default:
-              throw NotImplementedException("unsupported constraint");
-          }
-        }
+      case duckdb_libpgquery::T_PGConstraint:
+        BindTableConstraints(c, pk);
         break;
-      }
       default:
         throw NotImplementedException("ColumnDef type not handled yet");
     }
@@ -268,8 +285,8 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
   // case-insensitively, since an unquoted `_ID` folds to `_id`).
   for (const auto &col : columns) {
     if (StringUtil::Lower(col.GetName()) == AUTO_ID_COLUMN) {
-      throw BinderException(fmt::format("column name '{}' is reserved for the auto-generated primary key",
-                                        AUTO_ID_COLUMN));
+      throw BinderException(
+          fmt::format("column name '{}' is reserved for the auto-generated primary key", AUTO_ID_COLUMN));
     }
   }
 
@@ -280,7 +297,7 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
     }
     auto stmt = std::make_unique<CreateStatement>(std::move(table), std::move(columns), std::vector<std::string>{});
     stmt->format_ = StorageFormat::PARQUET;
-    stmt->location_ = std::move(location);
+    stmt->location_ = std::move(storage.location_);
     return stmt;
   }
 
@@ -289,15 +306,15 @@ auto Binder::BindCreate(duckdb_libpgquery::PGCreateStmt *pg_stmt) -> std::unique
     std::vector<Column> with_id;
     with_id.reserve(columns.size() + 1);
     with_id.push_back(Column::Make(AUTO_ID_COLUMN, LogicalType(LogicalTypeId::BIGINT)));
-    for (auto &c : columns)  with_id.push_back(std::move(c));
+    for (auto &c : columns) with_id.push_back(std::move(c));
 
     columns = std::move(with_id);
     pk = {AUTO_ID_COLUMN};
   } else {
     // A declared PRIMARY KEY must name real columns.
     for (const auto &key_col : pk) {
-      const bool found = std::any_of(columns.begin(), columns.end(),
-                                     [&](const Column &c) { return c.GetName() == key_col; });
+      const bool found =
+          std::any_of(columns.begin(), columns.end(), [&](const Column &c) { return c.GetName() == key_col; });
       if (!found) {
         throw BinderException(fmt::format("primary key column '{}' does not exist", key_col));
       }

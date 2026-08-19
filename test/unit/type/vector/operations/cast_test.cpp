@@ -187,7 +187,7 @@ TEST_F(VectorOperationsCastTest, TryCastDoubleIntoDecimal) {
   EXPECT_EQ(r, true);
   EXPECT_EQ(error->size(), 0);
   Vector result2(LogicalTypeId::STRING, data.size());
-  VectorOperations::TryCast(result1, result2, data.size(), error.get());
+  (void)VectorOperations::TryCast(result1, result2, data.size(), error.get());
 
   for (idx_t i = 0; i < data.size(); i++) {
     EXPECT_EQ(result2.GetValue(i).GetString(), expected_data[i]);
@@ -212,7 +212,7 @@ TEST_F(VectorOperationsCastTest, TryCastDecimalIntoDecimal1) {
   EXPECT_EQ(r, true);
   EXPECT_EQ(error->size(), 0);
   Vector result2(LogicalTypeId::STRING, data.size());
-  VectorOperations::TryCast(result1, result2, data.size(), error.get());
+  (void)VectorOperations::TryCast(result1, result2, data.size(), error.get());
 
   for (idx_t i = 0; i < data.size(); i++) {
     EXPECT_EQ(result2.GetValue(i).GetString(), expected_data[i]);
@@ -237,7 +237,7 @@ TEST_F(VectorOperationsCastTest, TryCastDecimalIntoDecimal2) {
   EXPECT_EQ(r, true);
   EXPECT_EQ(error->size(), 0);
   Vector result2(LogicalTypeId::STRING, data.size());
-  VectorOperations::TryCast(result1, result2, data.size(), error.get());
+  (void)VectorOperations::TryCast(result1, result2, data.size(), error.get());
 
   for (idx_t i = 0; i < data.size(); i++) {
     EXPECT_EQ(result2.GetValue(i).GetString(), expected_data[i]);

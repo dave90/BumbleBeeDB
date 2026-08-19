@@ -27,13 +27,11 @@
 
 namespace bumblebee {
 
-namespace {
-
 using Key = GenericKey<8>;
 using Cmp = GenericComparator<8>;
 using Tree = BPlusTree<Key, RID, Cmp>;
 
-auto MakeKey(int64_t k) -> Key {
+static auto MakeKey(int64_t k) -> Key {
   Key key;
   key.SetFromInteger(k);
   return key;
@@ -56,8 +54,6 @@ struct TreeFixture {
     tree = std::make_unique<Tree>("idx", header_page_id, &bpm, cmp, leaf_max, internal_max);
   }
 };
-
-}  // namespace
 
 TEST(BPlusTreeTest, InsertLookupAndDuplicate) {
   TreeFixture f;

@@ -21,26 +21,12 @@
 
 namespace bumblebee {
 
-namespace {
-
-/** @brief The column types of a schema, in order. */
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  types.reserve(schema.GetColumnCount());
-  for (const auto &col : schema.GetColumns()) {
-    types.push_back(col.GetType());
-  }
-  return types;
-}
-
 /** @brief A fresh chunk initialized to `op`'s output column types. */
-auto MakeChunkFor(const PhysicalOperator &op) -> std::unique_ptr<DataChunk> {
+static auto MakeChunkFor(const PhysicalOperator &op) -> std::unique_ptr<DataChunk> {
   auto chunk = std::make_unique<DataChunk>();
-  chunk->Initialize(TypesOf(*op.output_schema_));
+  chunk->Initialize(op.output_schema_->GetTypes());
   return chunk;
 }
-
-}  // namespace
 
 PipelineExecutor::PipelineExecutor(Pipeline &pipeline, ClientContext &client, ThreadContext &thread)
     : pipeline_(pipeline), context_(client, thread, &pipeline) {
@@ -66,9 +52,9 @@ PipelineExecutor::PipelineExecutor(Pipeline &pipeline, ClientContext &client, Th
 
   // The chunk handed to the sink is the last operator's output (or the source's, if no operators).
   if (pipeline_.operators_.empty()) {
-    final_chunk_.Initialize(TypesOf(*pipeline_.source_->output_schema_));
+    final_chunk_.Initialize(pipeline_.source_->output_schema_->GetTypes());
   } else {
-    final_chunk_.Initialize(TypesOf(*pipeline_.operators_.back()->output_schema_));
+    final_chunk_.Initialize(pipeline_.operators_.back()->output_schema_->GetTypes());
   }
 
   // Written-columns hint per boundary: the source's, carried through column-preserving operators.
@@ -116,8 +102,7 @@ auto PipelineExecutor::Execute(DataChunk &input, DataChunk &result, idx_t initia
   while (current_idx <= pipeline_.operators_.size()) {
     auto &prev_chunk = (current_idx == initial_idx + 1) ? input : *intermediate_chunks_[current_idx - 1];
     const auto &current_op = *pipeline_.operators_[current_idx - 1];
-    auto &current_chunk =
-        (current_idx == pipeline_.operators_.size()) ? result : *intermediate_chunks_[current_idx];
+    auto &current_chunk = (current_idx == pipeline_.operators_.size()) ? result : *intermediate_chunks_[current_idx];
 
     ResetChunk(current_chunk, current_idx);
     OperatorResultType res;

@@ -25,10 +25,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Bind, plan and optimize a query. */
-auto TryOptimize(const Catalog &catalog, const std::string &query) -> AbstractPlanNodeRef {
+static auto TryOptimize(const Catalog &catalog, const std::string &query) -> AbstractPlanNodeRef {
   auto statements = TryBind(catalog, query);
   EXPECT_EQ(statements.size(), 1U);
   Planner planner(catalog);
@@ -38,14 +36,12 @@ auto TryOptimize(const Catalog &catalog, const std::string &query) -> AbstractPl
 }
 
 /** @brief Bind and plan a query, without optimizing it. */
-auto TryPlan(const Catalog &catalog, const std::string &query) -> AbstractPlanNodeRef {
+static auto TryPlan(const Catalog &catalog, const std::string &query) -> AbstractPlanNodeRef {
   auto statements = TryBind(catalog, query);
   Planner planner(catalog);
   planner.PlanQuery(*statements[0]);
   return planner.plan_;
 }
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // MergeProjection
@@ -306,8 +302,7 @@ TEST(OptimizerTest, FilterPushDownTurnsEveryLevelOfAMultiTableJoinIntoAHashJoin)
   // (a JOIN b) JOIN d cross products, and MergeFilterNLJ folds the WHERE only into the
   // outermost one — so without recursive pushdown the inner (a, b) join stays a full
   // cross product with a Filter on top. Every level must become a hash join instead.
-  auto plan =
-      TryOptimize(*catalog, "SELECT * FROM a, b, d WHERE a.x = b.x AND b.y = d.y AND a.y > 10");
+  auto plan = TryOptimize(*catalog, "SELECT * FROM a, b, d WHERE a.x = b.x AND b.y = d.y AND a.y > 10");
 
   // Every level is a hash join and no cross product survives — the invariant this guards. (The
   // cost-based join-order pass now picks the bushy shape and tops the region with a projection that
@@ -379,8 +374,7 @@ TEST(OptimizerTest, FilterPushDownDoesNotCrossAnOuterJoin) {
   // The inner join to `d` must become a hash join, but the WHERE predicate on the
   // LEFT join's output must NOT be pushed into the LEFT join — it runs after
   // null-padding. It settles as a Filter directly above the preserved LEFT join.
-  auto plan = TryOptimize(
-      *catalog, "SELECT * FROM (a LEFT JOIN b ON a.x = b.x), d WHERE a.x = d.x AND a.y > 10");
+  auto plan = TryOptimize(*catalog, "SELECT * FROM (a LEFT JOIN b ON a.x = b.x), d WHERE a.x = d.x AND a.y > 10");
 
   EXPECT_EQ(CountPlanNodes(plan, PlanType::HashJoin), 2U);
   EXPECT_EQ(CountPlanNodes(plan, PlanType::NestedLoopJoin), 0U);
@@ -417,8 +411,7 @@ TEST(OptimizerTest, ColumnPruningIsStillAStub) {
   auto plan = TryOptimize(*catalog, "SELECT x FROM y");
   auto scan = FindPlanNode(plan, PlanType::SeqScan);
   ASSERT_NE(scan, nullptr);
-  EXPECT_EQ(scan->OutputSchema().GetColumnCount(), 5U)
-      << "column pruning appears to be implemented; update this test";
+  EXPECT_EQ(scan->OutputSchema().GetColumnCount(), 5U) << "column pruning appears to be implemented; update this test";
 }
 
 // ---------------------------------------------------------------------------

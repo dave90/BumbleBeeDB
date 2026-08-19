@@ -27,19 +27,15 @@ namespace bumblebee {
 
 namespace fs = std::filesystem;
 
-namespace {
-
-auto ColRef(uint32_t col, LogicalType type) -> AbstractExpressionRef {
+static auto ColRef(uint32_t col, LogicalType type) -> AbstractExpressionRef {
   return std::make_shared<ColumnValueExpression>(0, col, Column::Make("c", type));
 }
 
-auto Const(const Value &v) -> AbstractExpressionRef { return std::make_shared<ConstantValueExpression>(v); }
+static auto Const(const Value &v) -> AbstractExpressionRef { return std::make_shared<ConstantValueExpression>(v); }
 
-auto Cmp(AbstractExpressionRef l, AbstractExpressionRef r, ComparisonType t) -> AbstractExpressionRef {
+static auto Cmp(AbstractExpressionRef l, AbstractExpressionRef r, ComparisonType t) -> AbstractExpressionRef {
   return std::make_shared<ComparisonExpression>(std::move(l), std::move(r), t);
 }
-
-}  // namespace
 
 /** Zone predicates: extraction from expression trees, and pruning against real file statistics
  * written by our own ParquetWriter. */
@@ -137,8 +133,7 @@ TEST_F(ParquetZoneFilterTest, MissingStatsNeverPrune) {
   const auto &group = reader.GetFileMetadata()->row_groups[0];
   // The string column (idx 1) with an Equal predicate: stats exist or not, string predicates are
   // out of the numeric zone-map domain and must not prune.
-  EXPECT_TRUE(
-      RowGroupCanMatch(group, reader.return_types_, {ZonePredicate{1, ComparisonType::Equal, Value("zzz")}}));
+  EXPECT_TRUE(RowGroupCanMatch(group, reader.return_types_, {ZonePredicate{1, ComparisonType::Equal, Value("zzz")}}));
 }
 
 }  // namespace bumblebee

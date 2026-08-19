@@ -26,16 +26,14 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @return The type `INTEGER[]`. */
-auto IntListType() -> LogicalType { return LogicalType::List(LogicalTypeId::INTEGER); }
+static auto IntListType() -> LogicalType { return LogicalType::List(LogicalTypeId::INTEGER); }
 
 /** @return The type `INTEGER[n]`. */
-auto IntArrayType(idx_t n) -> LogicalType { return LogicalType::Array(LogicalTypeId::INTEGER, n); }
+static auto IntArrayType(idx_t n) -> LogicalType { return LogicalType::Array(LogicalTypeId::INTEGER, n); }
 
 /** @return An `INTEGER[]` value holding `elements`. A nullopt element becomes a NULL element. */
-auto IntList(const std::vector<int32_t> &elements) -> Value {
+static auto IntList(const std::vector<int32_t> &elements) -> Value {
   std::vector<Value> children;
   children.reserve(elements.size());
   for (auto e : elements) {
@@ -45,7 +43,7 @@ auto IntList(const std::vector<int32_t> &elements) -> Value {
 }
 
 /** @return An `INTEGER[n]` value holding `elements`. */
-auto IntArray(const std::vector<int32_t> &elements) -> Value {
+static auto IntArray(const std::vector<int32_t> &elements) -> Value {
   std::vector<Value> children;
   children.reserve(elements.size());
   for (auto e : elements) {
@@ -55,12 +53,10 @@ auto IntArray(const std::vector<int32_t> &elements) -> Value {
 }
 
 /** @return An `INTEGER[]` value whose elements are the given values verbatim (NULLs allowed). */
-auto ListOf(std::vector<Value> children) -> Value { return Value::List(IntListType(), std::move(children)); }
+static auto ListOf(std::vector<Value> children) -> Value { return Value::List(IntListType(), std::move(children)); }
 
 /** @return A NULL INTEGER element, as it appears INSIDE a list. */
-auto NullElement() -> Value { return Value::Null(LogicalTypeId::INTEGER); }
-
-}  // namespace
+static auto NullElement() -> Value { return Value::Null(LogicalTypeId::INTEGER); }
 
 // ---------------------------------------------------------------------------
 // The type system's view of a nested type
@@ -413,11 +409,11 @@ TEST(ListVectorTest, DataChunkAppendWithAListColumn) {
 TEST(ListVectorTest, HashIsElementWise) {
   Vector vec(IntListType(), 8);
   vec.SetValue(0, IntList({1, 2, 3}));
-  vec.SetValue(1, IntList({1, 2, 3}));  // equal to row 0
-  vec.SetValue(2, IntList({1, 2, 4}));  // one element apart
-  vec.SetValue(3, IntList({3, 2, 1}));  // the same elements, reordered
-  vec.SetValue(4, IntList({1, 2}));     // a prefix
-  vec.SetValue(5, IntList({}));         // empty
+  vec.SetValue(1, IntList({1, 2, 3}));       // equal to row 0
+  vec.SetValue(2, IntList({1, 2, 4}));       // one element apart
+  vec.SetValue(3, IntList({3, 2, 1}));       // the same elements, reordered
+  vec.SetValue(4, IntList({1, 2}));          // a prefix
+  vec.SetValue(5, IntList({}));              // empty
   vec.SetValue(6, ListOf({NullElement()}));  // a NULL element is not an empty list
 
   Vector hashes(LogicalTypeId::HASH);
@@ -572,7 +568,7 @@ TEST(ListVectorTest, CastThrows) {
   EXPECT_THROW(VectorOperations::Cast(source, target, 1), NotImplementedException);
 
   std::string error;
-  EXPECT_THROW(VectorOperations::TryCast(source, target, 1, &error), NotImplementedException);
+  EXPECT_THROW(static_cast<void>(VectorOperations::TryCast(source, target, 1, &error)), NotImplementedException);
 }
 
 TEST(ListVectorTest, CreateSortKeyThrows) {

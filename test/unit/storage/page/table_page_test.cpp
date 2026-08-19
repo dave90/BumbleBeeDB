@@ -21,18 +21,16 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto MakePage() -> std::vector<char> {
+static auto MakePage() -> std::vector<char> {
   std::vector<char> backing(PAGE_SIZE, 0);
   reinterpret_cast<TablePage *>(backing.data())->Init();
   return backing;
 }
 
 /** @brief View a byte buffer as RowLayout bytes for the TablePage API. */
-auto AsRow(const std::vector<char> &v) -> const_data_ptr_t { return reinterpret_cast<const_data_ptr_t>(v.data()); }
-
-}  // namespace
+static auto AsRow(const std::vector<char> &v) -> const_data_ptr_t {
+  return reinterpret_cast<const_data_ptr_t>(v.data());
+}
 
 TEST(TablePageTest, InsertAndReadRows) {
   auto backing = MakePage();

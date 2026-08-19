@@ -56,7 +56,8 @@ class VectorDataMngr {
   explicit VectorDataMngr(VectorDataMngrType type) : type_(type) {}
   explicit VectorDataMngr(std::unique_ptr<data_t[]> data)
       : type_(VectorDataMngrType::STANDARD_DATA_MNGR), data_(std::move(data)) {}
-  explicit VectorDataMngr(idx_t size) : type_(VectorDataMngrType::STANDARD_DATA_MNGR), data_(new data_t[size]) {}
+  explicit VectorDataMngr(idx_t size)
+      : type_(VectorDataMngrType::STANDARD_DATA_MNGR), data_(std::make_unique_for_overwrite<data_t[]>(size)) {}
   virtual ~VectorDataMngr() = default;
 
   /** @return What this manager holds. */
@@ -77,8 +78,7 @@ class VectorDataMngr {
    * @param capacity The number of rows.
    * @return vector_data_mngr_ptr_t The data manager owning the allocation.
    */
-  static auto CreateStandardVector(PhysicalType type, idx_t capacity = STANDARD_VECTOR_SIZE)
-      -> vector_data_mngr_ptr_t {
+  static auto CreateStandardVector(PhysicalType type, idx_t capacity = STANDARD_VECTOR_SIZE) -> vector_data_mngr_ptr_t {
     return vector_data_mngr_ptr_t(new VectorDataMngr(capacity * LogicalType::SizeOf(type)));
   }
 

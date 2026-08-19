@@ -35,8 +35,8 @@ BPLUSTREE_TYPE::BPlusTree(std::string name, page_id_t header_page_id, BufferPool
 
 INDEX_TEMPLATE_ARGUMENTS
 BPLUSTREE_TYPE::BPlusTree(OpenExisting, std::string name, page_id_t header_page_id,
-                          BufferPoolManager *buffer_pool_manager, const KeyComparator &comparator,
-                          int leaf_max_size, int internal_max_size)
+                          BufferPoolManager *buffer_pool_manager, const KeyComparator &comparator, int leaf_max_size,
+                          int internal_max_size)
     : bpm_(buffer_pool_manager),
       index_name_(std::move(name)),
       comparator_(comparator),
@@ -101,11 +101,9 @@ auto BPLUSTREE_TYPE::InitBPlusTree(const KeyType &key, const ValueType &value) -
   return leaf_page_id;
 }
 
-namespace {
-
 template <typename PageT, typename KeyComparatorT, typename KeyTypeT, typename ValueTypeT>
-void InsertAfterSplit(PageT &page1, PageT &page2, KeyComparatorT comparator, const KeyTypeT &key,
-                      const ValueTypeT &value) {
+static void InsertAfterSplit(PageT &page1, PageT &page2, KeyComparatorT comparator, const KeyTypeT &key,
+                             const ValueTypeT &value) {
   if (comparator(page2.KeyAt(0), key) < 0) {
     page2.Insert(comparator, key, value);
   } else {
@@ -114,14 +112,12 @@ void InsertAfterSplit(PageT &page1, PageT &page2, KeyComparatorT comparator, con
 }
 
 template <typename PageT>
-auto NewWritablePage(BufferPoolManager &bpm) -> std::pair<WritePageGuard, PageT *> {
+static auto NewWritablePage(BufferPoolManager &bpm) -> std::pair<WritePageGuard, PageT *> {
   auto new_page_id = bpm.NewPage();
   auto new_wguard = bpm.WritePage(new_page_id);
   auto new_page = new_wguard.template AsMut<PageT>();
   return {std::move(new_wguard), new_page};
 }
-
-}  // namespace
 
 INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::RecursiveInsertLeaf(Context &ctx, const KeyType &key, const ValueType &value)
@@ -155,8 +151,7 @@ auto BPLUSTREE_TYPE::RecursiveInsertLeaf(Context &ctx, const KeyType &key, const
 }
 
 INDEX_TEMPLATE_ARGUMENTS
-auto BPLUSTREE_TYPE::RecursiveInsert(Context &ctx, const KeyType &key, const ValueType &value)
-    -> InsertInternalResult {
+auto BPLUSTREE_TYPE::RecursiveInsert(Context &ctx, const KeyType &key, const ValueType &value) -> InsertInternalResult {
   if (ctx.write_set_.back().As<BPlusTreePage>()->IsLeafPage()) {
     return RecursiveInsertLeaf(ctx, key, value);
   }
@@ -292,12 +287,10 @@ auto BPLUSTREE_TYPE::GetBestSiblingForMerge(InternalPage &parent_page, int pidx,
   return left;
 }
 
-namespace {
-
 // Try to borrow one entry from `sib` into `page`; on failure, merge the two into the left node.
 template <typename PageT, typename InternalNode, typename KeyComparatorT>
-auto StealOrMergeNodes(KeyComparatorT comparator, PageT *page, page_id_t page_id, InternalNode *parent, PageT *sib,
-                       page_id_t sib_id, int pidx, bool sib_left) -> page_id_t {
+static auto StealOrMergeNodes(KeyComparatorT comparator, PageT *page, page_id_t page_id, InternalNode *parent,
+                              PageT *sib, page_id_t sib_id, int pidx, bool sib_left) -> page_id_t {
   int sep_idx = sib_left ? pidx : pidx + 1;
   auto parent_sep = parent->KeyAt(sep_idx);
   decltype(parent_sep) new_sep{};
@@ -314,8 +307,6 @@ auto StealOrMergeNodes(KeyComparatorT comparator, PageT *page, page_id_t page_id
   parent->Remove(sep_idx);
   return sib_id;
 }
-
-}  // namespace
 
 INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::RecursiveDeleteLeaf(Context &ctx, const KeyType &key) -> bool {
@@ -353,8 +344,8 @@ auto BPLUSTREE_TYPE::RecursiveDeleteLeaf(Context &ctx, const KeyType &key) -> bo
   int sib_idx;
   auto sib_guard = GetBestSiblingForMerge(*parent, pidx, sib_idx);
   auto sib = sib_guard.template AsMut<LeafPage>();
-  auto dead = StealOrMergeNodes(comparator_, leaf, guard.GetPageId(), parent, sib, sib_guard.GetPageId(), pidx,
-                                sib_idx < pidx);
+  auto dead =
+      StealOrMergeNodes(comparator_, leaf, guard.GetPageId(), parent, sib, sib_guard.GetPageId(), pidx, sib_idx < pidx);
   if (dead != INVALID_PAGE_ID) {
     if (dead == guard.GetPageId()) {
       guard.Drop();

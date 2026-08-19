@@ -26,8 +26,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** Which of a join's two inputs an expression reads from. */
 enum class Side {
   /** Reads no column at all, e.g. a bare constant. */
@@ -40,7 +38,7 @@ enum class Side {
   BOTH,
 };
 
-auto Combine(Side a, Side b) -> Side {
+static auto Combine(Side a, Side b) -> Side {
   if (a == Side::NEITHER) {
     return b;
   }
@@ -57,7 +55,7 @@ auto Combine(Side a, Side b) -> Side {
  * concatenated output schema through tuple 0, so a reference is on the left iff its
  * column index is below the left input's width.
  */
-auto SideOf(const AbstractExpressionRef &expr, size_t left_width) -> Side {
+static auto SideOf(const AbstractExpressionRef &expr, size_t left_width) -> Side {
   if (const auto *col = dynamic_cast<const ColumnValueExpression *>(expr.get()); col != nullptr) {
     return col->GetColIdx() < left_width ? Side::LEFT : Side::RIGHT;
   }
@@ -69,7 +67,7 @@ auto SideOf(const AbstractExpressionRef &expr, size_t left_width) -> Side {
 }
 
 /** @brief Break a predicate into its AND-ed conjuncts. */
-void SplitConjuncts(const AbstractExpressionRef &expr, std::vector<AbstractExpressionRef> &out) {
+static void SplitConjuncts(const AbstractExpressionRef &expr, std::vector<AbstractExpressionRef> &out) {
   if (const auto *logic = dynamic_cast<const LogicExpression *>(expr.get());
       logic != nullptr && logic->logic_type_ == LogicType::And) {
     SplitConjuncts(logic->GetChildAt(0), out);
@@ -80,7 +78,7 @@ void SplitConjuncts(const AbstractExpressionRef &expr, std::vector<AbstractExpre
 }
 
 /** @brief Rebuild a single predicate by AND-ing `conjuncts` back together. */
-auto Conjoin(const std::vector<AbstractExpressionRef> &conjuncts) -> AbstractExpressionRef {
+static auto Conjoin(const std::vector<AbstractExpressionRef> &conjuncts) -> AbstractExpressionRef {
   if (conjuncts.empty()) {
     // Nothing left to test: the join is unrestricted. EliminateTrueFilter and the
     // hash-join rule both understand a constant-true predicate.
@@ -101,7 +99,7 @@ auto Conjoin(const std::vector<AbstractExpressionRef> &conjuncts) -> AbstractExp
  * `RewriteExpressionForJoin`, and it lets a join predicate be pushed further down (or
  * re-split) using the same flat addressing a Filter uses.
  */
-auto FlattenJoinPredicate(const AbstractExpressionRef &expr, size_t left_width) -> AbstractExpressionRef {
+static auto FlattenJoinPredicate(const AbstractExpressionRef &expr, size_t left_width) -> AbstractExpressionRef {
   if (const auto *col = dynamic_cast<const ColumnValueExpression *>(expr.get()); col != nullptr) {
     auto flat_idx = col->GetTupleIdx() == 0 ? col->GetColIdx() : left_width + col->GetColIdx();
     return std::make_shared<ColumnValueExpression>(0, flat_idx, col->GetReturnType());
@@ -121,7 +119,7 @@ auto FlattenJoinPredicate(const AbstractExpressionRef &expr, size_t left_width) 
  * indices (`left_width .. left_width + right_width`). Once it sits below the join, on
  * top of the right input alone, each index drops by the left input's width.
  */
-auto RebaseRightToChild(const AbstractExpressionRef &expr, size_t left_width) -> AbstractExpressionRef {
+static auto RebaseRightToChild(const AbstractExpressionRef &expr, size_t left_width) -> AbstractExpressionRef {
   if (const auto *col = dynamic_cast<const ColumnValueExpression *>(expr.get()); col != nullptr) {
     return std::make_shared<ColumnValueExpression>(0, col->GetColIdx() - left_width, col->GetReturnType());
   }
@@ -132,8 +130,6 @@ auto RebaseRightToChild(const AbstractExpressionRef &expr, size_t left_width) ->
   }
   return expr->CloneWithChildren(children);
 }
-
-}  // namespace
 
 /**
  * @brief Push `pending` predicates into `node`, threading them as deep as they belong.
@@ -155,8 +151,8 @@ auto RebaseRightToChild(const AbstractExpressionRef &expr, size_t left_width) ->
  *    left, a Filter carrying them is placed on top. Stopping at an outer join is what
  *    keeps the rewrite correct — a predicate must not cross the null-extended side.
  */
-auto Optimizer::FilterPushDownInto(const AbstractPlanNodeRef &node,
-                                   const std::vector<AbstractExpressionRef> &pending) -> AbstractPlanNodeRef {
+auto Optimizer::FilterPushDownInto(const AbstractPlanNodeRef &node, const std::vector<AbstractExpressionRef> &pending)
+    -> AbstractPlanNodeRef {
   if (node->GetType() == PlanType::NestedLoopJoin) {
     if (const auto &nlj = dynamic_cast<const NestedLoopJoinPlanNode &>(*node); nlj.GetJoinType() == JoinType::INNER) {
       const auto left_width = nlj.GetLeftPlan()->OutputSchema().GetColumnCount();

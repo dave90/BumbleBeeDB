@@ -28,19 +28,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 static_assert((GH_PARTITION_COUNT & (GH_PARTITION_COUNT - 1)) == 0, "GH_PARTITION_COUNT must be a power of two");
 constexpr idx_t PARTITION_BITS = 6;  // log2(64); each recursion level consumes the next 6 hash bits
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  types.reserve(schema.GetColumnCount());
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
 
 /**
  * @brief Which of the `GH_PARTITION_COUNT` buckets a key hash routes to at recursion `depth`.
@@ -49,12 +38,12 @@ auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
  * split again with fresh bits — UNLESS every row shares one key (a hot key), which maps to a single
  * bucket at every level and so never splits (→ the NLJ fallback).
  */
-auto PartitionAt(hash_t hash, idx_t depth) -> idx_t {
+static auto PartitionAt(hash_t hash, idx_t depth) -> idx_t {
   return (hash >> (depth * PARTITION_BITS)) & (GH_PARTITION_COUNT - 1);
 }
 
-void BuildKeyExec(const std::vector<AbstractExpressionRef> &keys, ExpressionExecutor &exec,
-                  std::vector<LogicalType> &types) {
+static void BuildKeyExec(const std::vector<AbstractExpressionRef> &keys, ExpressionExecutor &exec,
+                         std::vector<LogicalType> &types) {
   for (const auto &k : keys) {
     exec.AddExpression(*k);
     types.push_back(k->GetReturnType().GetType());
@@ -62,8 +51,8 @@ void BuildKeyExec(const std::vector<AbstractExpressionRef> &keys, ExpressionExec
 }
 
 /** @brief Lazily create the 64 spill partitions of one side. */
-void EnsurePartitions(std::vector<std::unique_ptr<SpillCollection>> &parts, BufferPoolManager *bpm,
-                      const SchemaRef &schema) {
+static void EnsurePartitions(std::vector<std::unique_ptr<SpillCollection>> &parts, BufferPoolManager *bpm,
+                             const SchemaRef &schema) {
   if (parts.empty()) {
     for (idx_t p = 0; p < GH_PARTITION_COUNT; p++) {
       parts.push_back(std::make_unique<SpillCollection>(bpm, schema));
@@ -78,9 +67,10 @@ void EnsurePartitions(std::vector<std::unique_ptr<SpillCollection>> &parts, Buff
  * non-empty partition. When `filter_null_keys` is set, NULL-keyed rows are dropped — or diverted to
  * `null_sink` when given (LEFT probe side: those rows are preserved, just never joinable).
  */
-void AppendPartitioned(DataChunk &chunk, ExpressionExecutor &key_exec, const std::vector<LogicalType> &key_types,
-                       const std::vector<LogicalType> &row_types, idx_t depth, bool filter_null_keys,
-                       std::vector<std::unique_ptr<SpillCollection>> &parts, SpillCollection *null_sink = nullptr) {
+static void AppendPartitioned(DataChunk &chunk, ExpressionExecutor &key_exec, const std::vector<LogicalType> &key_types,
+                              const std::vector<LogicalType> &row_types, idx_t depth, bool filter_null_keys,
+                              std::vector<std::unique_ptr<SpillCollection>> &parts,
+                              SpillCollection *null_sink = nullptr) {
   const idx_t count = chunk.GetSize();
   DataChunk key_chunk;
   key_chunk.Initialize(key_types);
@@ -137,9 +127,10 @@ void AppendPartitioned(DataChunk &chunk, ExpressionExecutor &key_exec, const std
  * probe chunk at `probe_offset` (INNER puts the build/left first, LEFT the probe/left first). The
  * append deep-copies, so nothing staged outlives its source.
  */
-void StageMatches(const std::vector<LogicalType> &out_types, DataChunk &probe_chunk, const SelectionVector &probe_sel,
-                  const PRLHashTable &ht, const std::vector<data_ptr_t> &addrs, idx_t offset, idx_t n,
-                  idx_t build_cols, idx_t build_offset, idx_t probe_offset, ChunkCollection &staging) {
+static void StageMatches(const std::vector<LogicalType> &out_types, DataChunk &probe_chunk,
+                         const SelectionVector &probe_sel, const PRLHashTable &ht, const std::vector<data_ptr_t> &addrs,
+                         idx_t offset, idx_t n, idx_t build_cols, idx_t build_offset, idx_t probe_offset,
+                         ChunkCollection &staging) {
   DataChunk stage;
   stage.Initialize(out_types);
   Vector addr_vec{LogicalType{LogicalTypeId::UBIGINT},
@@ -170,8 +161,8 @@ struct OutputLayout {
  * @brief LEFT: stage probe rows with the build columns NULL — the unmatched rows of a chunk (when
  * `matched` is given), or the whole chunk (the NULL-keyed spill, which never joins by definition).
  */
-void StageNullPadded(const OutputLayout &out, DataChunk &probe_chunk, const std::vector<uint8_t> *matched,
-                     ChunkCollection &staging) {
+static void StageNullPadded(const OutputLayout &out, DataChunk &probe_chunk, const std::vector<uint8_t> *matched,
+                            ChunkCollection &staging) {
   const idx_t count = probe_chunk.GetSize();
   std::vector<sel_t> rows;
   for (idx_t i = 0; i < count; i++) {
@@ -192,8 +183,6 @@ void StageNullPadded(const OutputLayout &out, DataChunk &probe_chunk, const std:
   stage.SetCardinality(rows.size());
   staging.Append(stage);  // deep copy — the local selection may die after this
 }
-
-}  // namespace
 
 PhysicalGraceHashJoin::PhysicalGraceHashJoin(SchemaRef output_schema, std::vector<AbstractExpressionRef> left_keys,
                                              std::vector<AbstractExpressionRef> right_keys, JoinType join_type,
@@ -226,7 +215,7 @@ struct GraceGlobalSinkState : GlobalSinkState {
   std::vector<std::unique_ptr<SpillCollection>> build_parts_;
   std::vector<std::unique_ptr<SpillCollection>> probe_parts_;
   std::unique_ptr<SpillCollection> null_probe_rows_;  // LEFT: NULL-keyed preserved rows (never joinable)
-  idx_t build_count_{0};  // summed at the first Finalize, once the build tasks are done
+  idx_t build_count_{0};                              // summed at the first Finalize, once the build tasks are done
 };
 
 struct GraceLocalSinkState : LocalSinkState {
@@ -262,12 +251,12 @@ auto PhysicalGraceHashJoin::Sink(ExecutionContext & /*context*/, DataChunk &inpu
 
   if (gs.phase_ == GraceGlobalSinkState::Phase::PARTITION_BUILD) {
     // A NULL build key can never equi-match: dropped for good.
-    AppendPartitioned(input, *ls.build_exec_, ls.build_key_types_, TypesOf(*build_schema_), 0,
+    AppendPartitioned(input, *ls.build_exec_, ls.build_key_types_, build_schema_->GetTypes(), 0,
                       /*filter_null_keys=*/true, gs.build_parts_);
   } else {
     // A NULL probe key never joins either — but a LEFT join must still preserve the row, so it is
     // diverted to the dedicated spill and emitted NULL-padded by the source.
-    AppendPartitioned(input, *ls.probe_exec_, ls.probe_key_types_, TypesOf(*probe_schema_), 0,
+    AppendPartitioned(input, *ls.probe_exec_, ls.probe_key_types_, probe_schema_->GetTypes(), 0,
                       /*filter_null_keys=*/true, gs.probe_parts_, gs.null_probe_rows_.get());
   }
   return SinkResultType::NEED_MORE_INPUT;
@@ -302,16 +291,12 @@ auto PhysicalGraceHashJoin::Finalize(ClientContext & /*context*/, GlobalSinkStat
 // Source: join the partition pairs, one resident build table at a time.
 // --------------------------------------------------------------------------------------------------
 
-namespace {
-
 /** @brief One unit of join work: a build partition and the probe partition with the same hash bits. */
 struct PartitionPair {
   SpillCollection *build_{nullptr};  // may be null/empty
   SpillCollection *probe_{nullptr};  // never null (empty probes are not enqueued)
   idx_t depth_{0};
 };
-
-}  // namespace
 
 /**
  * @brief The shared join-phase state: a work queue of partition pairs claimed by parallel tasks.
@@ -332,11 +317,11 @@ struct GraceGlobalSourceState : GlobalSourceState {
   std::vector<LogicalType> build_types_;
   std::vector<LogicalType> probe_types_;
 
-  std::mutex mu_;  // guards everything below
-  bool seeded_{false};  // the work list is seeded on the FIRST GetData call: the source state is
-                        // created at executor initialization, before the sink pipelines have run
-  bool null_rows_claimed_{false};                             // LEFT: one task drains the NULL spill
-  std::vector<PartitionPair> work_;                           // pairs still to join (LIFO)
+  std::mutex mu_;                    // guards everything below
+  bool seeded_{false};               // the work list is seeded on the FIRST GetData call: the source state is
+                                     // created at executor initialization, before the sink pipelines have run
+  bool null_rows_claimed_{false};    // LEFT: one task drains the NULL spill
+  std::vector<PartitionPair> work_;  // pairs still to join (LIFO)
   std::vector<std::unique_ptr<SpillCollection>> sub_spills_;  // owns every recursion sub-partition
   idx_t task_count_{1};                                       // recorded by MaxThreads for the budget split
 
@@ -380,10 +365,8 @@ struct GraceLocalSourceState : LocalSourceState {
   idx_t staging_cursor_{0};
 };
 
-namespace {
-
 /** @brief Load one build partition into a fresh resident table: build keys first, build columns after. */
-auto LoadBuildTable(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, SpillCollection *spill)
+static auto LoadBuildTable(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, SpillCollection *spill)
     -> std::unique_ptr<PRLHashTable> {
   auto layout_types = src.build_key_types_;
   for (const auto &t : src.build_types_) {
@@ -422,8 +405,8 @@ auto LoadBuildTable(const GraceGlobalSourceState &src, GraceLocalSourceState &ls
 }
 
 /** @brief HT mode: join one probe chunk against the resident build table and stage the output. */
-void JoinProbeChunkHashed(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, DataChunk &probe_chunk,
-                          const OutputLayout &out) {
+static void JoinProbeChunkHashed(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, DataChunk &probe_chunk,
+                                 const OutputLayout &out) {
   const idx_t count = probe_chunk.GetSize();
   DataChunk keys;
   keys.Initialize(src.probe_key_types_);
@@ -455,8 +438,8 @@ void JoinProbeChunkHashed(const GraceGlobalSourceState &src, GraceLocalSourceSta
  * stream the oversized build partition one chunk at a time, probing each build row into that table —
  * memory stays bounded by one chunk plus the tiny table.
  */
-void JoinProbeChunkNestedLoop(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, DataChunk &probe_chunk,
-                              const OutputLayout &out) {
+static void JoinProbeChunkNestedLoop(const GraceGlobalSourceState &src, GraceLocalSourceState &ls,
+                                     DataChunk &probe_chunk, const OutputLayout &out) {
   const idx_t count = probe_chunk.GetSize();
   DataChunk keys;
   keys.Initialize(src.probe_key_types_);
@@ -534,7 +517,7 @@ void JoinProbeChunkNestedLoop(const GraceGlobalSourceState &src, GraceLocalSourc
  * finished sub-pairs takes it, which is also the happens-before edge that lets another task safely
  * read spills this task just wrote.
  */
-void OpenPair(GraceGlobalSourceState &src, GraceLocalSourceState &ls, const PartitionPair &pair) {
+static void OpenPair(GraceGlobalSourceState &src, GraceLocalSourceState &ls, const PartitionPair &pair) {
   const idx_t build_count = pair.build_ != nullptr ? pair.build_->Count() : 0;
   if (build_count <= src.budget_rows_) {
     ls.ht_ = LoadBuildTable(src, ls, pair.build_);
@@ -606,7 +589,7 @@ void OpenPair(GraceGlobalSourceState &src, GraceLocalSourceState &ls, const Part
 // --- the GetData state machine, one step per function --------------------------------------------
 
 /** @brief Emit the next staged chunk into `output`, if any is pending. */
-auto EmitStaged(GraceLocalSourceState &ls, DataChunk &output) -> bool {
+static auto EmitStaged(GraceLocalSourceState &ls, DataChunk &output) -> bool {
   if (ls.staging_cursor_ < ls.staging_.ChunkCount()) {
     auto &chunk = ls.staging_.GetChunk(ls.staging_cursor_++);
     chunk.Copy(output);
@@ -619,8 +602,8 @@ auto EmitStaged(GraceLocalSourceState &ls, DataChunk &output) -> bool {
 }
 
 /** @brief LEFT: stage the next chunk of the claimed NULL-keyed spill (freed once drained). */
-auto DrainNullRows(GraceGlobalSinkState &gs, GraceGlobalSourceState &src, GraceLocalSourceState &ls,
-                   const OutputLayout &out) -> bool {
+static auto DrainNullRows(GraceGlobalSinkState &gs, GraceGlobalSourceState &src, GraceLocalSourceState &ls,
+                          const OutputLayout &out) -> bool {
   if (ls.null_scan_ == nullptr) {
     return false;
   }
@@ -636,7 +619,7 @@ auto DrainNullRows(GraceGlobalSinkState &gs, GraceGlobalSourceState &src, GraceL
 }
 
 /** @brief Advance the claimed pair by one probe chunk; close it (and free its spills) when drained. */
-auto AdvancePair(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, const OutputLayout &out) -> bool {
+static auto AdvancePair(const GraceGlobalSourceState &src, GraceLocalSourceState &ls, const OutputLayout &out) -> bool {
   if (!ls.pair_open_) {
     return false;
   }
@@ -675,8 +658,8 @@ enum class Claim { NULL_ROWS, PAIR, NOTHING };
  * LEFT (all its rows NULL-pad). The per-task resident budget is the total divided by the task
  * fan-out — every task may hold one build table at once.
  */
-auto ClaimWork(GraceGlobalSinkState &gs, GraceGlobalSourceState &src, GraceLocalSourceState &ls, bool left,
-               PartitionPair &pair) -> Claim {
+static auto ClaimWork(GraceGlobalSinkState &gs, GraceGlobalSourceState &src, GraceLocalSourceState &ls, bool left,
+                      PartitionPair &pair) -> Claim {
   std::lock_guard lock(src.mu_);
   if (!src.seeded_) {
     src.seeded_ = true;
@@ -704,8 +687,6 @@ auto ClaimWork(GraceGlobalSinkState &gs, GraceGlobalSourceState &src, GraceLocal
   return Claim::PAIR;
 }
 
-}  // namespace
-
 auto PhysicalGraceHashJoin::GetGlobalSourceState(ClientContext &context, GlobalSinkState *own_sink_state) const
     -> std::unique_ptr<GlobalSourceState> {
   auto src = std::make_unique<GraceGlobalSourceState>();
@@ -715,8 +696,8 @@ auto PhysicalGraceHashJoin::GetGlobalSourceState(ClientContext &context, GlobalS
   ExpressionExecutor throwaway;  // the types are wanted here; each task builds its own executors
   BuildKeyExec(BuildKeys(), throwaway, src->build_key_types_);
   BuildKeyExec(ProbeKeys(), throwaway, src->probe_key_types_);
-  src->build_types_ = TypesOf(*build_schema_);
-  src->probe_types_ = TypesOf(*probe_schema_);
+  src->build_types_ = build_schema_->GetTypes();
+  src->probe_types_ = probe_schema_->GetTypes();
   // Plan-time width, so no data to measure: the inline stride per column, plus an assumed average
   // out-of-line payload for variable-size types (strings, lists), plus 16 bytes of row bookkeeping.
   idx_t row_bytes = 16;

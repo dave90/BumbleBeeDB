@@ -24,7 +24,9 @@ namespace bumblebee {
 
 Vector::Vector(Vector &other) : vtype_(other.vtype_), type_(other.type_) { Reference(other); }
 
-Vector::Vector(Vector &other, const SelectionVector &sel, idx_t count) : type_(other.type_) { Slice(other, sel, count); }
+Vector::Vector(Vector &other, const SelectionVector &sel, idx_t count) : type_(other.type_) {
+  Slice(other, sel, count);
+}
 
 Vector::Vector(Vector &other, idx_t offset) : vtype_(other.vtype_), type_(other.type_) { Slice(other, offset); }
 
@@ -478,17 +480,6 @@ void Vector::Sequence(int64_t start, int64_t offset, int64_t stride, int64_t end
   data[3] = end;
 }
 
-void Vector::Verify(idx_t count) {
-  // TODO(milestone-2): a DEBUG-only structural check of the vector.
-  (void)count;
-}
-
-void Vector::Verify(const SelectionVector &sel, idx_t count) {
-  // TODO(milestone-2): a DEBUG-only structural check of the selected rows.
-  (void)sel;
-  (void)count;
-}
-
 auto Vector::WrapValue(Value raw) const -> Value {
   if (raw.GetType() == type_) {
     return raw;
@@ -680,8 +671,8 @@ void Vector::SetValue(idx_t index, const Value &val) {
       const auto &children = val.GetChildren();
       if (children.size() != array_size) {
         throw Exception(ExceptionType::MISMATCH_TYPE,
-                        fmt::format("Vector::SetValue: an {} row takes exactly {} elements, not {}",
-                                    type_.ToString(), array_size, children.size()));
+                        fmt::format("Vector::SetValue: an {} row takes exactly {} elements, not {}", type_.ToString(),
+                                    array_size, children.size()));
       }
       auto &child = ArrayVector::GetChild(*this);
       for (idx_t i = 0; i < array_size; i++) {
@@ -752,9 +743,8 @@ void Vector::WriteNullFill(idx_t index) {
       break;
     }
     default:
-      throw NotImplementedException(
-          fmt::format("Vector::SetValue: unsupported type {} for the null fill",
-                      LogicalType::NameOf(type_.GetPhysicalType())));
+      throw NotImplementedException(fmt::format("Vector::SetValue: unsupported type {} for the null fill",
+                                                LogicalType::NameOf(type_.GetPhysicalType())));
   }
 }
 
@@ -838,7 +828,7 @@ void Vector::Resize(idx_t cur_size, idx_t new_size) {
   BUMBLEBEE_ASSERT(data_ != nullptr, "Vector::Resize: the vector has no data");
   auto type_size = LogicalType::SizeOf(type_.GetPhysicalType());
   // Allocate a bigger array and move the old rows into it.
-  auto new_data = std::unique_ptr<data_t[]>(new data_t[new_size * type_size]);
+  auto new_data = std::make_unique_for_overwrite<data_t[]>(new_size * type_size);
   memcpy(new_data.get(), data_, cur_size * type_size);
   if (type_.GetPhysicalType() == PhysicalType::LIST && new_size > cur_size) {
     // The new entries must read as empty lists, not as garbage (offset, length) pairs.

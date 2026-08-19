@@ -18,16 +18,14 @@
 
 namespace bumblebee {
 
-namespace {
 /** @brief Build the identity table 0..STANDARD_VECTOR_SIZE-1 at compile time, for any vector size. */
-constexpr auto MakeIncrementalVector() -> std::array<sel_t, STANDARD_VECTOR_SIZE> {
+static constexpr auto MakeIncrementalVector() -> std::array<sel_t, STANDARD_VECTOR_SIZE> {
   std::array<sel_t, STANDARD_VECTOR_SIZE> table{};
   for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
     table[i] = static_cast<sel_t>(i);
   }
   return table;
 }
-}  // namespace
 
 // The two selections every kernel falls back on:
 //
@@ -46,6 +44,5 @@ const sel_t ConstantVector::ZERO_VECTOR[STANDARD_VECTOR_SIZE] = {0};
 // The identity table 0..STANDARD_VECTOR_SIZE-1, generated at compile time so it scales to whatever
 // STANDARD_VECTOR_SIZE the build was configured with (see BBDB_VECTOR_SIZE / the small-vector test build).
 const std::array<sel_t, STANDARD_VECTOR_SIZE> FlatVector::INCREMENTAL_VECTOR = MakeIncrementalVector();
-
 
 }  // namespace bumblebee

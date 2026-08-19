@@ -57,8 +57,6 @@ class ExpressionExecutor {
   /** @brief Append another root expression. */
   void AddExpression(const AbstractExpression &expr) { roots_.push_back(&expr); }
 
-  auto ExpressionCount() const -> idx_t { return roots_.size(); }
-
   /** @brief Evaluate root `expr_idx` over `input` into `result` (a single vector). */
   void ExecuteExpression(idx_t expr_idx, DataChunk &input, Vector &result);
 

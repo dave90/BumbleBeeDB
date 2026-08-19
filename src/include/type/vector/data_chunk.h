@@ -169,9 +169,6 @@ class DataChunk {
   /** @return A printable rendering of the chunk. */
   auto ToString() const -> std::string;
 
-  /** @brief DEBUG-only consistency check. */
-  void Verify();
-
   // -- Kernels --------------------------------------------------------------
 
   /** @brief Hash every column of every row into `result` (a UBIGINT vector). */

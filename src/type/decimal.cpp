@@ -30,7 +30,7 @@ namespace bumblebee {
 template <class SIGNED, class UNSIGNED>
 static auto TemplatedDecimalToString(SIGNED value, uint8_t scale) -> std::string {
   auto len = DecimalToString::DecimalLength<SIGNED, UNSIGNED>(value, scale);
-  auto data = std::unique_ptr<char[]>(new char[len + 1]);
+  auto data = std::make_unique_for_overwrite<char[]>(len + 1);
   DecimalToString::FormatDecimal<SIGNED, UNSIGNED>(value, scale, data.get(), len);
   return {data.get(), static_cast<std::size_t>(len)};
 }

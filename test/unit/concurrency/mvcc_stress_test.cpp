@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <random>
@@ -35,18 +36,12 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypesOf(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
-
-auto ReadIntColumn(const RowLayout &layout, const char *row) -> int32_t {
-  return *reinterpret_cast<const int32_t *>(row + layout.GetOffsets()[0]);
+static auto ReadIntColumn(const RowLayout &layout, const char *row) -> int32_t {
+  // memcpy, not a reinterpret_cast dereference: a row buffer offset carries no alignment
+  // guarantee, so the direct load is undefined (UBSan flags it).
+  int32_t value;
+  std::memcpy(&value, row + layout.GetOffsets()[0], sizeof(value));
+  return value;
 }
 
 /** A one-column (INTEGER v) MVCC table — integer values keep every update the same byte size. */
@@ -67,7 +62,7 @@ struct IntFixture {
 
   auto OneRow(int32_t v) -> DataChunk {
     DataChunk c;
-    c.Initialize(TypesOf(table->schema_));
+    c.Initialize(table->schema_.GetTypes());
     c.SetValue(0, 0, Value(v));
     c.SetCardinality(1);
     return c;
@@ -95,8 +90,6 @@ struct IntFixture {
     return ReadIntColumn(Heap().GetLayout(), bytes->data());
   }
 };
-
-}  // namespace
 
 // GC reclaims committed txns once no live snapshot needs their versions; a long reader pins them.
 TEST(MvccStressTest, GarbageCollectionRespectsLongReader) {

@@ -21,9 +21,7 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto FlipComparison(ComparisonType t) -> ComparisonType {
+static auto FlipComparison(ComparisonType t) -> ComparisonType {
   switch (t) {
     case ComparisonType::LessThan:
       return ComparisonType::GreaterThan;
@@ -46,7 +44,7 @@ struct NumericRange {
 };
 
 /** @brief Decode a plain-encoded statistics payload of the chunk's parquet physical type. */
-auto DecodeNumericStat(const std::string &bytes, format::Type::type type) -> std::optional<double> {
+static auto DecodeNumericStat(const std::string &bytes, format::Type::type type) -> std::optional<double> {
   switch (type) {
     case format::Type::INT32: {
       if (bytes.size() != sizeof(int32_t)) {
@@ -86,7 +84,7 @@ auto DecodeNumericStat(const std::string &bytes, format::Type::type type) -> std
 }
 
 /** @brief The numeric range of a column chunk, when trustworthy statistics exist. */
-auto NumericStatsOf(const format::ColumnChunk &chunk) -> std::optional<NumericRange> {
+static auto NumericStatsOf(const format::ColumnChunk &chunk) -> std::optional<NumericRange> {
   if (!chunk.__isset.meta_data || !chunk.meta_data.__isset.statistics) {
     return std::nullopt;
   }
@@ -114,7 +112,7 @@ auto NumericStatsOf(const format::ColumnChunk &chunk) -> std::optional<NumericRa
 }
 
 /** @brief Plain numeric logical type (no domain shift: excludes DECIMAL / DATE / TIMESTAMP). */
-auto IsPlainNumericTypeId(LogicalTypeId id) -> bool {
+static auto IsPlainNumericTypeId(LogicalTypeId id) -> bool {
   switch (id) {
     case LogicalTypeId::TINYINT:
     case LogicalTypeId::SMALLINT:
@@ -131,8 +129,6 @@ auto IsPlainNumericTypeId(LogicalTypeId id) -> bool {
       return false;
   }
 }
-
-}  // namespace
 
 void ExtractZonePredicates(const AbstractExpressionRef &expr, std::vector<ZonePredicate> &out) {
   if (expr == nullptr) {

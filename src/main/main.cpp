@@ -24,8 +24,6 @@
 #include "common/util/string_util.h"
 #include "linenoise.h"
 
-namespace {
-
 /**
  * The ASCII record-separator (0x1e) that prefixes a per-statement status line in `--test-protocol`
  * mode. It cannot appear in SQL result text, so the e2e harness can unambiguously tell a status
@@ -41,8 +39,8 @@ constexpr char kStatusMarker = '\x1e';
  * stdout after the statement: `<RS>ok` on success, `<RS>err <message>` on failure. Otherwise the
  * human shell format (tab-separated with a header) is used and errors go to stderr.
  */
-auto RunStatement(bumblebee::BumbleBeeInstance &instance, const std::string &sql, bool test_protocol,
-                  bumblebee::idx_t max_rows) -> bool {
+static auto RunStatement(bumblebee::BumbleBeeInstance &instance, const std::string &sql, bool test_protocol,
+                         bumblebee::idx_t max_rows) -> bool {
   try {
     if (test_protocol) {
       // The e2e harness must see every row, so it is never truncated (unlimited display).
@@ -65,102 +63,129 @@ auto RunStatement(bumblebee::BumbleBeeInstance &instance, const std::string &sql
   }
 }
 
-}  // namespace
-
-auto main(int argc, char **argv) -> int {
-  // Exception's constructor traces to stderr in debug builds, which is useful when a
-  // test blows up but is just noise here: the shell reports the error itself.
-  bumblebee::global_disable_exception_print.store(true);
-
-  // By default the shell is durable, backed by `bb.db` — the catalog (and, once the execution engine
-  // lands, the rows) survives across runs. `--db <path>` overrides the file; `--memory` (or `-m`) runs
-  // a purely in-memory instance that persists nothing.
-  std::filesystem::path db_path = "bb.db";
-  bool in_memory = false;
-  // `--test-protocol` puts the shell in machine-drivable mode for the e2e harness; `--no-seed` skips the
-  // demo tables so a run starts from an empty catalog. The remaining flags override config.h defaults so a
-  // test can exercise a statement under a tighter memory budget, the external operators, or a smaller pool.
-  bool test_protocol = false;
-  bool no_seed = false;
-  bool prefer_external = false;
-  bumblebee::idx_t max_memory = bumblebee::MAX_MEMORY;
-  bumblebee::idx_t max_threads = 0;  // 0 = leave the hardware-detected default
-  bumblebee::idx_t morsel_pages = bumblebee::MORSEL_PAGES;
-  bumblebee::idx_t morsel_size = bumblebee::MORSEL_SIZE;
-  size_t num_frames = bumblebee::BUFFER_POOL_SIZE;
+/** @brief Everything about the shell that `argv` can configure. Defaults are the shell's defaults. */
+struct ShellOptions {
+  // By default the shell is durable, backed by `bb.db` — the catalog and rows survive across runs.
+  // `--db <path>` overrides the file; `--memory` (or `-m`) runs a purely in-memory instance.
+  std::filesystem::path db_path{"bb.db"};
+  bool in_memory{false};
+  // `--test-protocol` puts the shell in machine-drivable mode for the e2e harness; `--no-seed` skips
+  // the demo tables so a run starts from an empty catalog. The rest override config.h defaults so a
+  // test can exercise a statement under a tighter memory budget, the external operators, or a
+  // smaller pool.
+  bool test_protocol{false};
+  bool no_seed{false};
+  bool prefer_external{false};
+  bumblebee::idx_t max_memory{bumblebee::MAX_MEMORY};
+  bumblebee::idx_t max_threads{0};  // 0 = leave the hardware-detected default
+  bumblebee::idx_t morsel_pages{bumblebee::MORSEL_PAGES};
+  bumblebee::idx_t morsel_size{bumblebee::MORSEL_SIZE};
+  size_t num_frames{bumblebee::BUFFER_POOL_SIZE};
   // How long a transaction may stay open before `\gc` aborts it. Runtime-configurable (unlike the
   // compile-time STANDARD_VECTOR_SIZE) so tests can shrink it to milliseconds via `--txn-timeout`.
-  bumblebee::duration_t txn_timeout = bumblebee::DEFAULT_TXN_TIMEOUT;
+  bumblebee::duration_t txn_timeout{bumblebee::DEFAULT_TXN_TIMEOUT};
   // How many result rows the interactive shell prints before truncating; 0 shows all. Keeps a giant
   // SELECT from flooding the terminal.
-  bumblebee::idx_t max_rows = 100;
+  bumblebee::idx_t max_rows{100};
+};
+
+/** @brief Parse a flag's non-negative decimal value. */
+static auto ToIdx(const char *value) -> bumblebee::idx_t {
+  return static_cast<bumblebee::idx_t>(std::strtoull(value, nullptr, 10));
+}
+
+/**
+ * @brief Read `argv` into a ShellOptions.
+ *
+ * An unrecognized argument is ignored, as is a flag whose value is missing — the shell has never
+ * rejected its command line, and the e2e harness relies on passing flags this build may not know.
+ */
+static auto ParseArgs(int argc, char **argv) -> ShellOptions {
+  ShellOptions opts;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "--memory") == 0 || std::strcmp(argv[i], "-m") == 0) {
-      in_memory = true;
-    } else if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
-      db_path = argv[++i];
+      opts.in_memory = true;
     } else if (std::strcmp(argv[i], "--test-protocol") == 0) {
-      test_protocol = true;
+      opts.test_protocol = true;
     } else if (std::strcmp(argv[i], "--no-seed") == 0) {
-      no_seed = true;
+      opts.no_seed = true;
     } else if (std::strcmp(argv[i], "--prefer-external") == 0) {
-      prefer_external = true;
-    } else if (std::strcmp(argv[i], "--max-memory") == 0 && i + 1 < argc) {
-      max_memory = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
-    } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-      max_threads = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
-    } else if (std::strcmp(argv[i], "--morsel-pages") == 0 && i + 1 < argc) {
-      morsel_pages = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
-    } else if (std::strcmp(argv[i], "--morsel-size") == 0 && i + 1 < argc) {
-      morsel_size = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
-    } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
-      num_frames = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
-    } else if (std::strcmp(argv[i], "--txn-timeout") == 0 && i + 1 < argc) {
-      txn_timeout = std::chrono::milliseconds(std::strtoull(argv[++i], nullptr, 10));
-    } else if (std::strcmp(argv[i], "--max-rows") == 0 && i + 1 < argc) {
-      max_rows = static_cast<bumblebee::idx_t>(std::strtoull(argv[++i], nullptr, 10));
+      opts.prefer_external = true;
+    } else if (i + 1 >= argc) {
+      continue;  // every remaining flag takes a value, and there is none left
+    } else if (std::strcmp(argv[i], "--db") == 0) {
+      opts.db_path = argv[++i];
+    } else if (std::strcmp(argv[i], "--max-memory") == 0) {
+      opts.max_memory = ToIdx(argv[++i]);
+    } else if (std::strcmp(argv[i], "--threads") == 0) {
+      opts.max_threads = ToIdx(argv[++i]);
+    } else if (std::strcmp(argv[i], "--morsel-pages") == 0) {
+      opts.morsel_pages = ToIdx(argv[++i]);
+    } else if (std::strcmp(argv[i], "--morsel-size") == 0) {
+      opts.morsel_size = ToIdx(argv[++i]);
+    } else if (std::strcmp(argv[i], "--frames") == 0) {
+      opts.num_frames = static_cast<size_t>(ToIdx(argv[++i]));
+    } else if (std::strcmp(argv[i], "--max-rows") == 0) {
+      opts.max_rows = ToIdx(argv[++i]);
+    } else if (std::strcmp(argv[i], "--txn-timeout") == 0) {
+      opts.txn_timeout = std::chrono::milliseconds(std::strtoull(argv[++i], nullptr, 10));
     }
   }
+  return opts;
+}
 
-  auto instance = in_memory ? std::make_unique<bumblebee::BumbleBeeInstance>(txn_timeout)
-                            : std::make_unique<bumblebee::BumbleBeeInstance>(db_path, num_frames, txn_timeout);
-  instance->prefer_external_ = prefer_external;
-  instance->max_memory_ = max_memory;
-  instance->max_threads_ = max_threads;
-  instance->morsel_pages_ = morsel_pages;
-  instance->morsel_size_ = morsel_size;
+/**
+ * @brief The SQL of a `-c "<sql>"` one-shot run, or nullptr for an interactive session.
+ *
+ * Deliberately a separate scan from ParseArgs rather than a case inside it: `-c` must not consume
+ * its argument during flag parsing, or a statement like `-c "--memory"` would be read as a flag.
+ */
+static auto FindOneShotSql(int argc, char **argv) -> const char * {
+  for (int i = 1; i < argc; i++) {
+    if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+      return argv[i + 1];
+    }
+  }
+  return nullptr;
+}
+
+/** @brief Open the database `opts` describes and apply the session settings to it. */
+static auto MakeInstance(const ShellOptions &opts) -> std::unique_ptr<bumblebee::BumbleBeeInstance> {
+  auto instance = opts.in_memory
+                      ? std::make_unique<bumblebee::BumbleBeeInstance>(opts.txn_timeout)
+                      : std::make_unique<bumblebee::BumbleBeeInstance>(opts.db_path, opts.num_frames, opts.txn_timeout);
+  instance->prefer_external_ = opts.prefer_external;
+  instance->max_memory_ = opts.max_memory;
+  instance->max_threads_ = opts.max_threads;
+  instance->morsel_pages_ = opts.morsel_pages;
+  instance->morsel_size_ = opts.morsel_size;
   // Seed the demo tables only when the catalog is empty and seeding is not suppressed — always for an
   // in-memory instance, and for a brand-new file so reopening an existing database does not fail on a
   // duplicate CREATE. The e2e harness passes `--no-seed` so each `.slt` file starts from a clean catalog.
-  if (!no_seed && instance->catalog_->GetTableNames().empty()) {
+  if (!opts.no_seed && instance->catalog_->GetTableNames().empty()) {
     instance->GenerateMockTable();
   }
+  return instance;
+}
 
-  // `-c "<sql>"` runs one statement and exits, which makes the shell scriptable.
-  for (int i = 1; i < argc; i++) {
-    if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-      return RunStatement(*instance, argv[i + 1], test_protocol, max_rows) ? 0 : 1;
-    }
-  }
-
-  // The banner and persistent history are shell niceties; the e2e harness wants a clean, side-effect-free
-  // stdout, so both are skipped in `--test-protocol` mode.
-  if (!test_protocol) {
-    std::cout << "BumbleBeeDB (" << (in_memory ? "in-memory" : db_path.string())
-              << ") — type \\help for help, Ctrl-D to exit." << std::endl;
-  }
-
-  // linenoise gives the prompt arrow-key line editing and command history. History persists across
-  // sessions in ~/.bumblebee_history (best-effort — a read-only HOME just means no saved history).
+/**
+ * @brief Load the persistent line-edit history, returning the file it should be saved back to.
+ *
+ * Best-effort: a read-only or absent HOME just means the session gets no saved history.
+ */
+static auto LoadHistory() -> std::string {
   std::string history_path;
-  if (!test_protocol) {
-    if (const char *home = std::getenv("HOME"); home != nullptr) {
-      history_path = std::string(home) + "/.bumblebee_history";
-      linenoiseHistoryLoad(history_path.c_str());
-    }
-    linenoiseHistorySetMaxLen(1000);
+  if (const char *home = std::getenv("HOME"); home != nullptr) {
+    history_path = std::string(home) + "/.bumblebee_history";
+    linenoiseHistoryLoad(history_path.c_str());
   }
+  linenoiseHistorySetMaxLen(1000);
+  return history_path;
+}
 
+/** @brief The line loop itself, shared by the interactive and `--test-protocol` shells. */
+static void RunReplLoop(bumblebee::BumbleBeeInstance &instance, const ShellOptions &opts,
+                        const std::string &history_path) {
   std::string query;
   while (true) {
     const char *prompt = query.empty() ? "bumblebee> " : "        ... ";
@@ -198,7 +223,7 @@ auto main(int argc, char **argv) -> int {
     // A meta-command is a whole statement on its own; anything else accumulates
     // until a line ends in a semicolon, so a statement can span lines.
     if (query.empty() && !line.empty() && line[0] == '\\') {
-      RunStatement(*instance, line, test_protocol, max_rows);
+      RunStatement(instance, line, opts.test_protocol, opts.max_rows);
       continue;
     }
 
@@ -217,9 +242,37 @@ auto main(int argc, char **argv) -> int {
       continue;
     }
 
-    RunStatement(*instance, trimmed, test_protocol, max_rows);
+    RunStatement(instance, trimmed, opts.test_protocol, opts.max_rows);
     query.clear();
   }
+}
 
+/** @brief The interactive shell: banner and saved history, then the line loop. */
+static void RunRepl(bumblebee::BumbleBeeInstance &instance, const ShellOptions &opts) {
+  // The banner and persistent history are shell niceties; the e2e harness wants a clean,
+  // side-effect-free stdout, so both are skipped in `--test-protocol` mode.
+  if (opts.test_protocol) {
+    RunReplLoop(instance, opts, "");
+    return;
+  }
+  std::cout << "BumbleBeeDB (" << (opts.in_memory ? "in-memory" : opts.db_path.string())
+            << ") — type \\help for help, Ctrl-D to exit." << std::endl;
+  RunReplLoop(instance, opts, LoadHistory());
+}
+
+auto main(int argc, char **argv) -> int {
+  // Exception's constructor traces to stderr in debug builds, which is useful when a
+  // test blows up but is just noise here: the shell reports the error itself.
+  bumblebee::global_disable_exception_print.store(true);
+
+  const ShellOptions opts = ParseArgs(argc, argv);
+  auto instance = MakeInstance(opts);
+
+  // `-c "<sql>"` runs one statement and exits, which makes the shell scriptable.
+  if (const char *sql = FindOneShotSql(argc, argv); sql != nullptr) {
+    return RunStatement(*instance, sql, opts.test_protocol, opts.max_rows) ? 0 : 1;
+  }
+
+  RunRepl(*instance, opts);
   return 0;
 }

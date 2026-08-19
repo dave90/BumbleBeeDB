@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "execution/expression_executor.h"
 #include "execution/operator/persistent/index_maintenance.h"
@@ -31,22 +32,6 @@
 #include "type/vector/vector.h"
 
 namespace bumblebee {
-
-namespace {
-
-auto ResolveHeap(ClientContext &context, table_oid_t oid) -> TableHeap * {
-  auto info = context.catalog_.GetTable(oid);
-  if (info == NULL_TABLE_INFO || info->storage_ == nullptr) {
-    throw ExecutionException("Update: table has no storage backend");
-  }
-  auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
-  if (heap == nullptr) {
-    throw ExecutionException("Update: table is not a row-format heap");
-  }
-  return heap;
-}
-
-}  // namespace
 
 /** One Sink call's worth of rows: the pre-image, the computed replacement, and their RIDs. */
 struct UpdateBatch {
@@ -133,7 +118,7 @@ static auto MakeRidVector(const std::vector<int64_t> &src, idx_t n) -> Vector {
 void PhysicalUpdate::Combine(ExecutionContext &context, GlobalSinkState &gstate, LocalSinkState &lstate) const {
   auto &ls = static_cast<UpdateLocalSinkState &>(lstate);
   auto &gs = static_cast<UpdateGlobalSinkState &>(gstate);
-  auto *heap = ResolveHeap(context.client_, table_oid_);
+  auto *heap = ResolveTableStorage<TableHeap>(context.client_, table_oid_, "Update", "a row-format heap");
   auto info = context.client_.catalog_.GetTable(table_oid_);
   auto pk = FindPrimaryKeyIndex(context.client_.catalog_, *info);
 
@@ -205,7 +190,7 @@ auto PhysicalUpdate::Finalize(ClientContext &context, GlobalSinkState &gstate, i
   }
   auto info = context.catalog_.GetTable(table_oid_);
   auto pk = FindPrimaryKeyIndex(context.catalog_, *info);
-  auto *heap = ResolveHeap(context, table_oid_);
+  auto *heap = ResolveTableStorage<TableHeap>(context, table_oid_, "Update", "a row-format heap");
 
   // A key-changing update is a tombstone of the old tuple + an insert of the new key. Doing it in two
   // statement-wide phases — delete EVERY changed row's old tuple, then insert-or-revive every new row —

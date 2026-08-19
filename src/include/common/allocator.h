@@ -90,9 +90,6 @@ class Allocator {
     return static_cast<data_ptr_t>(realloc(pointer, size));
   }
 
-  /** @return The implementation-private state of this allocator. */
-  auto GetPrivateData() -> PrivateAllocatorData * { return private_data_.get(); }
-
  private:
   allocate_function_ptr_t alloc_function_;
   free_function_ptr_t free_function_;

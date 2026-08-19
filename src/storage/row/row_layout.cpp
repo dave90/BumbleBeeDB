@@ -16,12 +16,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Round up to the next multiple of 8, so the next row starts aligned. */
-constexpr auto AlignValue(idx_t n) -> idx_t { return (n + 7) & ~idx_t(7); }
-
-}  // namespace
+static constexpr auto AlignValue(idx_t n) -> idx_t { return (n + 7) & ~idx_t(7); }
 
 void RowLayout::Initialize(std::vector<LogicalType> types) {
   types_ = std::move(types);

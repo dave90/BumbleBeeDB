@@ -1,0 +1,31 @@
+# DECIMAL declarations against an external file must share the file's backing integer. The column
+# reader decodes into the backing selected by the FILE's decimal width (INT32 here), while the
+# scan's output vector uses the DECLARED width — a different backing would type-pun the payload
+# (garbage values; a heap overflow for a narrower declaration), so the schema check rejects the
+# declaration at CREATE instead. Widths 5-9 share the INT32 backing, so any of them adopts the
+# file; 18 (INT64) and 4 (INT16) do not.
+# fixture: int32_decimal.parquet
+
+# Declared wider: DECIMAL(18,2) backs onto INT64, the file stores INT32.
+statement error
+CREATE TABLE d (value DECIMAL(18,2)) WITH (format='parquet', location='${TMPDIR}');
+
+# Declared narrower: DECIMAL(4,2) backs onto INT16.
+statement error
+CREATE TABLE d (value DECIMAL(4,2)) WITH (format='parquet', location='${TMPDIR}');
+
+# The matching backing works (the file derives as DECIMAL(9,2)).
+statement ok
+CREATE TABLE d (value DECIMAL(9,2)) WITH (format='parquet', location='${TMPDIR}');
+
+query
+SELECT COUNT(*) FROM d;
+----
+24
+
+query
+SELECT value FROM d ORDER BY value LIMIT 3;
+----
+1.00
+2.00
+3.00

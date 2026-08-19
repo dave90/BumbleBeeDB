@@ -24,17 +24,13 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto NextPowerOfTwo(idx_t n) -> idx_t {
+static auto NextPowerOfTwo(idx_t n) -> idx_t {
   idx_t p = 1;
   while (p < n) {
     p <<= 1;
   }
   return p;
 }
-
-}  // namespace
 
 auto PRLHashTable::NonNullKeyRows(DataChunk &key_chunk, SelectionVector &sel) -> idx_t {
   // Fast path — the overwhelmingly common one, and the one a 30M-row probe pays per chunk: no key
@@ -163,7 +159,7 @@ void PRLHashTable::FindOrCreateGroups(Vector &hashes, DataChunk &groups, Vector 
     buckets[i] = hash_data[i] & bitmask_;
   }
 
-  SelectionVector sel;              // identity on the first round
+  SelectionVector sel;                    // identity on the first round
   SelectionVector empty_sel(count);       // rows that created a group this round
   SelectionVector compare_sel(count);     // rows whose bucket hash matched — verify the keys
   SelectionVector round_no_match(count);  // rows that move to the next bucket
@@ -210,8 +206,8 @@ void PRLHashTable::FindOrCreateGroups(Vector &hashes, DataChunk &groups, Vector 
 
     // Verify the hash-equal rows against their group's key prefix; failures probe the next bucket.
     idx_t kernel_failures = 0;
-    RowOperations::Match(groups, col_data.get(), layout_, key_count_, addresses, compare_sel, compare_sel,
-                         n_compare, match_sel, kernel_no_match, kernel_failures, null_equal_keys_);
+    RowOperations::Match(groups, col_data.get(), layout_, key_count_, addresses, compare_sel, compare_sel, n_compare,
+                         match_sel, kernel_no_match, kernel_failures, null_equal_keys_);
     for (idx_t j = 0; j < kernel_failures; j++) {
       round_no_match.SetIndex(n_no_match++, compare_sel.GetIndex(kernel_no_match.GetIndex(j)));
     }
@@ -349,8 +345,8 @@ void PRLHashTable::Probe(Vector &hashes, DataChunk &keys, const SelectionVector 
   Probe(state, hashes, keys, sel, count, out_addrs, out_rows, matched);
 }
 
-void PRLHashTable::Probe(ProbeState &state, Vector &hashes, DataChunk &keys, const SelectionVector &sel,
-                         idx_t count, std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows,
+void PRLHashTable::Probe(ProbeState &state, Vector &hashes, DataChunk &keys, const SelectionVector &sel, idx_t count,
+                         std::vector<data_ptr_t> &out_addrs, std::vector<sel_t> &out_rows,
                          std::vector<uint8_t> *matched) {
   if (count == 0 || count_ == 0) {
     return;

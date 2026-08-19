@@ -27,16 +27,12 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto MakeSchema() -> Schema {
+static auto MakeSchema() -> Schema {
   return Schema{std::vector<Column>{
       Column("id", LogicalType(LogicalTypeId::INTEGER)),
       Column("v", LogicalType(LogicalTypeId::DOUBLE)),
   }};
 }
-
-}  // namespace
 
 TEST(CatalogStorageTest, CreateTableWithBpmGetsRowStorage) {
   MemoryDiskManager dm(256);
@@ -131,17 +127,13 @@ TEST(CatalogStorageTest, DropTableDoesNotReuseOidAndSparesOthers) {
   EXPECT_NE(a2->oid_, b->oid_);
 }
 
-namespace {
-
-auto Contains(const std::vector<page_id_t> &pages, page_id_t p) -> bool {
+static auto Contains(const std::vector<page_id_t> &pages, page_id_t p) -> bool {
   return std::find(pages.begin(), pages.end(), p) != pages.end();
 }
 
-auto HeapOf(const std::shared_ptr<TableInfo> &info) -> TableHeap * {
+static auto HeapOf(const std::shared_ptr<TableInfo> &info) -> TableHeap * {
   return dynamic_cast<TableHeap *>(info->storage_.get());
 }
-
-}  // namespace
 
 TEST(CatalogStorageTest, DropTableReturnsHeapPagesToFreeList) {
   MemoryDiskManager dm(256);

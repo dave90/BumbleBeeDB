@@ -57,7 +57,7 @@ class ParquetTable : public TableStorage {
   auto GetSchema() const -> const std::shared_ptr<Schema> & { return schema_; }
 
   /** @brief Fail-fast writer lock: at most one writer per table, losers throw immediately. */
-  auto TryLockForWrite() -> bool { return write_lock_.try_lock(); }
+  [[nodiscard]] auto TryLockForWrite() -> bool { return write_lock_.try_lock(); }
   void UnlockWrite() { write_lock_.unlock(); }
 
   auto MakeScan(const std::vector<idx_t> & /*projection*/ = {}) -> std::unique_ptr<TableScan> override {

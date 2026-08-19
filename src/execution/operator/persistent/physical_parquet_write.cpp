@@ -30,6 +30,7 @@
 #include <unordered_set>
 
 #include "catalog/catalog.h"
+#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "execution/expression_executor.h"
 #include "fmt/format.h"
@@ -43,29 +44,15 @@
 
 namespace bumblebee {
 
-namespace {
-
 namespace fs = std::filesystem;
 
-auto ResolveParquet(ClientContext &context, table_oid_t oid) -> ParquetTable * {
-  auto info = context.catalog_.GetTable(oid);
-  if (info == NULL_TABLE_INFO || info->storage_ == nullptr) {
-    throw ExecutionException("parquet write: table has no storage backend");
-  }
-  auto *parquet = dynamic_cast<ParquetTable *>(info->storage_.get());
-  if (parquet == nullptr) {
-    throw ExecutionException("parquet write: table is not an external parquet table");
-  }
-  return parquet;
-}
-
-auto TableName(ClientContext &context, table_oid_t oid) -> std::string {
+static auto TableName(ClientContext &context, table_oid_t oid) -> std::string {
   auto info = context.catalog_.GetTable(oid);
   return info != NULL_TABLE_INFO ? info->name_ : fmt::format("oid={}", oid);
 }
 
 /** @brief Read the manifest a locked rewrite is based on; a manifest must exist post-CREATE. */
-auto ReadManifestOrThrow(const std::string &dir, const std::string &table_name) -> ParquetManifest {
+static auto ReadManifestOrThrow(const std::string &dir, const std::string &table_name) -> ParquetManifest {
   auto manifest = ParquetManifestIO::ReadLatest(dir);
   if (!manifest.has_value()) {
     throw ExecutionException(
@@ -75,11 +62,13 @@ auto ReadManifestOrThrow(const std::string &dir, const std::string &table_name) 
 }
 
 /** The RID split: file index in the high 32 bits, row index within the file in the low 32. */
-auto RidFileIdx(int64_t rid) -> idx_t { return static_cast<uint64_t>(rid) >> 32U; }
-auto RidRowIdx(int64_t rid) -> uint32_t { return static_cast<uint32_t>(static_cast<uint64_t>(rid) & 0xFFFFFFFFU); }
+static auto RidFileIdx(int64_t rid) -> idx_t { return static_cast<uint64_t>(rid) >> 32U; }
+static auto RidRowIdx(int64_t rid) -> uint32_t {
+  return static_cast<uint32_t>(static_cast<uint64_t>(rid) & 0xFFFFFFFFU);
+}
 
 /** @brief Collect the RID column values of a chunk. */
-void CollectRids(DataChunk &input, idx_t rid_column, std::vector<int64_t> &out) {
+static void CollectRids(DataChunk &input, idx_t rid_column, std::vector<int64_t> &out) {
   const idx_t count = input.GetSize();
   input.data_[rid_column].Normalify(count);
   const auto *rd = FlatVector::GetData<int64_t>(input.data_[rid_column]);
@@ -91,8 +80,6 @@ struct ParquetWriteSourceState : GlobalSourceState {
   std::atomic<bool> emitted_{false};
   GlobalSinkState *sink_{nullptr};
 };
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // INSERT
@@ -139,7 +126,7 @@ auto PhysicalParquetInsert::Finalize(ClientContext &context, GlobalSinkState &gs
     return SinkFinalizeType::READY;  // nothing to append, no manifest churn
   }
 
-  auto *parquet = ResolveParquet(context, table_oid_);
+  auto *parquet = ResolveTableStorage<ParquetTable>(context, table_oid_, "parquet write", "an external parquet table");
   const auto table_name = TableName(context, table_oid_);
   const auto &dir = parquet->GetPath();
 
@@ -197,8 +184,6 @@ struct ParquetDeleteLocalSinkState : LocalSinkState {
   std::vector<int64_t> rids_;
 };
 
-namespace {
-
 /**
  * @brief The shared copy-on-write rewrite of DELETE and UPDATE.
  *
@@ -209,9 +194,10 @@ namespace {
  * @param transform Called per (file_idx, chunk, first_row_index_in_file, writer).
  */
 template <class TRANSFORM>
-void RewriteTouchedFiles(ClientContext &context, table_oid_t table_oid, const std::unordered_set<idx_t> &touched_files,
-                         const std::string &table_name, TRANSFORM &&transform) {
-  auto *parquet = ResolveParquet(context, table_oid);
+static void RewriteTouchedFiles(ClientContext &context, table_oid_t table_oid,
+                                const std::unordered_set<idx_t> &touched_files, const std::string &table_name,
+                                TRANSFORM &&transform) {
+  auto *parquet = ResolveTableStorage<ParquetTable>(context, table_oid, "parquet write", "an external parquet table");
   const auto &dir = parquet->GetPath();
   const auto &schema = *parquet->GetSchema();
 
@@ -274,8 +260,6 @@ void RewriteTouchedFiles(ClientContext &context, table_oid_t table_oid, const st
     fs::remove(fs::path(dir) / name, ec);
   }
 }
-
-}  // namespace
 
 auto PhysicalParquetDelete::GetGlobalSinkState(ClientContext & /*context*/) const -> std::unique_ptr<GlobalSinkState> {
   return std::make_unique<ParquetDeleteGlobalSinkState>();

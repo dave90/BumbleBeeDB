@@ -16,6 +16,7 @@
 #include <memory>
 
 #include "catalog/catalog.h"
+#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "fmt/format.h"
 #include "parallel/pipeline_builder.h"
@@ -23,23 +24,6 @@
 #include "type/value.h"
 
 namespace bumblebee {
-
-namespace {
-
-/** @brief Resolve the row-format heap behind a table oid, or throw if it is missing / not a heap. */
-auto ResolveHeap(ClientContext &context, table_oid_t oid) -> TableHeap * {
-  auto info = context.catalog_.GetTable(oid);
-  if (info == NULL_TABLE_INFO || info->storage_ == nullptr) {
-    throw ExecutionException("TableScan: table has no storage backend");
-  }
-  auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
-  if (heap == nullptr) {
-    throw ExecutionException("TableScan: table is not a row-format heap");
-  }
-  return heap;
-}
-
-}  // namespace
 
 /** @brief The shared scan snapshot for a whole `PhysicalTableScan`. */
 struct TableScanGlobalState : GlobalSourceState {
@@ -73,7 +57,7 @@ void PhysicalTableScan::BuildPipelines(Pipeline &current, PipelineBuilder & /*bu
 
 auto PhysicalTableScan::GetGlobalSourceState(ClientContext &context, GlobalSinkState * /*own*/) const
     -> std::unique_ptr<GlobalSourceState> {
-  auto *heap = ResolveHeap(context, table_oid_);
+  auto *heap = ResolveTableStorage<TableHeap>(context, table_oid_, "TableScan", "a row-format heap");
   auto gs = std::make_unique<TableScanGlobalState>();
   gs->scan_state_ = heap->BeginParallelScan(&context.txn_mgr_, context.txn_, table_oid_, predicate_, projection_);
   // Seed the per-scan morsel granularity from the session config; a lowered value lets a small table
@@ -141,7 +125,7 @@ auto PhysicalTableScan::GetData(ExecutionContext & /*context*/, DataChunk &outpu
           for (idx_t k = 0; k < projection_.size(); k++) {
             output.data_[projection_[k]].Reference(ls.narrow_.data_[k]);
           }
-         if (ls.first_null_column_ != output.ColumnCount() &&
+          if (ls.first_null_column_ != output.ColumnCount() &&
               output.data_[ls.first_null_column_].GetVectorType() != VectorType::CONSTANT_VECTOR) {
             for (idx_t c = 0, k = 0; c < output.ColumnCount(); c++) {
               if (k < projection_.size() && projection_[k] == c) {

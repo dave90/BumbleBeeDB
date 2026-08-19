@@ -34,8 +34,6 @@ using format::PageType;
 using format::Type;
 using ParquetRowGroup = format::RowGroup;
 
-namespace {
-
 /** Thrift transport writing into a Serializer (page headers / footer land in the file writer). */
 class SerializerTransport : public thrift::transport::TTransport {
  public:
@@ -53,7 +51,7 @@ class SerializerTransport : public thrift::transport::TTransport {
   Serializer &serializer_;
 };
 
-auto BumbleBeeTypeToParquetType(const LogicalType &type) -> Type::type {
+static auto BumbleBeeTypeToParquetType(const LogicalType &type) -> Type::type {
   switch (type.GetTypeId()) {
     case LogicalTypeId::BOOLEAN:
       return Type::BOOLEAN;
@@ -78,7 +76,7 @@ auto BumbleBeeTypeToParquetType(const LogicalType &type) -> Type::type {
   }
 }
 
-auto BumbleBeeTypeToConvertedType(const LogicalType &type, ConvertedType::type &result) -> bool {
+static auto BumbleBeeTypeToConvertedType(const LogicalType &type, ConvertedType::type &result) -> bool {
   switch (type.GetTypeId()) {
     case LogicalTypeId::STRING:
       result = ConvertedType::UTF8;
@@ -88,7 +86,7 @@ auto BumbleBeeTypeToConvertedType(const LogicalType &type, ConvertedType::type &
   }
 }
 
-void VarintEncode(uint32_t val, Serializer &ser) {
+static void VarintEncode(uint32_t val, Serializer &ser) {
   do {
     uint8_t byte = val & 127;
     val >>= 7;
@@ -99,7 +97,7 @@ void VarintEncode(uint32_t val, Serializer &ser) {
   } while (val != 0);
 }
 
-auto GetVarintSize(uint32_t val) -> uint8_t {
+static auto GetVarintSize(uint32_t val) -> uint8_t {
   uint8_t res = 0;
   do {
     val >>= 7;
@@ -109,7 +107,7 @@ auto GetVarintSize(uint32_t val) -> uint8_t {
 }
 
 template <class SRC, class TGT, bool HAS_NULL>
-void TemplatedWritePlainNullCheck(Vector &col, idx_t length, Serializer &ser) {
+static void TemplatedWritePlainNullCheck(Vector &col, idx_t length, Serializer &ser) {
   auto *ptr = FlatVector::GetData<SRC>(col);
   if constexpr (!HAS_NULL) {
     for (idx_t r = 0; r < length; r++) {
@@ -126,7 +124,7 @@ void TemplatedWritePlainNullCheck(Vector &col, idx_t length, Serializer &ser) {
 }
 
 template <class SRC, class TGT>
-void TemplatedWritePlain(Vector &col, idx_t length, Serializer &ser) {
+static void TemplatedWritePlain(Vector &col, idx_t length, Serializer &ser) {
   if (col.Validity().AllValid()) {
     TemplatedWritePlainNullCheck<SRC, TGT, false>(col, length, ser);
   } else {
@@ -139,7 +137,8 @@ void TemplatedWritePlain(Vector &col, idx_t length, Serializer &ser) {
  * plain-encoded statistics payload (raw little-endian TGT bytes) parquet readers expect.
  */
 template <class SRC, class TGT>
-auto ComputeNumericStats(ChunkCollection &buffer, idx_t col) -> std::optional<std::pair<std::string, std::string>> {
+static auto ComputeNumericStats(ChunkCollection &buffer, idx_t col)
+    -> std::optional<std::pair<std::string, std::string>> {
   bool seen = false;
   TGT min_v{};
   TGT max_v{};
@@ -169,7 +168,7 @@ auto ComputeNumericStats(ChunkCollection &buffer, idx_t col) -> std::optional<st
 }
 
 /** @brief Column-chunk statistics for the plain numeric types (zone-map fodder for the scan). */
-auto NumericStatsFor(const LogicalType &type, ChunkCollection &buffer, idx_t col)
+static auto NumericStatsFor(const LogicalType &type, ChunkCollection &buffer, idx_t col)
     -> std::optional<std::pair<std::string, std::string>> {
   switch (type.GetTypeId()) {
     case LogicalTypeId::TINYINT:
@@ -188,8 +187,6 @@ auto NumericStatsFor(const LogicalType &type, ChunkCollection &buffer, idx_t col
       return std::nullopt;  // strings/decimals/timestamps carry no stats (yet)
   }
 }
-
-}  // namespace
 
 ParquetWriter::ParquetWriter(std::string file_name, std::vector<LogicalType> types, std::vector<std::string> names,
                              CompressionCodec::type codec)
@@ -229,6 +226,174 @@ ParquetWriter::ParquetWriter(std::string file_name, std::vector<LogicalType> typ
   }
 }
 
+/** @brief Write column `col`'s definition levels as one RLE bit-packed-literals run: bit=1 valid,
+ * bit=0 NULL (LSB-first). STANDARD_VECTOR_SIZE is a multiple of 8, so per-chunk byte-aligned
+ * packing stays contiguous for the reader (only the last chunk pads). */
+static void WriteDefinitionLevels(ChunkCollection &buffer, idx_t col, Serializer &temp_writer) {
+  // First figure out how many bytes we need (1 byte per 8 rows, rounded up); the count is a
+  // varint header with the low bit set to indicate bit-packed literals.
+  auto define_byte_count = (buffer.GetCount() + 7) / 8;
+  uint32_t define_header = (define_byte_count << 1) | 1;
+  uint32_t define_size = GetVarintSize(define_header) + define_byte_count;
+
+  temp_writer.Write<uint32_t>(define_size);
+  VarintEncode(define_header, temp_writer);
+
+  for (auto &chunk : buffer.Chunks()) {
+    BUMBLEBEE_ASSERT(chunk->GetSize() <= STANDARD_VECTOR_SIZE, "parquet invariant violated");
+    auto &define_col = chunk->data_[col];
+    auto chunk_define_byte_count = (chunk->GetSize() + 7) / 8;
+    uint8_t define_buf[(STANDARD_VECTOR_SIZE + 7) / 8];
+    if (define_col.Validity().AllValid()) {
+      std::memset(define_buf, 0xFF, chunk_define_byte_count);
+    } else {
+      std::memset(define_buf, 0, chunk_define_byte_count);
+      for (idx_t r = 0; r < chunk->GetSize(); r++) {
+        if (define_col.RowIsValid(r)) {
+          define_buf[r / 8] |= static_cast<uint8_t>(1u << (r % 8));
+        }
+      }
+    }
+    temp_writer.WriteData(reinterpret_cast<const_data_ptr_t>(define_buf), chunk_define_byte_count);
+  }
+}
+
+/** @brief Write column `col`'s non-NULL values as PLAIN-encoded payload, chunk by chunk. */
+static void WritePlainColumnPayload(const LogicalType &type, ChunkCollection &buffer, idx_t col,
+                                    Serializer &temp_writer) {
+  for (auto &chunk : buffer.Chunks()) {
+    auto &input = *chunk;
+    auto &input_column = input.data_[col];
+
+    switch (type.GetTypeId()) {
+      case LogicalTypeId::BOOLEAN: {
+        auto *ptr = FlatVector::GetData<uint8_t>(input_column);
+        uint8_t byte = 0;
+        uint8_t byte_pos = 0;
+        for (idx_t r = 0; r < input.GetSize(); r++) {
+          if (!input_column.RowIsValid(r)) {
+            continue;  // NULL: no payload entry
+          }
+          byte |= (ptr[r] & 1) << byte_pos;
+          byte_pos++;
+
+          if (byte_pos == 8) {
+            temp_writer.Write<uint8_t>(byte);
+            byte = 0;
+            byte_pos = 0;
+          }
+        }
+        if (byte_pos > 0) {
+          temp_writer.Write<uint8_t>(byte);
+        }
+        break;
+      }
+      case LogicalTypeId::TINYINT:
+        TemplatedWritePlain<int8_t, int32_t>(input_column, input.GetSize(), temp_writer);
+        break;
+      case LogicalTypeId::SMALLINT:
+        TemplatedWritePlain<int16_t, int32_t>(input_column, input.GetSize(), temp_writer);
+        break;
+      case LogicalTypeId::INTEGER:
+        TemplatedWritePlain<int32_t, int32_t>(input_column, input.GetSize(), temp_writer);
+        break;
+      case LogicalTypeId::BIGINT:
+        TemplatedWritePlain<int64_t, int64_t>(input_column, input.GetSize(), temp_writer);
+        break;
+      case LogicalTypeId::FLOAT:
+        TemplatedWritePlain<float, float>(input_column, input.GetSize(), temp_writer);
+        break;
+      case LogicalTypeId::DECIMAL: {
+        // Written as DOUBLE until FIXED_LEN_BYTE_ARRAY decimals are implemented.
+        Vector double_vec{LogicalType(LogicalTypeId::DOUBLE)};
+        VectorOperations::Cast(input_column, double_vec, input.GetSize());
+        TemplatedWritePlain<double, double>(double_vec, input.GetSize(), temp_writer);
+        break;
+      }
+      case LogicalTypeId::DOUBLE:
+        TemplatedWritePlain<double, double>(input_column, input.GetSize(), temp_writer);
+        break;
+      case LogicalTypeId::DATE: {
+        auto *ptr = FlatVector::GetData<date_t>(input_column);
+        for (idx_t r = 0; r < input.GetSize(); r++) {
+          if (!input_column.RowIsValid(r)) {
+            continue;  // NULL: no payload entry
+          }
+          auto ts = Timestamp::FromDatetime(ptr[r]);
+          temp_writer.Write<Int96>(TimestampToImpalaTimestamp(ts));
+        }
+        break;
+      }
+      case LogicalTypeId::TIMESTAMP: {
+        auto *ptr = FlatVector::GetData<timestamp_t>(input_column);
+        for (idx_t r = 0; r < input.GetSize(); r++) {
+          if (!input_column.RowIsValid(r)) {
+            continue;  // NULL: no payload entry
+          }
+          temp_writer.Write<Int96>(TimestampToImpalaTimestamp(ptr[r]));
+        }
+        break;
+      }
+      case LogicalTypeId::STRING: {
+        auto *ptr = FlatVector::GetData<string_t>(input_column);
+        for (idx_t r = 0; r < input.GetSize(); r++) {
+          if (!input_column.RowIsValid(r)) {
+            continue;  // NULL: no payload entry
+          }
+          temp_writer.Write<uint32_t>(ptr[r].Size());
+          temp_writer.WriteData(reinterpret_cast<const_data_ptr_t>(ptr[r].GetDataUnsafe()), ptr[r].Size());
+        }
+        break;
+      }
+      default:
+        throw NotImplementedException("Parquet write type not supported: " + type.ToString());
+    }
+  }
+}
+
+/** @brief Compress the assembled page with `codec`. `holder` owns the compressed bytes when the
+ * codec allocates (UNCOMPRESSED aliases the page buffer instead — keep both alive until the
+ * returned span is written out). @return (data, size) of the bytes to write. */
+static auto CompressPage(CompressionCodec::type codec, BufferedSerializer &temp_writer,
+                         std::unique_ptr<data_t[]> &holder) -> std::pair<data_ptr_t, size_t> {
+  size_t compressed_size;
+  data_ptr_t compressed_data;
+  switch (codec) {
+    case CompressionCodec::UNCOMPRESSED:
+      compressed_size = temp_writer.blob_.size_;
+      compressed_data = temp_writer.blob_.data_.get();
+      break;
+    case CompressionCodec::SNAPPY: {
+      compressed_size = snappy::MaxCompressedLength(temp_writer.blob_.size_);
+      holder = std::make_unique_for_overwrite<data_t[]>(compressed_size);
+      snappy::RawCompress(reinterpret_cast<const char *>(temp_writer.blob_.data_.get()), temp_writer.blob_.size_,
+                          reinterpret_cast<char *>(holder.get()), &compressed_size);
+      compressed_data = holder.get();
+      break;
+    }
+    case CompressionCodec::GZIP: {
+      MiniZStream s;
+      compressed_size = s.MaxCompressedLength(temp_writer.blob_.size_);
+      holder = std::make_unique_for_overwrite<data_t[]>(compressed_size);
+      s.Compress(reinterpret_cast<const char *>(temp_writer.blob_.data_.get()), temp_writer.blob_.size_,
+                 reinterpret_cast<char *>(holder.get()), &compressed_size);
+      compressed_data = holder.get();
+      break;
+    }
+    case CompressionCodec::ZSTD: {
+      compressed_size = ZSTD_compressBound(temp_writer.blob_.size_);
+      holder = std::make_unique_for_overwrite<data_t[]>(compressed_size);
+      compressed_size = ZSTD_compress(holder.get(), compressed_size, temp_writer.blob_.data_.get(),
+                                      temp_writer.blob_.size_, ZSTD_CLEVEL_DEFAULT);
+      compressed_data = holder.get();
+      break;
+    }
+    default:
+      throw NotImplementedException("Unsupported codec for Parquet Writer");
+  }
+  return {compressed_data, compressed_size};
+}
+
 void ParquetWriter::Flush(ChunkCollection &buffer) {
   if (buffer.GetCount() == 0) {
     return;
@@ -264,168 +429,14 @@ void ParquetWriter::Flush(ChunkCollection &buffer) {
     // current page.
     auto start_offset = writer_->GetTotalWritten();
 
-    // Write the definition levels as one RLE bit-packed-literals run.
-    // First figure out how many bytes we need (1 byte per 8 rows, rounded up); the count is a
-    // varint header with the low bit set to indicate bit-packed literals.
-    auto define_byte_count = (buffer.GetCount() + 7) / 8;
-    uint32_t define_header = (define_byte_count << 1) | 1;
-    uint32_t define_size = GetVarintSize(define_header) + define_byte_count;
-
-    temp_writer.Write<uint32_t>(define_size);
-    VarintEncode(define_header, temp_writer);
-
-    for (auto &chunk : buffer.Chunks()) {
-      // Definition levels: bit=1 valid, bit=0 NULL (bit-packed, LSB-first).
-      // STANDARD_VECTOR_SIZE is a multiple of 8, so per-chunk byte-aligned packing stays
-      // contiguous for the reader (only the last chunk pads).
-      BUMBLEBEE_ASSERT(chunk->GetSize() <= STANDARD_VECTOR_SIZE, "parquet invariant violated");
-      auto &define_col = chunk->data_[i];
-      auto chunk_define_byte_count = (chunk->GetSize() + 7) / 8;
-      uint8_t define_buf[(STANDARD_VECTOR_SIZE + 7) / 8];
-      if (define_col.Validity().AllValid()) {
-        std::memset(define_buf, 0xFF, chunk_define_byte_count);
-      } else {
-        std::memset(define_buf, 0, chunk_define_byte_count);
-        for (idx_t r = 0; r < chunk->GetSize(); r++) {
-          if (define_col.RowIsValid(r)) {
-            define_buf[r / 8] |= static_cast<uint8_t>(1u << (r % 8));
-          }
-        }
-      }
-      temp_writer.WriteData(reinterpret_cast<const_data_ptr_t>(define_buf), chunk_define_byte_count);
-    }
-
-    // Now write the actual payload as PLAIN values.
-    for (auto &chunk : buffer.Chunks()) {
-      auto &input = *chunk;
-      auto &input_column = input.data_[i];
-
-      switch (sql_types_[i].GetTypeId()) {
-        case LogicalTypeId::BOOLEAN: {
-          auto *ptr = FlatVector::GetData<uint8_t>(input_column);
-          uint8_t byte = 0;
-          uint8_t byte_pos = 0;
-          for (idx_t r = 0; r < input.GetSize(); r++) {
-            if (!input_column.RowIsValid(r)) {
-              continue;  // NULL: no payload entry
-            }
-            byte |= (ptr[r] & 1) << byte_pos;
-            byte_pos++;
-
-            if (byte_pos == 8) {
-              temp_writer.Write<uint8_t>(byte);
-              byte = 0;
-              byte_pos = 0;
-            }
-          }
-          if (byte_pos > 0) {
-            temp_writer.Write<uint8_t>(byte);
-          }
-          break;
-        }
-        case LogicalTypeId::TINYINT:
-          TemplatedWritePlain<int8_t, int32_t>(input_column, input.GetSize(), temp_writer);
-          break;
-        case LogicalTypeId::SMALLINT:
-          TemplatedWritePlain<int16_t, int32_t>(input_column, input.GetSize(), temp_writer);
-          break;
-        case LogicalTypeId::INTEGER:
-          TemplatedWritePlain<int32_t, int32_t>(input_column, input.GetSize(), temp_writer);
-          break;
-        case LogicalTypeId::BIGINT:
-          TemplatedWritePlain<int64_t, int64_t>(input_column, input.GetSize(), temp_writer);
-          break;
-        case LogicalTypeId::FLOAT:
-          TemplatedWritePlain<float, float>(input_column, input.GetSize(), temp_writer);
-          break;
-        case LogicalTypeId::DECIMAL: {
-          // Written as DOUBLE until FIXED_LEN_BYTE_ARRAY decimals are implemented.
-          Vector double_vec{LogicalType(LogicalTypeId::DOUBLE)};
-          VectorOperations::Cast(input_column, double_vec, input.GetSize());
-          TemplatedWritePlain<double, double>(double_vec, input.GetSize(), temp_writer);
-          break;
-        }
-        case LogicalTypeId::DOUBLE:
-          TemplatedWritePlain<double, double>(input_column, input.GetSize(), temp_writer);
-          break;
-        case LogicalTypeId::DATE: {
-          auto *ptr = FlatVector::GetData<date_t>(input_column);
-          for (idx_t r = 0; r < input.GetSize(); r++) {
-            if (!input_column.RowIsValid(r)) {
-              continue;  // NULL: no payload entry
-            }
-            auto ts = Timestamp::FromDatetime(ptr[r]);
-            temp_writer.Write<Int96>(TimestampToImpalaTimestamp(ts));
-          }
-          break;
-        }
-        case LogicalTypeId::TIMESTAMP: {
-          auto *ptr = FlatVector::GetData<timestamp_t>(input_column);
-          for (idx_t r = 0; r < input.GetSize(); r++) {
-            if (!input_column.RowIsValid(r)) {
-              continue;  // NULL: no payload entry
-            }
-            temp_writer.Write<Int96>(TimestampToImpalaTimestamp(ptr[r]));
-          }
-          break;
-        }
-        case LogicalTypeId::STRING: {
-          auto *ptr = FlatVector::GetData<string_t>(input_column);
-          for (idx_t r = 0; r < input.GetSize(); r++) {
-            if (!input_column.RowIsValid(r)) {
-              continue;  // NULL: no payload entry
-            }
-            temp_writer.Write<uint32_t>(ptr[r].Size());
-            temp_writer.WriteData(reinterpret_cast<const_data_ptr_t>(ptr[r].GetDataUnsafe()), ptr[r].Size());
-          }
-          break;
-        }
-        default:
-          throw NotImplementedException("Parquet write type not supported: " + sql_types_[i].ToString());
-      }
-    }
+    WriteDefinitionLevels(buffer, i, temp_writer);
+    WritePlainColumnPayload(sql_types_[i], buffer, i, temp_writer);
 
     // Now that we have finished writing the data we know the uncompressed size.
     hdr.uncompressed_page_size = temp_writer.blob_.size_;
 
-    // Compress the page.
-    size_t compressed_size;
-    data_ptr_t compressed_data;
     std::unique_ptr<data_t[]> compressed_buf;
-    switch (codec_) {
-      case CompressionCodec::UNCOMPRESSED:
-        compressed_size = temp_writer.blob_.size_;
-        compressed_data = temp_writer.blob_.data_.get();
-        break;
-      case CompressionCodec::SNAPPY: {
-        compressed_size = snappy::MaxCompressedLength(temp_writer.blob_.size_);
-        compressed_buf = std::unique_ptr<data_t[]>(new data_t[compressed_size]);
-        snappy::RawCompress(reinterpret_cast<const char *>(temp_writer.blob_.data_.get()), temp_writer.blob_.size_,
-                            reinterpret_cast<char *>(compressed_buf.get()), &compressed_size);
-        compressed_data = compressed_buf.get();
-        break;
-      }
-      case CompressionCodec::GZIP: {
-        MiniZStream s;
-        compressed_size = s.MaxCompressedLength(temp_writer.blob_.size_);
-        compressed_buf = std::unique_ptr<data_t[]>(new data_t[compressed_size]);
-        s.Compress(reinterpret_cast<const char *>(temp_writer.blob_.data_.get()), temp_writer.blob_.size_,
-                   reinterpret_cast<char *>(compressed_buf.get()), &compressed_size);
-        compressed_data = compressed_buf.get();
-        break;
-      }
-      case CompressionCodec::ZSTD: {
-        compressed_size = ZSTD_compressBound(temp_writer.blob_.size_);
-        compressed_buf = std::unique_ptr<data_t[]>(new data_t[compressed_size]);
-        compressed_size =
-            ZSTD_compress(compressed_buf.get(), compressed_size, temp_writer.blob_.data_.get(),
-                          temp_writer.blob_.size_, ZSTD_CLEVEL_DEFAULT);
-        compressed_data = compressed_buf.get();
-        break;
-      }
-      default:
-        throw NotImplementedException("Unsupported codec for Parquet Writer");
-    }
+    auto [compressed_data, compressed_size] = CompressPage(codec_, temp_writer, compressed_buf);
 
     hdr.compressed_page_size = compressed_size;
     // Now finally write the data to the actual file.

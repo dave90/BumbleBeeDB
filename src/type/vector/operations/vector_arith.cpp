@@ -24,6 +24,19 @@
 
 namespace bumblebee {
 
+// The functor types in this file are template *policy* arguments: every kernel below is
+// instantiated over the full type cross-product, so each one names a functor in its mangled
+// name. They are the one construct here that must stay in an anonymous namespace.
+//
+// `static` gives internal linkage to functions and objects, but there is no such spelling for a
+// type ([basic.link]) — and nesting a type inside a class does not help either, because a nested
+// type of an externally linked class is itself externally linked. Promoting these functors to
+// `bumblebee` therefore flips every instantiation that mentions them from internal to weak
+// external linkage, which forces the compiler to emit an out-of-line body for each one instead of
+// inlining it into its single call site. Measured on this file: 11.1 MB -> 17.4 MB of object code
+// (+56%) and 150 -> 16,314 exported symbols. vector_comparison.cpp has the same property
+// (7.4 MB -> 11.4 MB, 710 -> 12,854 symbols); the other kernel files do not, and their functors
+// live in `bumblebee` like everything else.
 namespace {
 
 /** @brief `-value`, produced in the result's type. */
@@ -34,8 +47,10 @@ struct ArithNegate {
   }
 };
 
+}  // namespace
+
 template <class INPUT_TYPE>
-void TemplatedExecuteNegateSwitchResult(Vector &input, Vector &result, idx_t count) {
+static void TemplatedExecuteNegateSwitchResult(Vector &input, Vector &result, idx_t count) {
   switch (result.GetType()) {
     case PhysicalType::TINYINT:
       UnaryExecution::Execute<INPUT_TYPE, int8_t, ArithNegate>(input, result, count);
@@ -63,7 +78,7 @@ void TemplatedExecuteNegateSwitchResult(Vector &input, Vector &result, idx_t cou
 
 /** @brief The fast path: both inputs and the result share one logical type. */
 template <class OP>
-void TemplatedExecuteOperationSwitchEqualType(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationSwitchEqualType(Vector &left, Vector &right, Vector &result, idx_t count) {
   BUMBLEBEE_ASSERT(left.GetLogicalType() == right.GetLogicalType() && left.GetLogicalType() == result.GetLogicalType(),
                    "the equal-type path needs all three types to match");
   switch (left.GetLogicalTypeId()) {
@@ -115,6 +130,9 @@ void TemplatedExecuteOperationSwitchEqualType(Vector &left, Vector &right, Vecto
 // two DECIMALs therefore cannot just add the raw integers unless the scales agree, and the
 // result has its own scale to hit. The DecimalCommonCast functors below do the rescaling
 // per row, with the scales carried in through `dataptr`.
+
+// Policy functors — internal linkage, for the reason documented at ArithNegate above.
+namespace {
 
 /** @brief Promote both operands to RESULT_TYPE, then apply OP. */
 template <class LEFT_TYPE, class RIGHT_TYPE, class RESULT_TYPE, class OP>
@@ -260,8 +278,10 @@ struct DecimalCommonCast<LEFT_TYPE, RIGHT_TYPE, RESULT_TYPE, Division> {
   }
 };
 
+}  // namespace
+
 template <class LEFT_TYPE, class RIGHT_TYPE, class RESULT_TYPE, class OP>
-void TemplatedExecuteOperationSwitchDecimalMaxScale(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationSwitchDecimalMaxScale(Vector &left, Vector &right, Vector &result, idx_t count) {
   BUMBLEBEE_ASSERT(left.GetLogicalTypeId() == LogicalTypeId::DECIMAL, "the left operand must be a DECIMAL");
   BUMBLEBEE_ASSERT(right.GetLogicalTypeId() == LogicalTypeId::DECIMAL, "the right operand must be a DECIMAL");
   int sl = left.GetLogicalType().GetDecimalData().scale_;
@@ -275,7 +295,7 @@ void TemplatedExecuteOperationSwitchDecimalMaxScale(Vector &left, Vector &right,
 }
 
 template <class LEFT_DECIMAL_INT, class OP>
-void TemplatedExecuteOperationDecimalFloat(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationDecimalFloat(Vector &left, Vector &right, Vector &result, idx_t count) {
   BUMBLEBEE_ASSERT(left.GetLogicalTypeId() == LogicalTypeId::DECIMAL, "the left operand must be a DECIMAL");
   BUMBLEBEE_ASSERT(result.GetLogicalTypeId() == LogicalTypeId::DOUBLE, "a DECIMAL / float result must be a DOUBLE");
   int scale = left.GetLogicalType().GetDecimalData().scale_;
@@ -298,7 +318,7 @@ void TemplatedExecuteOperationDecimalFloat(Vector &left, Vector &right, Vector &
 }
 
 template <class RIGHT_DECIMAL_INT, class OP>
-void TemplatedExecuteOperationFloatDecimal(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationFloatDecimal(Vector &left, Vector &right, Vector &result, idx_t count) {
   BUMBLEBEE_ASSERT(right.GetLogicalTypeId() == LogicalTypeId::DECIMAL, "the right operand must be a DECIMAL");
   BUMBLEBEE_ASSERT(result.GetLogicalTypeId() == LogicalTypeId::DOUBLE, "a float / DECIMAL result must be a DOUBLE");
   int scale = right.GetLogicalType().GetDecimalData().scale_;
@@ -321,7 +341,7 @@ void TemplatedExecuteOperationFloatDecimal(Vector &left, Vector &right, Vector &
 }
 
 template <class LEFT_TYPE, class RIGHT_TYPE, class OP>
-void TemplatedExecuteOperationSwitchResult(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationSwitchResult(Vector &left, Vector &right, Vector &result, idx_t count) {
   switch (result.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       BinaryExecution::Execute<LEFT_TYPE, RIGHT_TYPE, int8_t, ArithCommonCast<LEFT_TYPE, RIGHT_TYPE, int8_t, OP>>(
@@ -370,13 +390,16 @@ void TemplatedExecuteOperationSwitchResult(Vector &left, Vector &right, Vector &
     case LogicalTypeId::DECIMAL: {
       switch (result.GetType()) {
         case PhysicalType::SMALLINT:
-          TemplatedExecuteOperationSwitchDecimalMaxScale<LEFT_TYPE, RIGHT_TYPE, int16_t, OP>(left, right, result, count);
+          TemplatedExecuteOperationSwitchDecimalMaxScale<LEFT_TYPE, RIGHT_TYPE, int16_t, OP>(left, right, result,
+                                                                                             count);
           break;
         case PhysicalType::INTEGER:
-          TemplatedExecuteOperationSwitchDecimalMaxScale<LEFT_TYPE, RIGHT_TYPE, int32_t, OP>(left, right, result, count);
+          TemplatedExecuteOperationSwitchDecimalMaxScale<LEFT_TYPE, RIGHT_TYPE, int32_t, OP>(left, right, result,
+                                                                                             count);
           break;
         case PhysicalType::BIGINT:
-          TemplatedExecuteOperationSwitchDecimalMaxScale<LEFT_TYPE, RIGHT_TYPE, int64_t, OP>(left, right, result, count);
+          TemplatedExecuteOperationSwitchDecimalMaxScale<LEFT_TYPE, RIGHT_TYPE, int64_t, OP>(left, right, result,
+                                                                                             count);
           break;
         default:
           throw NotImplementedException(
@@ -391,7 +414,7 @@ void TemplatedExecuteOperationSwitchResult(Vector &left, Vector &right, Vector &
 }
 
 template <class LEFT_TYPE, class OP>
-void TemplatedExecuteOperationSwitchRight(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationSwitchRight(Vector &left, Vector &right, Vector &result, idx_t count) {
   switch (right.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       TemplatedExecuteOperationSwitchResult<LEFT_TYPE, int8_t, OP>(left, right, result, count);
@@ -426,8 +449,8 @@ void TemplatedExecuteOperationSwitchRight(Vector &left, Vector &right, Vector &r
       TemplatedExecuteOperationSwitchResult<LEFT_TYPE, double, OP>(left, right, result, count);
       break;
     case LogicalTypeId::DECIMAL: {
-      const bool left_is_float = left.GetLogicalTypeId() == LogicalTypeId::FLOAT ||
-                                 left.GetLogicalTypeId() == LogicalTypeId::DOUBLE;
+      const bool left_is_float =
+          left.GetLogicalTypeId() == LogicalTypeId::FLOAT || left.GetLogicalTypeId() == LogicalTypeId::DOUBLE;
       switch (right.GetType()) {
         case PhysicalType::SMALLINT:
           left_is_float ? TemplatedExecuteOperationFloatDecimal<int16_t, OP>(left, right, result, count)
@@ -455,7 +478,7 @@ void TemplatedExecuteOperationSwitchRight(Vector &left, Vector &right, Vector &r
 
 /** @brief The slow path: the types differ, so left, right and result must each be dispatched. */
 template <class OP>
-void TemplatedExecuteOperationSwitchLeft(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void TemplatedExecuteOperationSwitchLeft(Vector &left, Vector &right, Vector &result, idx_t count) {
   switch (left.GetLogicalTypeId()) {
     case LogicalTypeId::TINYINT:
       TemplatedExecuteOperationSwitchRight<int8_t, OP>(left, right, result, count);
@@ -490,8 +513,8 @@ void TemplatedExecuteOperationSwitchLeft(Vector &left, Vector &right, Vector &re
       TemplatedExecuteOperationSwitchRight<double, OP>(left, right, result, count);
       break;
     case LogicalTypeId::DECIMAL: {
-      const bool right_is_float = right.GetLogicalTypeId() == LogicalTypeId::FLOAT ||
-                                  right.GetLogicalTypeId() == LogicalTypeId::DOUBLE;
+      const bool right_is_float =
+          right.GetLogicalTypeId() == LogicalTypeId::FLOAT || right.GetLogicalTypeId() == LogicalTypeId::DOUBLE;
       switch (left.GetType()) {
         case PhysicalType::SMALLINT:
           right_is_float ? TemplatedExecuteOperationDecimalFloat<int16_t, OP>(left, right, result, count)
@@ -519,15 +542,13 @@ void TemplatedExecuteOperationSwitchLeft(Vector &left, Vector &right, Vector &re
 
 /** @brief Dispatch an arithmetic op: the equal-type fast path, or the promoting slow path. */
 template <class OP>
-void ExecuteOperation(Vector &left, Vector &right, Vector &result, idx_t count) {
+static void ExecuteOperation(Vector &left, Vector &right, Vector &result, idx_t count) {
   if (left.GetLogicalType() == right.GetLogicalType() && left.GetLogicalType() == result.GetLogicalType()) {
     TemplatedExecuteOperationSwitchEqualType<OP>(left, right, result, count);
   } else {
     TemplatedExecuteOperationSwitchLeft<OP>(left, right, result, count);
   }
 }
-
-}  // namespace
 
 void VectorOperations::Sum(Vector &left, Vector &right, Vector &result, idx_t count) {
   ExecuteOperation<class Sum>(left, right, result, count);

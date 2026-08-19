@@ -26,45 +26,41 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto TypeOf(const std::string &s) -> UnicodeType { return Utf8Proc::Analyze(s.data(), s.size()); }
+static auto TypeOf(const std::string &s) -> UnicodeType { return Utf8Proc::Analyze(s.data(), s.size()); }
 
 /** @brief Analyze expecting INVALID; returns the reported reason/position pair. */
-auto InvalidAt(const std::string &s) -> std::pair<UnicodeInvalidReason, size_t> {
+static auto InvalidAt(const std::string &s) -> std::pair<UnicodeInvalidReason, size_t> {
   UnicodeInvalidReason reason{};
   size_t pos = 0;
   EXPECT_EQ(Utf8Proc::Analyze(s.data(), s.size(), &reason, &pos), UnicodeType::INVALID);
   return {reason, pos};
 }
 
-}  // namespace
-
 TEST(Utf8AnalyzeTest, AsciiAndEmpty) {
   EXPECT_EQ(TypeOf(""), UnicodeType::ASCII);
   EXPECT_EQ(TypeOf("a"), UnicodeType::ASCII);
-  EXPECT_EQ(TypeOf("hello world"), UnicodeType::ASCII);                    // crosses the 8-byte word
-  EXPECT_EQ(TypeOf("0123456"), UnicodeType::ASCII);                        // 7 bytes: scalar tail only
-  EXPECT_EQ(TypeOf("01234567"), UnicodeType::ASCII);                       // exactly one word
-  EXPECT_EQ(TypeOf(std::string(65, 'x')), UnicodeType::ASCII);             // words + 1 tail byte
+  EXPECT_EQ(TypeOf("hello world"), UnicodeType::ASCII);         // crosses the 8-byte word
+  EXPECT_EQ(TypeOf("0123456"), UnicodeType::ASCII);             // 7 bytes: scalar tail only
+  EXPECT_EQ(TypeOf("01234567"), UnicodeType::ASCII);            // exactly one word
+  EXPECT_EQ(TypeOf(std::string(65, 'x')), UnicodeType::ASCII);  // words + 1 tail byte
 }
 
 TEST(Utf8AnalyzeTest, TwoByteRuns) {
   // Pure Cyrillic of varying lengths: exercises the batched 2-byte word path (4 chars/word) and
   // its scalar tail on both sides of the 8-byte boundary.
-  const std::string ru = "привет";                     // 6 chars = 12 bytes: one word + 2 tail
+  const std::string ru = "привет";  // 6 chars = 12 bytes: one word + 2 tail
   EXPECT_EQ(TypeOf(ru), UnicodeType::UNICODE);
-  EXPECT_EQ(TypeOf("фыва"), UnicodeType::UNICODE);     // exactly 8 bytes
-  EXPECT_EQ(TypeOf("ф"), UnicodeType::UNICODE);        // single 2-byte char, below word size
+  EXPECT_EQ(TypeOf("фыва"), UnicodeType::UNICODE);                  // exactly 8 bytes
+  EXPECT_EQ(TypeOf("ф"), UnicodeType::UNICODE);                     // single 2-byte char, below word size
   EXPECT_EQ(TypeOf("это поисковый запрос"), UnicodeType::UNICODE);  // 2-byte runs + ASCII spaces
-  EXPECT_EQ(TypeOf("abcф"), UnicodeType::UNICODE);     // ASCII prefix into a trailing 2-byte char
-  EXPECT_EQ(TypeOf("фabc"), UnicodeType::UNICODE);     // 2-byte char back into ASCII
+  EXPECT_EQ(TypeOf("abcф"), UnicodeType::UNICODE);                  // ASCII prefix into a trailing 2-byte char
+  EXPECT_EQ(TypeOf("фabc"), UnicodeType::UNICODE);                  // 2-byte char back into ASCII
 }
 
 TEST(Utf8AnalyzeTest, WiderSequences) {
-  EXPECT_EQ(TypeOf("\xE2\x82\xAC"), UnicodeType::UNICODE);              // € (3-byte)
-  EXPECT_EQ(TypeOf("\xF0\x9F\x90\x9D"), UnicodeType::UNICODE);          // 🐝 (4-byte)
-  EXPECT_EQ(TypeOf("на\xE2\x82\xAC!"), UnicodeType::UNICODE);           // 2-byte + 3-byte + ASCII mix
+  EXPECT_EQ(TypeOf("\xE2\x82\xAC"), UnicodeType::UNICODE);      // € (3-byte)
+  EXPECT_EQ(TypeOf("\xF0\x9F\x90\x9D"), UnicodeType::UNICODE);  // 🐝 (4-byte)
+  EXPECT_EQ(TypeOf("на\xE2\x82\xAC!"), UnicodeType::UNICODE);   // 2-byte + 3-byte + ASCII mix
 }
 
 TEST(Utf8AnalyzeTest, NulByteReportsPosition) {

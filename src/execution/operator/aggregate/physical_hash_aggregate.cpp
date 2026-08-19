@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/helper.h"
+#include "execution/aggregate/aggregate_semantics.h"
 #include "execution/aggregate/aggregate_update_kernels.h"
 #include "execution/expression_executor.h"
 #include "execution/prl_hash_table.h"
@@ -30,8 +31,6 @@
 #include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
-
-namespace {
 
 /**
  * How many hash partitions the merge boundary uses. Combine scatters each task's local groups into
@@ -52,16 +51,27 @@ constexpr idx_t kSinkPartitionThreshold = 3ULL << 19;  // 1.5M
 
 /** The partition of a group hash. The TOP bits: the table directory indexes with the low bits, so
  * partition and bucket choice stay independent. */
-auto PartitionOf(hash_t hash) -> idx_t { return static_cast<idx_t>(hash >> 59) & (kMergePartitions - 1); }
+static auto PartitionOf(hash_t hash) -> idx_t { return static_cast<idx_t>(hash >> 59) & (kMergePartitions - 1); }
+
+// Column addressing for the group-table row and for every chunk shaped like it (the transport and
+// merge chunks): the group-by columns come first, then a (count, value) PAIR per aggregate.
+//
+// Spelling `num_groups + 2 * a` and `num_groups + 2 * a + 1` at each of the ~17 use sites is how a
+// count slot ends up read as a value slot, so the convention is named here instead.
+
+/** @return The column holding aggregate `a`'s running count. */
+static constexpr auto CountColumnOf(idx_t num_groups, idx_t a) -> idx_t { return num_groups + 2 * a; }
+
+/** @return The column holding aggregate `a`'s running value (or its off-row string index). */
+static constexpr auto ValueColumnOf(idx_t num_groups, idx_t a) -> idx_t { return num_groups + 2 * a + 1; }
 
 /** @return True when aggregate `a` is MIN/MAX over a VARCHAR — the string extreme needs off-row state. */
-auto IsStringMinMax(AggregationType type, const LogicalType &out_type) -> bool {
-  return (type == AggregationType::MinAggregate || type == AggregationType::MaxAggregate) &&
-         out_type.GetPhysicalType() == PhysicalType::STRING;
+static auto IsStringMinMax(AggregationType type, const LogicalType &out_type) -> bool {
+  return IsExtremeAgg(type) && out_type.GetPhysicalType() == PhysicalType::STRING;
 }
 
 /** @brief Per-aggregate flag: is this a string MIN/MAX (1) or a numeric aggregate (0)? */
-auto StringMinMaxFlags(const std::vector<AggregationType> &agg_types, const Schema &schema, idx_t num_groups)
+static auto StringMinMaxFlags(const std::vector<AggregationType> &agg_types, const Schema &schema, idx_t num_groups)
     -> std::vector<char> {
   std::vector<char> flags(agg_types.size(), 0);
   for (idx_t a = 0; a < agg_types.size(); a++) {
@@ -77,7 +87,7 @@ auto StringMinMaxFlags(const std::vector<AggregationType> &agg_types, const Sche
  * payload inside the fixed-width row, so its slot holds a BIGINT: a 1-based index (0 = "no value
  * yet") into the table's off-row `str_vals_`, whose bytes live in the table's own `StringHeap`.
  */
-auto RowValueTypes(const std::vector<char> &str_flags) -> std::vector<LogicalType> {
+static auto RowValueTypes(const std::vector<char> &str_flags) -> std::vector<LogicalType> {
   std::vector<LogicalType> types;
   types.reserve(str_flags.size());
   for (const char is_str : str_flags) {
@@ -91,13 +101,12 @@ auto RowValueTypes(const std::vector<char> &str_flags) -> std::vector<LogicalTyp
  * tasks (Combine → merge buffers): VARCHAR for a string MIN/MAX (the extreme rides across as a real
  * string, re-homed into the buffer's heap), DOUBLE otherwise.
  */
-auto TransportValueTypes(const std::vector<char> &str_flags, const Schema &schema, idx_t num_groups)
+static auto TransportValueTypes(const std::vector<char> &str_flags, const Schema &schema, idx_t num_groups)
     -> std::vector<LogicalType> {
   std::vector<LogicalType> types;
   types.reserve(str_flags.size());
   for (idx_t a = 0; a < str_flags.size(); a++) {
-    types.emplace_back(str_flags[a] ? schema.GetColumn(num_groups + a).GetType()
-                                    : LogicalType(LogicalTypeId::DOUBLE));
+    types.emplace_back(str_flags[a] ? schema.GetColumn(num_groups + a).GetType() : LogicalType(LogicalTypeId::DOUBLE));
   }
   return types;
 }
@@ -110,7 +119,7 @@ auto TransportValueTypes(const std::vector<char> &str_flags, const Schema &schem
  * accumulates in the value; MIN/MAX keep the extreme in the value, where "state initialized" is
  * simply count > 0 (every non-NULL update bumps the count).
  */
-auto GroupTableTypes(const std::vector<LogicalType> &group_types, const std::vector<LogicalType> &val_types)
+static auto GroupTableTypes(const std::vector<LogicalType> &group_types, const std::vector<LogicalType> &val_types)
     -> std::vector<LogicalType> {
   auto types = group_types;
   for (const auto &val_type : val_types) {
@@ -142,10 +151,16 @@ struct GroupedAggState {
     cnt_offs_.reserve(agg_types.size());
     val_offs_.reserve(agg_types.size());
     for (idx_t a = 0; a < agg_types.size(); a++) {
-      cnt_offs_.push_back(offsets[num_groups_ + 2 * a]);
-      val_offs_.push_back(offsets[num_groups_ + 2 * a + 1]);
+      cnt_offs_.push_back(offsets[CountColumn(a)]);
+      val_offs_.push_back(offsets[ValueColumn(a)]);
     }
   }
+
+  /** @return The column holding aggregate `a`'s count, in this table's row layout. */
+  [[nodiscard]] auto CountColumn(idx_t a) const -> idx_t { return CountColumnOf(num_groups_, a); }
+
+  /** @return The column holding aggregate `a`'s value, in this table's row layout. */
+  [[nodiscard]] auto ValueColumn(idx_t a) const -> idx_t { return ValueColumnOf(num_groups_, a); }
 
   PRLHashTable ht_;
   idx_t num_groups_;
@@ -167,9 +182,8 @@ struct GroupedAggState {
       return;
     }
     auto &cur = str_vals_[idx - 1];
-    const bool take = agg_types_[a] == AggregationType::MinAggregate ? incoming < cur : incoming > cur;
-    if (take) {
-      cur = str_heap_.AddString(incoming);
+    if (TakesExtreme(agg_types_[a], cur, incoming)) {
+      cur = str_heap_.AddString(incoming);  // copy only once we know it wins
     }
   }
 
@@ -189,8 +203,8 @@ struct GroupedAggState {
       add_scratch_.data_[g].Reference(group_chunk.data_[g]);
     }
     for (idx_t a = 0; a < agg_types_.size(); a++) {
-      add_scratch_.data_[num_groups_ + 2 * a].Reference(zero_cnt_);
-      add_scratch_.data_[num_groups_ + 2 * a + 1].Reference(str_flags_[a] ? zero_idx_ : zero_dbl_);
+      add_scratch_.data_[CountColumn(a)].Reference(zero_cnt_);
+      add_scratch_.data_[ValueColumn(a)].Reference(str_flags_[a] ? zero_idx_ : zero_dbl_);
     }
     add_scratch_.SetCardinality(count);
     ht_.FindOrCreateGroups(hashes, add_scratch_, addresses);
@@ -254,12 +268,8 @@ struct GroupedAggState {
       row_view.data_[g].Reference(full_chunk.data_[g]);
     }
     for (idx_t a = 0; a < agg_types_.size(); a++) {
-      row_view.data_[num_groups_ + 2 * a].Reference(full_chunk.data_[num_groups_ + 2 * a]);  // count
-      if (str_flags_[a]) {
-        row_view.data_[num_groups_ + 2 * a + 1].Reference(zero_idx);
-      } else {
-        row_view.data_[num_groups_ + 2 * a + 1].Reference(full_chunk.data_[num_groups_ + 2 * a + 1]);
-      }
+      row_view.data_[CountColumn(a)].Reference(full_chunk.data_[CountColumn(a)]);
+      row_view.data_[ValueColumn(a)].Reference(str_flags_[a] ? zero_idx : full_chunk.data_[ValueColumn(a)]);
     }
     row_view.SetCardinality(count);
 
@@ -275,8 +285,9 @@ struct GroupedAggState {
 
     auto *addrs = FlatVector::GetData<data_ptr_t>(addresses);
     for (idx_t a = 0; a < agg_types_.size(); a++) {
-      full_chunk.data_[num_groups_ + 2 * a].Normalify(count);
-      const auto *src_cnt = FlatVector::GetData<int64_t>(full_chunk.data_[num_groups_ + 2 * a]);
+      full_chunk.data_[CountColumn(a)].Normalify(count);
+      full_chunk.data_[ValueColumn(a)].Normalify(count);
+      const auto *src_cnt = FlatVector::GetData<int64_t>(full_chunk.data_[CountColumn(a)]);
       const auto cnt_off = cnt_offs_[a];
       const auto val_off = val_offs_[a];
       const auto type = agg_types_[a];
@@ -284,8 +295,7 @@ struct GroupedAggState {
       if (str_flags_[a]) {
         // A new group's count rode the scatter; an existing group's count adds. The extreme is
         // folded off-row for both (the index slot started unset for a new group).
-        full_chunk.data_[num_groups_ + 2 * a + 1].Normalify(count);
-        const auto *src_val = FlatVector::GetData<string_t>(full_chunk.data_[num_groups_ + 2 * a + 1]);
+        const auto *src_val = FlatVector::GetData<string_t>(full_chunk.data_[ValueColumn(a)]);
         for (idx_t i = 0; i < count; i++) {
           if (src_cnt[i] == 0) {
             continue;
@@ -299,36 +309,27 @@ struct GroupedAggState {
         continue;
       }
 
-      full_chunk.data_[num_groups_ + 2 * a + 1].Normalify(count);
-      const auto *src_val = FlatVector::GetData<double>(full_chunk.data_[num_groups_ + 2 * a + 1]);
+      const auto *src_val = FlatVector::GetData<double>(full_chunk.data_[ValueColumn(a)]);
+      const bool sum_like = IsSumLike(type);
       for (idx_t i = 0; i < count; i++) {
         if (is_new[i] || src_cnt[i] == 0) {
           continue;  // a new group's state rode the scatter; an empty source state merges to nothing
         }
         auto *addr = addrs[i];
         const auto dst_cnt = Load<int64_t>(addr + cnt_off);
-        if (type == AggregationType::SumAggregate || type == AggregationType::AvgAggregate) {
-          // AVG merges like SUM: add the partial value sums (and counts, handled above).
-          Store<double>(Load<double>(addr + val_off) + src_val[i], addr + val_off);
-        } else if (type == AggregationType::MinAggregate || type == AggregationType::MaxAggregate) {
-          if (dst_cnt == 0) {
-            Store<double>(src_val[i], addr + val_off);
-          } else {
-            const auto cur = Load<double>(addr + val_off);
-            const bool take_src =
-                type == AggregationType::MinAggregate ? src_val[i] < cur : src_val[i] > cur;
-            if (take_src) {
-              Store<double>(src_val[i], addr + val_off);
-            }
-          }
+        const auto cur = Load<double>(addr + val_off);
+        if (sum_like) {
+          // AVG merges like SUM: add the partial value sums (and counts, handled below).
+          Store<double>(cur + src_val[i], addr + val_off);
+        } else if (IsExtremeAgg(type)) {
+          // dst_cnt == 0 means this group has no extreme yet, so the source's seeds it.
+          Store<double>(dst_cnt == 0 ? src_val[i] : FoldExtreme(type, cur, src_val[i]), addr + val_off);
         }
         Store<int64_t>(dst_cnt + src_cnt[i], addr + cnt_off);
       }
     }
   }
 };
-
-}  // namespace
 
 struct HashAggGlobalSinkState : GlobalSinkState {
   /**
@@ -433,9 +434,7 @@ auto PhysicalHashAggregate::GetLocalSinkState(ExecutionContext & /*context*/) co
   return ls;
 }
 
-namespace {
-void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationType> &agg_types);
-}  // namespace
+static void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationType> &agg_types);
 
 auto PhysicalHashAggregate::Sink(ExecutionContext &context, DataChunk &input, GlobalSinkState & /*gstate*/,
                                  LocalSinkState &lstate) const -> SinkResultType {
@@ -516,11 +515,9 @@ auto PhysicalHashAggregate::Sink(ExecutionContext &context, DataChunk &input, Gl
   return SinkResultType::NEED_MORE_INPUT;
 }
 
-namespace {
-
 /** @brief Append `sel[0..n)` of `src` (transport layout) to a partition's row buffers, packing chunks full. */
-void PartitionAppend(HashAggGlobalSinkState::MergePartition &part, const std::vector<LogicalType> &types,
-                     DataChunk &src, const SelectionVector &sel, idx_t n) {
+static void PartitionAppend(HashAggGlobalSinkState::MergePartition &part, const std::vector<LogicalType> &types,
+                            DataChunk &src, const SelectionVector &sel, idx_t n) {
   idx_t done = 0;
   while (done < n) {
     if (part.rows_.empty() || part.rows_.back()->GetSize() >= STANDARD_VECTOR_SIZE) {
@@ -549,14 +546,14 @@ void PartitionAppend(HashAggGlobalSinkState::MergePartition &part, const std::ve
  * column is rebuilt from `state.str_vals_` (an unset index — the group saw no non-NULL string —
  * becomes an empty string, which the merge drops because its count is 0).
  */
-void BuildTransportChunk(const GroupedAggState &state, idx_t num_groups, DataChunk &row_chunk, DataChunk &out);
+static void BuildTransportChunk(const GroupedAggState &state, idx_t num_groups, DataChunk &row_chunk, DataChunk &out);
 
 /**
  * @brief Split a sink task's single local table into per-partition sub-tables (one-time, on
  * crossing kSinkPartitionThreshold): scan it in transport form and merge each row into its hash
  * partition's sub-table. The stored row hashes drive the partitioning — no key is re-hashed.
  */
-void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationType> &agg_types) {
+static void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationType> &agg_types) {
   auto old = std::move(ls.state_);
   const idx_t num_groups = ls.group_types_.size();
   const auto &stored_hashes = old->ht_.RowHashes();
@@ -569,9 +566,8 @@ void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationTy
   pack_chunk.Initialize(ls.transport_types_);
   std::array<idx_t, kMergePartitions> counts{};
 
-  const idx_t sub_capacity =
-      std::max<idx_t>(PRLHashTable::INITIAL_CAPACITY,
-                      static_cast<idx_t>(static_cast<double>(old->ht_.Count()) / kMergePartitions * 3));
+  const idx_t sub_capacity = std::max<idx_t>(
+      PRLHashTable::INITIAL_CAPACITY, static_cast<idx_t>(static_cast<double>(old->ht_.Count()) / kMergePartitions * 3));
 
   idx_t offset = 0;
   while (true) {
@@ -593,9 +589,8 @@ void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationTy
         continue;
       }
       if (ls.parts_[p] == nullptr) {
-        ls.parts_[p] =
-            std::make_unique<GroupedAggState>(ls.group_types_, agg_types, ls.str_flags_, ls.row_val_types_,
-                                              sub_capacity);
+        ls.parts_[p] = std::make_unique<GroupedAggState>(ls.group_types_, agg_types, ls.str_flags_, ls.row_val_types_,
+                                                         sub_capacity);
       }
       pack_chunk.Reset();
       for (idx_t c = 0; c < ls.transport_types_.size(); c++) {
@@ -610,15 +605,15 @@ void RepartitionLocal(HashAggLocalSinkState &ls, const std::vector<AggregationTy
   ls.partitioned_ = true;
 }
 
-void BuildTransportChunk(const GroupedAggState &state, idx_t num_groups, DataChunk &row_chunk, DataChunk &out) {
+static void BuildTransportChunk(const GroupedAggState &state, idx_t num_groups, DataChunk &row_chunk, DataChunk &out) {
   const idx_t n = row_chunk.GetSize();
   out.Reset();
   for (idx_t c = 0; c < num_groups; c++) {
     out.data_[c].Reference(row_chunk.data_[c]);
   }
   for (idx_t a = 0; a < state.agg_types_.size(); a++) {
-    const idx_t cnt_col = num_groups + 2 * a;
-    const idx_t val_col = num_groups + 2 * a + 1;
+    const idx_t cnt_col = CountColumnOf(num_groups, a);
+    const idx_t val_col = ValueColumnOf(num_groups, a);
     out.data_[cnt_col].Reference(row_chunk.data_[cnt_col]);
     if (!state.str_flags_[a]) {
       out.data_[val_col].Reference(row_chunk.data_[val_col]);
@@ -630,14 +625,11 @@ void BuildTransportChunk(const GroupedAggState &state, idx_t num_groups, DataChu
     auto *strs = FlatVector::GetData<string_t>(dst);
     for (idx_t i = 0; i < n; i++) {
       const auto idx = idxs[i];
-      strs[i] = idx == 0 ? StringVector::AddString(dst, "", 0)
-                         : StringVector::AddString(dst, state.str_vals_[idx - 1]);
+      strs[i] = idx == 0 ? StringVector::AddString(dst, "", 0) : StringVector::AddString(dst, state.str_vals_[idx - 1]);
     }
   }
   out.SetCardinality(n);
 }
-
-}  // namespace
 
 void PhysicalHashAggregate::Combine(ExecutionContext & /*context*/, GlobalSinkState &gstate,
                                     LocalSinkState &lstate) const {
@@ -723,8 +715,6 @@ auto PhysicalHashAggregate::GetLocalSourceState(ExecutionContext & /*context*/, 
   return std::make_unique<HashAggLocalSourceState>();
 }
 
-namespace {
-
 /**
  * @brief Build one partition's final table from its buffered rows, then FREE the buffers.
  *
@@ -734,9 +724,10 @@ namespace {
  * eagerly: once merged they are dead weight, and a large aggregation should not hold both the
  * buffers and the tables to peak.
  */
-auto BuildPartitionTable(HashAggGlobalSinkState::MergePartition &part, const std::vector<LogicalType> &group_types,
-                         const std::vector<AggregationType> &agg_types, const std::vector<char> &str_flags,
-                         const std::vector<LogicalType> &row_val_types) -> std::unique_ptr<GroupedAggState> {
+static auto BuildPartitionTable(HashAggGlobalSinkState::MergePartition &part,
+                                const std::vector<LogicalType> &group_types,
+                                const std::vector<AggregationType> &agg_types, const std::vector<char> &str_flags,
+                                const std::vector<LogicalType> &row_val_types) -> std::unique_ptr<GroupedAggState> {
   // The buffered rows + handed-off sub-tables bound the partition's group count exactly, so the
   // directory can be sized once — a high-cardinality partition (millions of mostly-unique groups)
   // would otherwise pay a dozen grow-and-rehash passes on the way up from the default capacity.
@@ -817,8 +808,8 @@ auto BuildPartitionTable(HashAggGlobalSinkState::MergePartition &part, const std
  * column, cast in one vectorized pass otherwise. (String MIN/MAX is finalized separately, from the
  * off-row extremes, since its state column is an index rather than a value.)
  */
-void FinalizeAggregateColumn(AggregationType type, Vector &cnt_vec, Vector &val_vec, Vector &out,
-                             const LogicalType &out_type, idx_t n) {
+static void FinalizeAggregateColumn(AggregationType type, Vector &cnt_vec, Vector &val_vec, Vector &out,
+                                    const LogicalType &out_type, idx_t n) {
   if (type == AggregationType::AvgAggregate) {
     // AVG = value-sum / count, as DOUBLE; a zero-count group (all inputs NULL) is NULL.
     const auto *cnt = FlatVector::GetData<int64_t>(cnt_vec);
@@ -834,8 +825,7 @@ void FinalizeAggregateColumn(AggregationType type, Vector &cnt_vec, Vector &val_
     }
     return;
   }
-  const bool is_count =
-      type == AggregationType::CountStarAggregate || type == AggregationType::CountAggregate;
+  const bool is_count = type == AggregationType::CountStarAggregate || type == AggregationType::CountAggregate;
   Vector &result_src = is_count ? cnt_vec : val_vec;
   if (result_src.GetLogicalType().GetPhysicalType() == out_type.GetPhysicalType()) {
     out.Reference(result_src);
@@ -855,8 +845,8 @@ void FinalizeAggregateColumn(AggregationType type, Vector &cnt_vec, Vector &val_
 }
 
 /** @brief Finalize a string MIN/MAX column: read each group's off-row extreme (NULL when count 0). */
-void FinalizeStringAggregateColumn(const GroupedAggState &state, Vector &cnt_vec, Vector &val_vec, Vector &out,
-                                   idx_t n) {
+static void FinalizeStringAggregateColumn(const GroupedAggState &state, Vector &cnt_vec, Vector &val_vec, Vector &out,
+                                          idx_t n) {
   const auto *cnt = FlatVector::GetData<int64_t>(cnt_vec);
   const auto *idxs = FlatVector::GetData<int64_t>(val_vec);
   out.SetVectorType(VectorType::FLAT_VECTOR);
@@ -870,8 +860,6 @@ void FinalizeStringAggregateColumn(const GroupedAggState &state, Vector &cnt_vec
     }
   }
 }
-
-}  // namespace
 
 auto PhysicalHashAggregate::GetData(ExecutionContext & /*context*/, DataChunk &output, GlobalSourceState &gstate,
                                     LocalSourceState &lstate) const -> SourceResultType {
@@ -909,8 +897,8 @@ auto PhysicalHashAggregate::GetData(ExecutionContext & /*context*/, DataChunk &o
       output.data_[g].Reference(scan_chunk.data_[g]);
     }
     for (idx_t a = 0; a < agg_types_.size(); a++) {
-      Vector &cnt_vec = scan_chunk.data_[num_groups + 2 * a];
-      Vector &val_vec = scan_chunk.data_[num_groups + 2 * a + 1];
+      Vector &cnt_vec = scan_chunk.data_[CountColumnOf(num_groups, a)];
+      Vector &val_vec = scan_chunk.data_[ValueColumnOf(num_groups, a)];
       if (sink.str_flags_[a]) {
         FinalizeStringAggregateColumn(*ls.table_, cnt_vec, val_vec, output.data_[num_groups + a], n);
       } else {

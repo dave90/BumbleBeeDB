@@ -20,16 +20,11 @@
 
 namespace bumblebee {
 
-namespace {
-
-auto IntColumn(uint32_t tuple_idx, uint32_t col_idx) -> AbstractExpressionRef {
-  return std::make_shared<ColumnValueExpression>(tuple_idx, col_idx,
-                                                 Column{"c", LogicalType(LogicalTypeId::INTEGER)});
+static auto IntColumn(uint32_t tuple_idx, uint32_t col_idx) -> AbstractExpressionRef {
+  return std::make_shared<ColumnValueExpression>(tuple_idx, col_idx, Column{"c", LogicalType(LogicalTypeId::INTEGER)});
 }
 
-auto IntConst(int32_t v) -> AbstractExpressionRef { return std::make_shared<ConstantValueExpression>(Value{v}); }
-
-}  // namespace
+static auto IntConst(int32_t v) -> AbstractExpressionRef { return std::make_shared<ConstantValueExpression>(Value{v}); }
 
 TEST(ExpressionTest, ColumnValueToString) {
   EXPECT_EQ(IntColumn(0, 1)->ToString(), "#0.1");
@@ -43,12 +38,10 @@ TEST(ExpressionTest, ConstantToString) {
 }
 
 TEST(ExpressionTest, ConstantReturnTypeFollowsTheValue) {
-  EXPECT_EQ(ConstantValueExpression(Value{true}).GetReturnType().GetType(),
-            LogicalType(LogicalTypeId::BOOLEAN));
+  EXPECT_EQ(ConstantValueExpression(Value{true}).GetReturnType().GetType(), LogicalType(LogicalTypeId::BOOLEAN));
   // A VARCHAR constant is variable-length; Column::Make must not trip the
   // fixed-width assertion.
-  EXPECT_EQ(ConstantValueExpression(Value{"abc"}).GetReturnType().GetType(),
-            LogicalType(LogicalTypeId::STRING));
+  EXPECT_EQ(ConstantValueExpression(Value{"abc"}).GetReturnType().GetType(), LogicalType(LogicalTypeId::STRING));
 }
 
 TEST(ExpressionTest, ComparisonToString) {
@@ -100,8 +93,7 @@ TEST(ExpressionTest, HasOrPredicate) {
 }
 
 TEST(ExpressionTest, StringExpression) {
-  auto str = std::make_shared<ColumnValueExpression>(
-      0, 0, Column{"s", LogicalType(LogicalTypeId::STRING), 32});
+  auto str = std::make_shared<ColumnValueExpression>(0, 0, Column{"s", LogicalType(LogicalTypeId::STRING), 32});
   StringExpression lower{str, StringExpressionType::Lower};
   EXPECT_EQ(lower.ToString(), "lower(#0.0)");
   EXPECT_EQ(lower.GetReturnType().GetType(), LogicalType(LogicalTypeId::STRING));

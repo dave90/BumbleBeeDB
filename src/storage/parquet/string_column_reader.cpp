@@ -77,7 +77,7 @@ auto StringColumnReader::VerifyString(const char *str_data, uint32_t str_len) ->
 
 void StringColumnReader::Dictionary(std::shared_ptr<ByteBuffer> data, idx_t num_entries) {
   dict_ = std::move(data);
-  dict_strings_ = std::unique_ptr<string_t[]>(new string_t[num_entries]);
+  dict_strings_ = std::make_unique_for_overwrite<string_t[]>(num_entries);
   for (idx_t dict_idx = 0; dict_idx < num_entries; dict_idx++) {
     uint32_t str_len = dict_->Read<uint32_t>();
     dict_->Available(str_len);

@@ -21,17 +21,15 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Add a relation of a given estimated size; returns its id. */
-auto AddRel(JoinGraph &g, double card) -> idx_t {
+static auto AddRel(JoinGraph &g, double card) -> idx_t {
   JoinRelation r;
   r.cardinality_ = card;
   return g.AddRelation(r);
 }
 
 /** @brief Collect the relation set of every INTERNAL node of the tree (leaves excluded). */
-void CollectInternalSets(const JoinTreeNode *node, std::vector<RelationSet> &out) {
+static void CollectInternalSets(const JoinTreeNode *node, std::vector<RelationSet> &out) {
   if (node == nullptr || node->IsLeaf()) {
     return;
   }
@@ -40,7 +38,7 @@ void CollectInternalSets(const JoinTreeNode *node, std::vector<RelationSet> &out
   CollectInternalSets(node->right_.get(), out);
 }
 
-auto HasInternalSet(const JoinTreeNode *root, RelationSet target) -> bool {
+static auto HasInternalSet(const JoinTreeNode *root, RelationSet target) -> bool {
   std::vector<RelationSet> sets;
   CollectInternalSets(root, sets);
   for (const auto s : sets) {
@@ -51,17 +49,15 @@ auto HasInternalSet(const JoinTreeNode *root, RelationSet target) -> bool {
   return false;
 }
 
-}  // namespace
-
 // q02 shape: part—partsupp—supplier—nation—region, a chain. part and supplier share NO edge (they
 // connect only through partsupp), so a left-deep FROM-order join would cross-product them. GOO must
 // NOT: it should never create an internal node that is exactly {part, supplier}.
 TEST(GreedyJoinOrderTest, AvoidsCrossProductOnQ02Chain) {
   JoinGraph g;
-  const auto part = AddRel(g, 200);        // filtered p_size=15 AND p_type LIKE '%BRASS'
+  const auto part = AddRel(g, 200);  // filtered p_size=15 AND p_type LIKE '%BRASS'
   const auto partsupp = AddRel(g, 800000);
   const auto supplier = AddRel(g, 10000);
-  const auto nation = AddRel(g, 5);        // filtered to EUROPE region
+  const auto nation = AddRel(g, 5);  // filtered to EUROPE region
   const auto region = AddRel(g, 1);
 
   g.AddEdge(RelationSet::Singleton(part).Union(RelationSet::Singleton(partsupp)), nullptr, /*is_equi=*/true);
@@ -125,12 +121,12 @@ TEST(GreedyJoinOrderTest, AvoidsLowCardinalityKeyJoinWithNdv) {
 
   auto pair = [](idx_t x, idx_t y) { return RelationSet::Singleton(x).Union(RelationSet::Singleton(y)); };
   // High-NDV fact keys (unique on the PK side).
-  g.AddEdge(pair(customer, orders), nullptr, /*is_equi=*/true, /*ndv=*/1500000);   // c_custkey = o_custkey
-  g.AddEdge(pair(orders, lineitem), nullptr, true, 7500000);                       // o_orderkey = l_orderkey
-  g.AddEdge(pair(supplier, lineitem), nullptr, true, 10000);                       // s_suppkey = l_suppkey
+  g.AddEdge(pair(customer, orders), nullptr, /*is_equi=*/true, /*ndv=*/1500000);  // c_custkey = o_custkey
+  g.AddEdge(pair(orders, lineitem), nullptr, true, 7500000);                      // o_orderkey = l_orderkey
+  g.AddEdge(pair(supplier, lineitem), nullptr, true, 10000);                      // s_suppkey = l_suppkey
   // Low-cardinality nationkey joins (25 distinct) — joining on these is near-cartesian.
-  g.AddEdge(pair(customer, supplier), nullptr, true, 25);                          // c_nationkey = s_nationkey
-  g.AddEdge(pair(supplier, nation), nullptr, true, 25);                            // s_nationkey = n_nationkey
+  g.AddEdge(pair(customer, supplier), nullptr, true, 25);  // c_nationkey = s_nationkey
+  g.AddEdge(pair(supplier, nation), nullptr, true, 25);    // s_nationkey = n_nationkey
 
   CardinalityEstimator est;
   GreedyJoinOrder goo;

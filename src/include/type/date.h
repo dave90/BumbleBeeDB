@@ -71,7 +71,7 @@ class Date {
    * @param result The days since the epoch.
    * @return bool False if the date is not valid; `result` is then untouched.
    */
-  static auto TryFromDate(int32_t year, int32_t month, int32_t day, date_t &result) -> bool;
+  [[nodiscard]] static auto TryFromDate(int32_t year, int32_t month, int32_t day, date_t &result) -> bool;
 
   /** @brief Break `d` (days since the epoch) into year, month and day. */
   static void Convert(int32_t d, int32_t &year, int32_t &month, int32_t &day);
@@ -88,7 +88,7 @@ class Date {
    * @param strict Whether trailing non-space characters are an error.
    * @return bool True if a date was parsed.
    */
-  static auto TryConvertDate(const char *buf, idx_t len, idx_t &pos, date_t &result, bool strict) -> bool;
+  [[nodiscard]] static auto TryConvertDate(const char *buf, idx_t len, idx_t &pos, date_t &result, bool strict) -> bool;
 
   /** @brief Parse one or two digits at `pos`. */
   static auto ParseDoubleDigit(const char *buf, idx_t len, idx_t &pos, int32_t &result) -> bool;

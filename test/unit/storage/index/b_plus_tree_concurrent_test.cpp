@@ -25,19 +25,25 @@
 
 namespace bumblebee {
 
-namespace {
-
 using Key = GenericKey<8>;
 using Cmp = GenericComparator<8>;
 using Tree = BPlusTree<Key, RID, Cmp>;
 
-auto MakeKey(int64_t k) -> Key {
+static auto MakeKey(int64_t k) -> Key {
   Key key;
   key.SetFromInteger(k);
   return key;
 }
 
-struct TreeFixture {
+/**
+ * @brief A tree sized for the concurrent tests: a bigger pool and fanout 5 than the
+ *        single-threaded fixture in b_plus_tree_test.cpp uses.
+ *
+ * Deliberately NOT named `TreeFixture`: both files live in namespace `bumblebee` and link into the
+ * same `unit_tests` binary, so sharing the name would be an ODR violation between two structs that
+ * really do differ, and the linker would silently pick one constructor for both.
+ */
+struct ConcurrentTreeFixture {
   MemoryDiskManager dm;
   BufferPoolManager bpm;
   Schema key_schema;
@@ -45,7 +51,7 @@ struct TreeFixture {
   page_id_t header_page_id;
   std::unique_ptr<Tree> tree;
 
-  TreeFixture()
+  ConcurrentTreeFixture()
       : dm(8192),
         bpm(128, &dm),
         key_schema(std::vector<Column>{Column("k", LogicalType(LogicalTypeId::BIGINT))}),
@@ -55,12 +61,10 @@ struct TreeFixture {
   }
 };
 
-}  // namespace
-
 // N threads insert DISJOINT key subsets (partitioned by key % threads). Concurrent latch-crabbing
 // must lose no key. TSan-clean = no latch leak / deadlock / race.
 TEST(BPlusTreeConcurrentTest, ConcurrentInsertDisjoint) {
-  TreeFixture f;
+  ConcurrentTreeFixture f;
   const int n = 500;
   const int threads = 4;
   LaunchParallelTest(threads, [&](uint64_t tid) {
@@ -81,7 +85,7 @@ TEST(BPlusTreeConcurrentTest, ConcurrentInsertDisjoint) {
 // Concurrent lookups while a single writer inserts: readers must never crash and either see the key
 // or not (no torn reads). Then everything is present.
 TEST(BPlusTreeConcurrentTest, ConcurrentInsertAndLookup) {
-  TreeFixture f;
+  ConcurrentTreeFixture f;
   const int n = 400;
   // Two inserter threads on disjoint halves + two lookup threads scanning the whole range.
   LaunchParallelTest(4, [&](uint64_t tid) {
@@ -109,7 +113,7 @@ TEST(BPlusTreeConcurrentTest, ConcurrentInsertAndLookup) {
 
 // Concurrent deletes of disjoint subsets after a full insert; the complementary keys survive.
 TEST(BPlusTreeConcurrentTest, ConcurrentDeleteDisjoint) {
-  TreeFixture f;
+  ConcurrentTreeFixture f;
   const int n = 500;
   const int threads = 4;
   for (int k = 0; k < n; k++) {

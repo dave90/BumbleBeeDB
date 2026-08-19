@@ -84,7 +84,8 @@ class Transaction {
   explicit Transaction(txn_id_t txn_id, IsolationLevel isolation_level = IsolationLevel::SNAPSHOT_ISOLATION)
       : isolation_level_(isolation_level), txn_id_(txn_id), start_time_(steady_clock_t::now()) {}
 
-  DISALLOW_COPY(Transaction);
+  Transaction(const Transaction &) = delete;
+  auto operator=(const Transaction &) -> Transaction & = delete;
 
   auto GetTransactionId() const -> txn_id_t { return txn_id_; }
   /** @return The temporary timestamp a running txn stamps its uncommitted writes with (== its id). */
@@ -96,9 +97,6 @@ class Transaction {
   auto GetTransactionState() const -> TransactionState { return state_.load(); }
   auto GetReadTs() const -> timestamp_t { return read_ts_.load(); }
   auto GetCommitTs() const -> timestamp_t { return commit_ts_.load(); }
-
-  /** @return The steady-clock instant this transaction began (used for timeout enforcement). */
-  auto GetStartTime() const -> time_point_t { return start_time_; }
 
   /** @return True if the txn has been alive at least `timeout` as of `now` (a timeout candidate). */
   auto IsExpired(duration_t timeout, time_point_t now) const -> bool { return now - start_time_ >= timeout; }
@@ -120,11 +118,6 @@ class Transaction {
   auto GetUndoLog(size_t log_id) -> UndoLog {
     std::scoped_lock lock(latch_);
     return undo_logs_[log_id];
-  }
-
-  auto GetUndoLogNum() -> size_t {
-    std::scoped_lock lock(latch_);
-    return undo_logs_.size();
   }
 
   /** @brief Record that this txn wrote `rid` in table `oid`. */

@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The matrix that was previously only ever run by hand. Release + ASan cover
+  # the unit suite; the e2e corpus runs in all three modes because chunk-boundary
+  # and reopen bugs only surface in the small-vector and durable runs.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+            build_dir: build
+          - name: asan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=address
+            build_dir: build-asan
+          - name: tsan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=thread
+            build_dir: build-tsan
+          # UBSan has never been run against this codebase (refactor.md W12).
+          # CMakeLists passes -DSANITIZER straight to -fsanitize, so no build
+          # change is needed. Advisory until the first findings are triaged.
+          - name: ubsan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=undefined
+            build_dir: build-ubsan
+            advisory: true
+          - name: small-vector
+            cmake_args: -DCMAKE_BUILD_TYPE=Release -DBBDB_VECTOR_SIZE=4
+            build_dir: build-smallvec
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev ninja-build
+      - name: Configure
+        run: cmake -S . -B ${{ matrix.build_dir }} -G Ninja ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build ${{ matrix.build_dir }} -j
+      # Unit tests assume STANDARD_VECTOR_SIZE == 1024, so the small-vector build
+      # runs only the e2e corpus (see CLAUDE.md).
+      - name: Unit tests
+        if: matrix.name != 'small-vector'
+        continue-on-error: ${{ matrix.advisory == true }}
+        run: ./${{ matrix.build_dir }}/unit_tests
+      - name: E2E
+        if: matrix.name == 'release'
+        run: python3 -m pytest test/e2e -q
+      - name: E2E (durable)
+        if: matrix.name == 'release'
+        run: BBDB_SLT_DURABLE=1 python3 -m pytest test/e2e -q
+      - name: E2E (small vector)
+        if: matrix.name == 'small-vector'
+        run: BBDB_SLT_BIN=${{ matrix.build_dir }}/BumbleBee BBDB_SLT_SMALL_VECTOR=1 python3 -m pytest test/e2e -q
+
+  # ---------------------------------------------------------------------------
+  # Style. Scoped to lines the PR actually changes: the tree still carries ~700
+  # lines of pre-existing formatting drift (refactor.md W1), so a whole-tree gate
+  # would be red on arrival and teach everyone to ignore it.
+  # ---------------------------------------------------------------------------
+  format:
+    name: clang-format (changed lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Check formatting of changed lines
+        run: |
+          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          git-clang-format --diff "$base" -- \
+            $(git diff --name-only "$base" -- 'src/*' 'test/*' \
+              | grep -E '\.(cpp|h)$' || true) > fmt.diff || true
+          if [ -s fmt.diff ] && ! grep -q "no modified files\|did not modify" fmt.diff; then
+            echo "::error::clang-format would change these lines:"; cat fmt.diff; exit 1
+          fi
+          echo "formatting OK"
+
+  # ---------------------------------------------------------------------------
+  # clang-tidy. Advisory on its first outing: .clang-tidy was tuned against a
+  # 12-file sample on macOS, so the Linux toolchain may surface checks the sample
+  # missed. Flip continue-on-error off once a clean baseline is confirmed.
+  # ---------------------------------------------------------------------------
+  tidy:
+    name: clang-tidy (changed files, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy uuid-dev ninja-build
+      - name: Configure (for compile_commands.json)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Build generated sources only
+        run: cmake --build build -j --target duckdb_pg_query
+      - name: Run clang-tidy on changed files
+        run: |
+          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          files=$(git diff --name-only "$base" -- 'src/*' | grep -E '\.cpp$' || true)
+          [ -z "$files" ] && { echo "no C++ sources changed"; exit 0; }
+          echo "$files" | xargs -r clang-tidy -p build --quiet

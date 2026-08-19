@@ -13,11 +13,10 @@
 #include "common/exception.h"
 #include "common/hash.h"
 #include "common/macros.h"
+#include "type/physical_type_dispatch.h"
 #include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
-
-namespace {
 
 /**
  * @brief The hash of a NULL element, at any nesting level.
@@ -40,8 +39,8 @@ constexpr hash_t NULL_HASH = UINT64_C(0x9e3779b97f4a7c15);
  *         through the same selection.
  */
 template <bool HAS_RSEL, class T>
-inline void TightLoopHash(T *__restrict ldata, hash_t *__restrict rdata, const SelectionVector *rsel, idx_t count,
-                          const SelectionVector *__restrict lsel, const ValidityMask *validity) {
+static inline void TightLoopHash(T *__restrict ldata, hash_t *__restrict rdata, const SelectionVector *rsel,
+                                 idx_t count, const SelectionVector *__restrict lsel, const ValidityMask *validity) {
   const bool has_nulls = validity != nullptr && !validity->AllValid();
   for (idx_t i = 0; i < count; i++) {
     auto ridx = HAS_RSEL ? rsel->GetIndex(i) : i;
@@ -51,7 +50,7 @@ inline void TightLoopHash(T *__restrict ldata, hash_t *__restrict rdata, const S
 }
 
 template <bool HAS_RSEL, class T>
-inline void TemplatedLoopHash(Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
+static inline void TemplatedLoopHash(Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
   if (input.GetVectorType() == VectorType::CONSTANT_VECTOR) {
     // One value, so one hash: the result stays a constant.
     result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -76,7 +75,7 @@ inline void TemplatedLoopHash(Vector &input, Vector &result, const SelectionVect
  * two column hashes in a different order — or hashing (a, b) versus (b, a) — does not
  * collide, which a bare XOR would.
  */
-inline auto CombineHashScalar(hash_t a, hash_t b) -> hash_t { return (a * UINT64_C(0xbf58476d1ce4e5b9)) ^ b; }
+static inline auto CombineHashScalar(hash_t a, hash_t b) -> hash_t { return (a * UINT64_C(0xbf58476d1ce4e5b9)) ^ b; }
 
 /**
  * @brief Hash one row of any vector, recursing into a LIST / ARRAY element by element.
@@ -85,14 +84,13 @@ inline auto CombineHashScalar(hash_t a, hash_t b) -> hash_t { return (a * UINT64
  * folded in first so that [1] and [1, 1] do not collide. A NULL element hashes to its own
  * constant, which is what keeps [NULL] apart from an empty list.
  */
-auto HashNestedRow(const Vector &vector, idx_t index) -> hash_t {
+static auto HashNestedRow(const Vector &vector, idx_t index) -> hash_t {
   switch (vector.GetVectorType()) {
     case VectorType::CONSTANT_VECTOR:
       index = 0;
       break;
     case VectorType::DICTIONARY_VECTOR:
-      return HashNestedRow(DictionaryVector::Child(vector),
-                           DictionaryVector::SelVector(vector).GetIndex(index));
+      return HashNestedRow(DictionaryVector::Child(vector), DictionaryVector::SelVector(vector).GetIndex(index));
     case VectorType::FLAT_VECTOR:
       break;
     default:
@@ -149,7 +147,7 @@ auto HashNestedRow(const Vector &vector, idx_t index) -> hash_t {
 
 /** @brief Hash a LIST / ARRAY vector row by row. The result is always FLAT. */
 template <bool HAS_RSEL>
-void LoopHashNested(Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
+static void LoopHashNested(Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
   result.SetVectorType(VectorType::FLAT_VECTOR);
   auto *result_data = FlatVector::GetData<hash_t>(result);
   for (idx_t i = 0; i < count; i++) {
@@ -159,56 +157,25 @@ void LoopHashNested(Vector &input, Vector &result, const SelectionVector *rsel, 
 }
 
 template <bool HAS_RSEL>
-inline void HashTypeSwitch(Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
+static inline void HashTypeSwitch(Vector &input, Vector &result, const SelectionVector *rsel, idx_t count) {
   BUMBLEBEE_ASSERT(result.GetType() == PhysicalType::UBIGINT, "the hash result must be a UBIGINT vector");
 
-  switch (input.GetType()) {
-    case PhysicalType::TINYINT:
-      TemplatedLoopHash<HAS_RSEL, int8_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::SMALLINT:
-      TemplatedLoopHash<HAS_RSEL, int16_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::INTEGER:
-      TemplatedLoopHash<HAS_RSEL, int32_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::BIGINT:
-      TemplatedLoopHash<HAS_RSEL, int64_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::UTINYINT:
-      TemplatedLoopHash<HAS_RSEL, uint8_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::USMALLINT:
-      TemplatedLoopHash<HAS_RSEL, uint16_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::UINTEGER:
-      TemplatedLoopHash<HAS_RSEL, uint32_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::UBIGINT:
-      TemplatedLoopHash<HAS_RSEL, uint64_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::FLOAT:
-      TemplatedLoopHash<HAS_RSEL, float>(input, result, rsel, count);
-      break;
-    case PhysicalType::DOUBLE:
-      TemplatedLoopHash<HAS_RSEL, double>(input, result, rsel, count);
-      break;
-    case PhysicalType::STRING:
-      TemplatedLoopHash<HAS_RSEL, string_t>(input, result, rsel, count);
-      break;
-    case PhysicalType::LIST:
-    case PhysicalType::ARRAY:
-      LoopHashNested<HAS_RSEL>(input, result, rsel, count);
-      break;
-    default:
-      throw NotImplementedException(fmt::format("hash: unsupported type {}", LogicalType::NameOf(input.GetType())));
-  }
+  DispatchNumericAndStringPhysicalType(
+      input.GetType(), [&]<class T>() { TemplatedLoopHash<HAS_RSEL, T>(input, result, rsel, count); },
+      [&]() {
+        const auto type = input.GetType();
+        if (type == PhysicalType::LIST || type == PhysicalType::ARRAY) {
+          LoopHashNested<HAS_RSEL>(input, result, rsel, count);
+          return;
+        }
+        throw NotImplementedException(fmt::format("hash: unsupported type {}", LogicalType::NameOf(type)));
+      });
 }
 
 template <bool HAS_RSEL, class T>
-inline void TightLoopCombineHashConstant(T *__restrict ldata, hash_t constant_hash, hash_t *__restrict hash_data,
-                                         const SelectionVector *rsel, idx_t count,
-                                         const SelectionVector *__restrict lsel, const ValidityMask *validity) {
+static inline void TightLoopCombineHashConstant(T *__restrict ldata, hash_t constant_hash, hash_t *__restrict hash_data,
+                                                const SelectionVector *rsel, idx_t count,
+                                                const SelectionVector *__restrict lsel, const ValidityMask *validity) {
   const bool has_nulls = validity != nullptr && !validity->AllValid();
   for (idx_t i = 0; i < count; i++) {
     auto ridx = HAS_RSEL ? rsel->GetIndex(i) : i;
@@ -219,8 +186,9 @@ inline void TightLoopCombineHashConstant(T *__restrict ldata, hash_t constant_ha
 }
 
 template <bool HAS_RSEL, class T>
-inline void TightLoopCombineHash(T *__restrict ldata, hash_t *__restrict hash_data, const SelectionVector *rsel,
-                                 idx_t count, const SelectionVector *__restrict lsel, const ValidityMask *validity) {
+static inline void TightLoopCombineHash(T *__restrict ldata, hash_t *__restrict hash_data, const SelectionVector *rsel,
+                                        idx_t count, const SelectionVector *__restrict lsel,
+                                        const ValidityMask *validity) {
   const bool has_nulls = validity != nullptr && !validity->AllValid();
   for (idx_t i = 0; i < count; i++) {
     auto ridx = HAS_RSEL ? rsel->GetIndex(i) : i;
@@ -231,9 +199,8 @@ inline void TightLoopCombineHash(T *__restrict ldata, hash_t *__restrict hash_da
 }
 
 template <bool HAS_RSEL, class T>
-void TemplatedLoopCombineHash(Vector &input, Vector &hashes, const SelectionVector *rsel, idx_t count) {
-  if (input.GetVectorType() == VectorType::CONSTANT_VECTOR &&
-      hashes.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+static void TemplatedLoopCombineHash(Vector &input, Vector &hashes, const SelectionVector *rsel, idx_t count) {
+  if (input.GetVectorType() == VectorType::CONSTANT_VECTOR && hashes.GetVectorType() == VectorType::CONSTANT_VECTOR) {
     // Both sides are a single value, so the combination is too.
     auto *hash = ConstantVector::GetData<hash_t>(hashes);
     auto other_hash = ConstantVector::IsNull(input) ? NULL_HASH : Hash<T>(*ConstantVector::GetData<T>(input));
@@ -261,7 +228,7 @@ void TemplatedLoopCombineHash(Vector &input, Vector &hashes, const SelectionVect
 
 /** @brief Fold the hash of every row of a LIST / ARRAY vector into `hashes`. */
 template <bool HAS_RSEL>
-void LoopCombineHashNested(Vector &input, Vector &hashes, const SelectionVector *rsel, idx_t count) {
+static void LoopCombineHashNested(Vector &input, Vector &hashes, const SelectionVector *rsel, idx_t count) {
   if (hashes.GetVectorType() == VectorType::CONSTANT_VECTOR) {
     // Read the accumulated constant out FIRST: turning the accumulator flat overwrites the
     // slot it lives in.
@@ -283,54 +250,20 @@ void LoopCombineHashNested(Vector &input, Vector &hashes, const SelectionVector 
 }
 
 template <bool HAS_RSEL>
-inline void CombineHashTypeSwitch(Vector &hashes, Vector &input, const SelectionVector *rsel, idx_t count) {
+static inline void CombineHashTypeSwitch(Vector &hashes, Vector &input, const SelectionVector *rsel, idx_t count) {
   BUMBLEBEE_ASSERT(hashes.GetType() == PhysicalType::UBIGINT, "the hash accumulator must be a UBIGINT vector");
 
-  switch (input.GetType()) {
-    case PhysicalType::TINYINT:
-      TemplatedLoopCombineHash<HAS_RSEL, int8_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::SMALLINT:
-      TemplatedLoopCombineHash<HAS_RSEL, int16_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::INTEGER:
-      TemplatedLoopCombineHash<HAS_RSEL, int32_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::BIGINT:
-      TemplatedLoopCombineHash<HAS_RSEL, int64_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::UTINYINT:
-      TemplatedLoopCombineHash<HAS_RSEL, uint8_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::USMALLINT:
-      TemplatedLoopCombineHash<HAS_RSEL, uint16_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::UINTEGER:
-      TemplatedLoopCombineHash<HAS_RSEL, uint32_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::UBIGINT:
-      TemplatedLoopCombineHash<HAS_RSEL, uint64_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::FLOAT:
-      TemplatedLoopCombineHash<HAS_RSEL, float>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::DOUBLE:
-      TemplatedLoopCombineHash<HAS_RSEL, double>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::STRING:
-      TemplatedLoopCombineHash<HAS_RSEL, string_t>(input, hashes, rsel, count);
-      break;
-    case PhysicalType::LIST:
-    case PhysicalType::ARRAY:
-      LoopCombineHashNested<HAS_RSEL>(input, hashes, rsel, count);
-      break;
-    default:
-      throw NotImplementedException(
-          fmt::format("combine hash: unsupported type {}", LogicalType::NameOf(input.GetType())));
-  }
+  DispatchNumericAndStringPhysicalType(
+      input.GetType(), [&]<class T>() { TemplatedLoopCombineHash<HAS_RSEL, T>(input, hashes, rsel, count); },
+      [&]() {
+        const auto type = input.GetType();
+        if (type == PhysicalType::LIST || type == PhysicalType::ARRAY) {
+          LoopCombineHashNested<HAS_RSEL>(input, hashes, rsel, count);
+          return;
+        }
+        throw NotImplementedException(fmt::format("combine hash: unsupported type {}", LogicalType::NameOf(type)));
+      });
 }
-
-}  // namespace
 
 void VectorOperations::Hash(Vector &input, Vector &hashes, idx_t count) {
   HashTypeSwitch<false>(input, hashes, nullptr, count);

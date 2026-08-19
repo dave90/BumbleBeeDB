@@ -366,10 +366,8 @@ auto DataChunk::GetTypes() const -> std::vector<LogicalType> {
   return types;
 }
 
-namespace {
-
 /** The materialized bytes of `count` rows of `vec`: the inline stride plus the out-of-line payloads. */
-auto VectorEstimatedBytes(Vector &vec, idx_t count) -> idx_t {
+static auto VectorEstimatedBytes(Vector &vec, idx_t count) -> idx_t {
   const auto ptype = vec.GetType();
   idx_t bytes = LogicalType::SizeOf(ptype) * count;
   switch (ptype) {
@@ -398,8 +396,6 @@ auto VectorEstimatedBytes(Vector &vec, idx_t count) -> idx_t {
   return bytes;
 }
 
-}  // namespace
-
 auto DataChunk::EstimatedBytes() -> idx_t {
   idx_t bytes = 0;
   for (auto &v : data_) {
@@ -414,10 +410,6 @@ auto DataChunk::ToString() const -> std::string {
     result += "- " + data_[i].ToString(GetSize()) + "\n";
   }
   return result;
-}
-
-void DataChunk::Verify() {
-  // TODO(milestone-2): a DEBUG-only structural check of the chunk.
 }
 
 void DataChunk::Hash(Vector &result) {

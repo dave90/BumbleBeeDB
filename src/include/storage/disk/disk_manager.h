@@ -32,7 +32,10 @@ class DiskManager {
  public:
   DiskManager() = default;
   virtual ~DiskManager() = default;
-  DISALLOW_COPY_AND_MOVE(DiskManager);
+  DiskManager(const DiskManager &) = delete;
+  auto operator=(const DiskManager &) -> DiskManager & = delete;
+  DiskManager(DiskManager &&) = delete;
+  auto operator=(DiskManager &&) -> DiskManager & = delete;
 
   /**
    * @brief Write a full page to the backing store.

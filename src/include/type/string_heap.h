@@ -78,7 +78,9 @@ class StringHeap {
  private:
   /** One bump-allocated block of string bytes, linked to the block that preceded it. */
   struct StringChunk {
-    explicit StringChunk(idx_t size) : maximum_size_(size) { data_ = std::unique_ptr<char[]>(new char[maximum_size_]); }
+    explicit StringChunk(idx_t size) : maximum_size_(size) {
+      data_ = std::make_unique_for_overwrite<char[]>(maximum_size_);
+    }
 
     std::unique_ptr<char[]> data_;
     idx_t current_position_{0};

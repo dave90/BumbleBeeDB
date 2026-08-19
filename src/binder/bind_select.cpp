@@ -559,8 +559,6 @@ auto Binder::BindFuncCall(duckdb_libpgquery::PGFuncCall *root) -> std::unique_pt
   return std::make_unique<BoundFuncCall>(function_name, std::move(children));
 }
 
-namespace {
-
 /**
  * @brief Resolve an unqualified column name against a schema.
  *
@@ -568,7 +566,7 @@ namespace {
  * @param col_name The dotted parts of the column name.
  * @return std::unique_ptr<BoundColumnRef> The resolved column, or null if the schema has no such column.
  */
-auto ResolveColumnRefFromSchema(const Schema &schema, const std::vector<std::string> &col_name)
+static auto ResolveColumnRefFromSchema(const Schema &schema, const std::vector<std::string> &col_name)
     -> std::unique_ptr<BoundColumnRef> {
   if (col_name.size() != 1) {
     return nullptr;
@@ -586,7 +584,7 @@ auto ResolveColumnRefFromSchema(const Schema &schema, const std::vector<std::str
 }
 
 /** @brief Is `suffix` the tail of `full_name`, compared case-insensitively? */
-auto MatchSuffix(const std::vector<std::string> &suffix, const std::vector<std::string> &full_name) -> bool {
+static auto MatchSuffix(const std::vector<std::string> &suffix, const std::vector<std::string> &full_name) -> bool {
   std::vector<std::string> lowercase_full_name;
   lowercase_full_name.reserve(full_name.size());
   for (const auto &col : full_name) {
@@ -597,8 +595,6 @@ auto MatchSuffix(const std::vector<std::string> &suffix, const std::vector<std::
   }
   return std::equal(suffix.rbegin(), suffix.rend(), lowercase_full_name.rbegin());
 }
-
-}  // namespace
 
 auto Binder::ResolveColumnRefFromBaseTableRef(const BoundBaseTableRef &table_ref,
                                               const std::vector<std::string> &col_name)
@@ -795,8 +791,7 @@ auto Binder::ResolveGroupByAlias(const std::vector<std::unique_ptr<BoundExpressi
   if (column_ref->fields->length != 1 || head_node->type != duckdb_libpgquery::T_PGString) {
     return nullptr;  // only a bare, unqualified name can be an alias
   }
-  const auto name =
-      StringUtil::Lower(reinterpret_cast<duckdb_libpgquery::PGValue *>(head_node)->val.str);
+  const auto name = StringUtil::Lower(reinterpret_cast<duckdb_libpgquery::PGValue *>(head_node)->val.str);
   for (const auto &item : select_list) {
     if (item->type_ != ExpressionType::ALIAS) {
       continue;
@@ -875,8 +870,8 @@ auto Binder::BindSubLink(duckdb_libpgquery::PGSubLink *root) -> std::unique_ptr<
       // `x IN (SELECT ...)` is `x = ANY (SELECT ...)`; any other combining operator (> ANY, ...)
       // is out of scope. An absent operName means "=".
       if (root->operName != nullptr) {
-        const auto op = std::string(
-            reinterpret_cast<duckdb_libpgquery::PGValue *>(root->operName->head->data.ptr_value)->val.str);
+        const auto op =
+            std::string(reinterpret_cast<duckdb_libpgquery::PGValue *>(root->operName->head->data.ptr_value)->val.str);
         if (op != "=") {
           throw NotImplementedException(fmt::format("{} ANY (SELECT ...) is not supported (only IN)", op));
         }
@@ -1062,8 +1057,7 @@ auto Binder::ResolveOrderByFromSelectList(const std::vector<std::unique_ptr<Boun
   return nullptr;
 }
 
-auto Binder::BindSort(duckdb_libpgquery::PGList *list,
-                      const std::vector<std::unique_ptr<BoundExpression>> &select_list)
+auto Binder::BindSort(duckdb_libpgquery::PGList *list, const std::vector<std::unique_ptr<BoundExpression>> &select_list)
     -> std::vector<std::unique_ptr<BoundOrderBy>> {
   auto order_by = std::vector<std::unique_ptr<BoundOrderBy>>{};
 

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "catalog/catalog.h"
+#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "common/macros.h"
 #include "execution/expression_executor.h"
@@ -35,21 +36,6 @@
 
 namespace bumblebee {
 
-namespace {
-
-/** @brief Resolve the external parquet storage behind a table oid. */
-auto ResolveParquet(ClientContext &context, table_oid_t oid) -> ParquetTable * {
-  auto info = context.catalog_.GetTable(oid);
-  if (info == NULL_TABLE_INFO || info->storage_ == nullptr) {
-    throw ExecutionException("ParquetScan: table has no storage backend");
-  }
-  auto *parquet = dynamic_cast<ParquetTable *>(info->storage_.get());
-  if (parquet == nullptr) {
-    throw ExecutionException("ParquetScan: table is not an external parquet table");
-  }
-  return parquet;
-}
-
 /** One morsel: one row group of one live file. */
 struct ParquetMorsel {
   idx_t file_idx_;        // index into the snapshot's file list (the RID high half)
@@ -57,14 +43,12 @@ struct ParquetMorsel {
   idx_t file_row_start_;  // absolute row offset of this group within its file (RID low half base)
 };
 
-}  // namespace
-
 /** @brief The manifest snapshot + flattened row-group morsel space, shared by all workers. */
 struct ParquetScanGlobalState : GlobalSourceState {
   std::vector<std::unique_ptr<ParquetReader>> readers_;  // one per live file, footer parsed once
   std::vector<ParquetMorsel> morsels_;
   std::atomic<idx_t> next_morsel_{0};
-  std::vector<idx_t> column_ids_;  // file column per output column (identity + optional RID tail)
+  std::vector<idx_t> column_ids_;    // file column per output column (identity + optional RID tail)
   std::vector<idx_t> null_columns_;  // pruned output columns, constant-NULLed per emitted chunk
   // One shared constant-NULL vector per pruned column: every emitted chunk references it instead
   // of allocating a fresh constant (immutable, so sharing across worker threads is safe).
@@ -93,7 +77,7 @@ void PhysicalParquetScan::BuildPipelines(Pipeline &current, PipelineBuilder & /*
 
 auto PhysicalParquetScan::GetGlobalSourceState(ClientContext &context, GlobalSinkState * /*own*/) const
     -> std::unique_ptr<GlobalSourceState> {
-  auto *parquet = ResolveParquet(context, table_oid_);
+  auto *parquet = ResolveTableStorage<ParquetTable>(context, table_oid_, "ParquetScan", "an external parquet table");
   const auto &dir = parquet->GetPath();
   const auto &schema = *parquet->GetSchema();
 
@@ -118,9 +102,8 @@ auto PhysicalParquetScan::GetGlobalSourceState(ClientContext &context, GlobalSin
     auto reader = std::make_unique<ParquetReader>(GlobalParquetAllocator(), file_path);
     // Guard against externally replaced files: the footer must still match the catalog schema.
     if (!ExternalSchemaMatches(schema, reader->names_, reader->return_types_)) {
-      throw ExecutionException(fmt::format(
-          "external table '{}': parquet file '{}' no longer matches the table schema", table_name_,
-          entry.file_name_));
+      throw ExecutionException(fmt::format("external table '{}': parquet file '{}' no longer matches the table schema",
+                                           table_name_, entry.file_name_));
     }
     // Flatten this file's row groups into the morsel space, skipping groups whose statistics
     // prove no row can satisfy the predicate.
@@ -196,7 +179,6 @@ auto PhysicalParquetScan::GetData(ExecutionContext & /*context*/, DataChunk &out
     if (ls.state_) {
       gs.readers_[ls.file_idx_]->Scan(*ls.state_, output);
       if (output.GetSize() > 0) {
-
         if (!gs.null_columns_.empty() &&
             output.data_[gs.null_columns_.front()].GetVectorType() != VectorType::CONSTANT_VECTOR) {
           for (auto c : gs.null_columns_) {

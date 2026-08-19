@@ -23,19 +23,15 @@
 
 namespace bumblebee {
 
-namespace {
-
-void WriteMarker(BufferPoolManager &bpm, page_id_t page_id, char marker) {
+static void WriteMarker(BufferPoolManager &bpm, page_id_t page_id, char marker) {
   auto guard = bpm.WritePage(page_id);
   std::memset(guard.GetDataMut(), marker, PAGE_SIZE);
 }
 
-auto ReadMarker(BufferPoolManager &bpm, page_id_t page_id) -> char {
+static auto ReadMarker(BufferPoolManager &bpm, page_id_t page_id) -> char {
   auto guard = bpm.ReadPage(page_id);
   return guard.GetData()[0];
 }
-
-}  // namespace
 
 TEST(BufferPoolManagerTest, NewPageWriteReadRoundTrip) {
   MemoryDiskManager dm(64);
@@ -77,14 +73,14 @@ TEST(BufferPoolManagerTest, DirtyEvictionThenRereadSurvives) {
   WriteMarker(bpm, p1, '1');
   // Touch two more pages, forcing p0 (and then p1) out of the two-frame pool.
   WriteMarker(bpm, p2, '2');
-  { auto g = bpm.ReadPage(p1); }  // ensure p1 stays / reloads
+  {
+    auto g = bpm.ReadPage(p1);
+  }  // ensure p1 stays / reloads
 
   // p0 was dirty and evicted; its data must have survived to disk.
   EXPECT_EQ(ReadMarker(bpm, p0), '0');
   EXPECT_EQ(ReadMarker(bpm, p2), '2');
 }
-
-namespace {
 
 /** @brief A disk manager whose writes always fail, to exercise the eviction failure path. */
 class WriteFailingDiskManager : public DiskManager {
@@ -96,8 +92,6 @@ class WriteFailingDiskManager : public DiskManager {
   }
   auto DeletePage(page_id_t /*page_id*/) -> void override {}
 };
-
-}  // namespace
 
 // Bug #2b: when the dirty write-back fails, the frame must NOT be silently recycled (which would lose
 // the page). The pool reports out-of-memory instead, and the dirty page is still readable in memory.

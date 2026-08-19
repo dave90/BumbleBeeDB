@@ -33,17 +33,15 @@
 
 namespace bumblebee {
 
-namespace {
-
 const LogicalType kInt(LogicalTypeId::INTEGER);
 
-auto Col(uint32_t idx) -> AbstractExpressionRef {
+static auto Col(uint32_t idx) -> AbstractExpressionRef {
   return std::make_shared<ColumnValueExpression>(0, idx, Column::Make("c", kInt));
 }
-auto Const(int v) -> AbstractExpressionRef { return std::make_shared<ConstantValueExpression>(Value(v)); }
+static auto Const(int v) -> AbstractExpressionRef { return std::make_shared<ConstantValueExpression>(Value(v)); }
 
 /** @brief A 2-column INT chunk: col0 = a, col1 = b. */
-auto MakeChunk(const std::vector<int> &a, const std::vector<int> &b) -> DataChunk {
+static auto MakeChunk(const std::vector<int> &a, const std::vector<int> &b) -> DataChunk {
   DataChunk chunk;
   chunk.Initialize(std::vector<LogicalType>{kInt, kInt});
   for (idx_t i = 0; i < a.size(); i++) {
@@ -53,8 +51,6 @@ auto MakeChunk(const std::vector<int> &a, const std::vector<int> &b) -> DataChun
   chunk.SetCardinality(a.size());
   return chunk;
 }
-
-}  // namespace
 
 TEST(ExpressionExecutorTest, SelectGreaterThanConstant) {
   auto chunk = MakeChunk({1, 6, 3, 10, 5}, {0, 0, 0, 0, 0});

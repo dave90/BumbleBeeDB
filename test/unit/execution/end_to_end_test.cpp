@@ -30,8 +30,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 // SQL-created tables carry an auto BIGINT `_id` primary key at column 0 (see AUTO_ID_COLUMN). These
 // helpers seed the heap directly (bypassing the INSERT executor), so they must fill `_id` themselves —
 // a sequential value is fine since these tests only read the user columns by name. The two user columns
@@ -40,7 +38,7 @@ const std::vector<LogicalType> kIdTwoInt{LogicalType(LogicalTypeId::BIGINT), Log
                                          LogicalType(LogicalTypeId::INTEGER)};
 
 /** @brief Append `rows` of (x, y) INT pairs into table `name`'s heap, prefixed with a sequential _id. */
-void SeedTable(BumbleBeeInstance &db, const std::string &name, const std::vector<std::pair<int, int>> &rows) {
+static void SeedTable(BumbleBeeInstance &db, const std::string &name, const std::vector<std::pair<int, int>> &rows) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -58,7 +56,7 @@ void SeedTable(BumbleBeeInstance &db, const std::string &name, const std::vector
 }
 
 /** @brief Seed `n` rows of (g = i % groups, v = 1) straight into `name`'s heap, spanning many pages. */
-void SeedManyRows(BumbleBeeInstance &db, const std::string &name, int n, int groups) {
+static void SeedManyRows(BumbleBeeInstance &db, const std::string &name, int n, int groups) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -81,7 +79,7 @@ void SeedManyRows(BumbleBeeInstance &db, const std::string &name, int n, int gro
 }
 
 /** @brief Seed `n` rows of (x = pseudo-random, id = i) into `name`'s heap. */
-void SeedVaried(BumbleBeeInstance &db, const std::string &name, int n) {
+static void SeedVaried(BumbleBeeInstance &db, const std::string &name, int n) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -103,7 +101,7 @@ void SeedVaried(BumbleBeeInstance &db, const std::string &name, int n) {
   }
 }
 
-auto RunColumn(BumbleBeeInstance &db, const std::string &sql, int col) -> std::vector<int> {
+static auto RunColumn(BumbleBeeInstance &db, const std::string &sql, int col) -> std::vector<int> {
   StringVectorWriter w;
   db.ExecuteSql(sql, w);
   std::vector<int> out;
@@ -114,12 +112,8 @@ auto RunColumn(BumbleBeeInstance &db, const std::string &sql, int col) -> std::v
   return out;
 }
 
-}  // namespace
-
-namespace {
-
 /** @brief Seed `n` rows of (k = i % distinct, val = i) into `name`'s heap. */
-void SeedKeyed(BumbleBeeInstance &db, const std::string &name, int n, int distinct) {
+static void SeedKeyed(BumbleBeeInstance &db, const std::string &name, int n, int distinct) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -146,7 +140,7 @@ void SeedKeyed(BumbleBeeInstance &db, const std::string &name, int n, int distin
  * distinct keys. Hashing can never split the hot key's partition, so the grace join must fall back to
  * a block nested loop for it — this exercises the NLJ leaf of the recursion tree.
  */
-void SeedHot(BumbleBeeInstance &db, const std::string &name, int n, int hot) {
+static void SeedHot(BumbleBeeInstance &db, const std::string &name, int n, int hot) {
   auto info = db.catalog_->GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
@@ -157,8 +151,8 @@ void SeedHot(BumbleBeeInstance &db, const std::string &name, int n, int hot) {
     chunk.Initialize(kIdTwoInt);
     for (idx_t i = 0; i < batch; i++) {
       int idx = written + static_cast<int>(i);
-      chunk.SetValue(0, i, Value(static_cast<int64_t>(idx)));            // _id
-      chunk.SetValue(1, i, Value(idx < hot ? 0 : idx));  // key 0 is hot; everything past `hot` is unique
+      chunk.SetValue(0, i, Value(static_cast<int64_t>(idx)));  // _id
+      chunk.SetValue(1, i, Value(idx < hot ? 0 : idx));        // key 0 is hot; everything past `hot` is unique
       chunk.SetValue(2, i, Value(idx));
     }
     chunk.SetCardinality(batch);
@@ -168,12 +162,12 @@ void SeedHot(BumbleBeeInstance &db, const std::string &name, int n, int hot) {
   }
 }
 
-auto RunHotJoinMultiset(BumbleBeeInstance &db) -> std::multiset<std::pair<int, int>> {
+static auto RunHotJoinMultiset(BumbleBeeInstance &db) -> std::multiset<std::pair<int, int>> {
   StringVectorWriter w;
   db.ExecuteSql("CREATE TABLE ha(k INT, v INT);", w);
   db.ExecuteSql("CREATE TABLE hb(k INT, v INT);", w);
   SeedHot(db, "ha", 3000, 2500);  // build: 2500 rows on key 0 (> STANDARD_VECTOR_SIZE budget) -> NLJ leaf
-  SeedHot(db, "hb", 550, 50);      // probe: 50 rows on key 0 (keeps the joined result modest)
+  SeedHot(db, "hb", 550, 50);     // probe: 50 rows on key 0 (keeps the joined result modest)
   db.ExecuteSql("SELECT ha.v, hb.v FROM ha, hb WHERE ha.k = hb.k;", w);
   std::multiset<std::pair<int, int>> rows;
   for (const auto &row : w.values_) {
@@ -182,7 +176,7 @@ auto RunHotJoinMultiset(BumbleBeeInstance &db) -> std::multiset<std::pair<int, i
   return rows;
 }
 
-auto RunJoinMultiset(BumbleBeeInstance &db) -> std::multiset<std::pair<int, int>> {
+static auto RunJoinMultiset(BumbleBeeInstance &db) -> std::multiset<std::pair<int, int>> {
   StringVectorWriter w;
   db.ExecuteSql("CREATE TABLE ja(k INT, v INT);", w);
   db.ExecuteSql("CREATE TABLE jb(k INT, v INT);", w);
@@ -197,7 +191,7 @@ auto RunJoinMultiset(BumbleBeeInstance &db) -> std::multiset<std::pair<int, int>
 }
 
 /** @brief Run `sql` and return its result rows as a multiset of string cells (so NULLs compare too). */
-auto RunRows(BumbleBeeInstance &db, const std::string &sql) -> std::multiset<std::vector<std::string>> {
+static auto RunRows(BumbleBeeInstance &db, const std::string &sql) -> std::multiset<std::vector<std::string>> {
   StringVectorWriter w;
   db.ExecuteSql(sql, w);
   std::multiset<std::vector<std::string>> rows;
@@ -208,7 +202,7 @@ auto RunRows(BumbleBeeInstance &db, const std::string &sql) -> std::multiset<std
 }
 
 /** A multi-chunk LEFT join whose right side covers only a third of the left keys (NULL rows matter). */
-auto RunLeftJoinRows(BumbleBeeInstance &db) -> std::multiset<std::vector<std::string>> {
+static auto RunLeftJoinRows(BumbleBeeInstance &db) -> std::multiset<std::vector<std::string>> {
   StringVectorWriter w;
   db.ExecuteSql("CREATE TABLE ja(k INT, v INT);", w);
   db.ExecuteSql("CREATE TABLE jb(k INT, v INT);", w);
@@ -218,16 +212,14 @@ auto RunLeftJoinRows(BumbleBeeInstance &db) -> std::multiset<std::vector<std::st
 }
 
 /** A LEFT join whose (right) build side is dominated by one hot key — the grace NLJ-fallback path. */
-auto RunHotLeftJoinRows(BumbleBeeInstance &db) -> std::multiset<std::vector<std::string>> {
+static auto RunHotLeftJoinRows(BumbleBeeInstance &db) -> std::multiset<std::vector<std::string>> {
   StringVectorWriter w;
   db.ExecuteSql("CREATE TABLE ha(k INT, v INT);", w);
   db.ExecuteSql("CREATE TABLE hb(k INT, v INT);", w);
-  SeedHot(db, "ha", 550, 50);      // probe/preserved: 50 rows on key 0, keys 50..549 unmatched
-  SeedHot(db, "hb", 3000, 2500);   // build: 2500 rows on key 0 (>> resident budget) -> NLJ leaf
+  SeedHot(db, "ha", 550, 50);     // probe/preserved: 50 rows on key 0, keys 50..549 unmatched
+  SeedHot(db, "hb", 3000, 2500);  // build: 2500 rows on key 0 (>> resident budget) -> NLJ leaf
   return RunRows(db, "SELECT ha.v, hb.v FROM ha LEFT JOIN hb ON ha.k = hb.k;");
 }
-
-}  // namespace
 
 // An equi LEFT JOIN lowers to the hash join. Every left row survives: matched rows pair with the right,
 // duplicate right keys fan out, and an unmatched left row appears once with the right columns NULL.
@@ -270,8 +262,7 @@ TEST(EndToEndTest, LeftJoinNonEquiUsesNestedLoop) {
   db.ExecuteSql("INSERT INTO b VALUES (1,15),(1,5);", w);  // only a.x=10 is < some b.y (15)
 
   auto got = RunRows(db, "SELECT a.id, a.x, b.y FROM a LEFT JOIN b ON a.x < b.y;");
-  std::multiset<std::vector<std::string>> expected{
-      {"1", "10", "15"}, {"2", "20", "NULL"}, {"3", "30", "NULL"}};
+  std::multiset<std::vector<std::string>> expected{{"1", "10", "15"}, {"2", "20", "NULL"}, {"3", "30", "NULL"}};
   EXPECT_EQ(got, expected);
 }
 
@@ -489,7 +480,7 @@ TEST(EndToEndTest, SelectStarReturnsEveryRow) {
 
   std::vector<int> xs;
   for (const auto &row : w.values_) {
-    ASSERT_EQ(row.size(), 3u);       // _id, x, y  (SELECT * now includes the auto primary key)
+    ASSERT_EQ(row.size(), 3u);        // _id, x, y  (SELECT * now includes the auto primary key)
     xs.push_back(std::stoi(row[1]));  // x is column 1; column 0 is _id
   }
   std::sort(xs.begin(), xs.end());
@@ -803,13 +794,12 @@ TEST(EndToEndTest, DeletedKeyIsRevivedWithNewValue) {
   for (int cycle = 1; cycle <= 3; cycle++) {
     ASSERT_TRUE(db.ExecuteSql("DELETE FROM p;", w));
     const int base = cycle * 100;
-    db.ExecuteSql("INSERT INTO p VALUES (1," + std::to_string(base + 1) + "),(2," + std::to_string(base + 2) +
-                      "),(3," + std::to_string(base + 3) + ");",
+    db.ExecuteSql("INSERT INTO p VALUES (1," + std::to_string(base + 1) + "),(2," + std::to_string(base + 2) + "),(3," +
+                      std::to_string(base + 3) + ");",
                   w);
     auto got = RunRows(db, "SELECT id, v FROM p;");
-    std::multiset<std::vector<std::string>> expected{{"1", std::to_string(base + 1)},
-                                                     {"2", std::to_string(base + 2)},
-                                                     {"3", std::to_string(base + 3)}};
+    std::multiset<std::vector<std::string>> expected{
+        {"1", std::to_string(base + 1)}, {"2", std::to_string(base + 2)}, {"3", std::to_string(base + 3)}};
     EXPECT_EQ(got, expected) << "cycle " << cycle;
     // The revived keys are live again, so uniqueness is enforced.
     EXPECT_THROW(db.ExecuteSql("INSERT INTO p VALUES (2,-1);", w), Exception);
@@ -840,7 +830,7 @@ TEST(EndToEndTest, RollbackRestoresIndexForAllVerbs) {
   db.ExecuteSql("BEGIN;", w);
   db.ExecuteSql("UPDATE p SET id = 50 WHERE id = 2;", w);
   db.ExecuteSql("ROLLBACK;", w);
-  ASSERT_TRUE(db.ExecuteSql("INSERT INTO p VALUES (50,5);", w));         // new key 50 was never committed
+  ASSERT_TRUE(db.ExecuteSql("INSERT INTO p VALUES (50,5);", w));              // new key 50 was never committed
   EXPECT_THROW(db.ExecuteSql("INSERT INTO p VALUES (2,-2);", w), Exception);  // old key 2 restored
 
   auto got = RunRows(db, "SELECT id, v FROM p;");
@@ -871,8 +861,7 @@ TEST(EndToEndTest, AutoIdCounterSurvivesRestart) {
     StringVectorWriter w;
     db.ExecuteSql("INSERT INTO t VALUES (30),(40);", w);  // ids must continue at 2,3
     auto got = RunRows(db, "SELECT * FROM t;");
-    std::multiset<std::vector<std::string>> expected{
-        {"0", "10"}, {"1", "20"}, {"2", "30"}, {"3", "40"}};
+    std::multiset<std::vector<std::string>> expected{{"0", "10"}, {"1", "20"}, {"2", "30"}, {"3", "40"}};
     EXPECT_EQ(got, expected);
   }
   std::filesystem::remove(path);

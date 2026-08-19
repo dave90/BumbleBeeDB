@@ -29,10 +29,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Indent every line of `text` by `spaces` columns. */
-auto Indent(const std::string &text, int spaces) -> std::string {
+static auto Indent(const std::string &text, int spaces) -> std::string {
   const std::string pad(static_cast<size_t>(spaces), ' ');
   std::string out;
   size_t start = 0;
@@ -48,20 +46,14 @@ auto Indent(const std::string &text, int spaces) -> std::string {
   return out;
 }
 
-}  // namespace
-
-namespace {
-
 /** @brief Number the operator tree post-order, `0..N-1`; returns the next free id (== the count). */
-auto AssignIds(PhysicalOperator &op, idx_t next) -> idx_t {
+static auto AssignIds(PhysicalOperator &op, idx_t next) -> idx_t {
   for (auto &child : op.children_) {
     next = AssignIds(*child, next);
   }
   op.id_ = next;
   return next + 1;
 }
-
-}  // namespace
 
 void Executor::Initialize(PhysicalOperator &root) {
   num_operators_ = AssignIds(root, 0);
@@ -238,8 +230,8 @@ void Executor::ExecuteQuery() {
   }
   scheduler_.EnqueueAll(std::move(ready));
 
-  const idx_t nthreads = std::clamp<idx_t>(std::min<idx_t>(context_.config_.max_threads_, PeakTaskDemand()), 1,
-                                           MAX_THREADS);
+  const idx_t nthreads =
+      std::clamp<idx_t>(std::min<idx_t>(context_.config_.max_threads_, PeakTaskDemand()), 1, MAX_THREADS);
   std::vector<std::thread> workers;
   workers.reserve(nthreads > 0 ? nthreads - 1 : 0);
   for (idx_t i = 1; i < nthreads; i++) {

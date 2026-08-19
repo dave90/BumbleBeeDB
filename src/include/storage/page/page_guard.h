@@ -53,14 +53,18 @@ class ReadPageGuard {
   ~ReadPageGuard();
 
  private:
-  explicit ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, std::shared_ptr<ArcReplacer> replacer,
-                         std::shared_ptr<std::mutex> bpm_latch, std::shared_ptr<DiskScheduler> disk_scheduler);
+  explicit ReadPageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, ArcReplacer *replacer,
+                         std::mutex *bpm_latch, DiskScheduler *disk_scheduler);
 
   page_id_t page_id_{INVALID_PAGE_ID};
   std::shared_ptr<FrameHeader> frame_;
-  std::shared_ptr<ArcReplacer> replacer_;
-  std::shared_ptr<std::mutex> bpm_latch_;
-  std::shared_ptr<DiskScheduler> disk_scheduler_;
+  // Non-owning: all three belong to the BufferPoolManager, which outlives every guard — a live
+  // guard pins one of the pool's frames, so a guard outliving the pool is already a bug. Holding
+  // shared_ptr copies here cost three atomic refcount pairs per page access for a lifetime the
+  // pool guarantees anyway.
+  ArcReplacer *replacer_{nullptr};
+  std::mutex *bpm_latch_{nullptr};
+  DiskScheduler *disk_scheduler_{nullptr};
   bool is_valid_{false};
 };
 
@@ -100,14 +104,15 @@ class WritePageGuard {
   ~WritePageGuard();
 
  private:
-  explicit WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, std::shared_ptr<ArcReplacer> replacer,
-                          std::shared_ptr<std::mutex> bpm_latch, std::shared_ptr<DiskScheduler> disk_scheduler);
+  explicit WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, ArcReplacer *replacer,
+                          std::mutex *bpm_latch, DiskScheduler *disk_scheduler);
 
   page_id_t page_id_{INVALID_PAGE_ID};
   std::shared_ptr<FrameHeader> frame_;
-  std::shared_ptr<ArcReplacer> replacer_;
-  std::shared_ptr<std::mutex> bpm_latch_;
-  std::shared_ptr<DiskScheduler> disk_scheduler_;
+  // Non-owning; see ReadPageGuard for the lifetime argument.
+  ArcReplacer *replacer_{nullptr};
+  std::mutex *bpm_latch_{nullptr};
+  DiskScheduler *disk_scheduler_{nullptr};
   bool is_valid_{false};
 };
 

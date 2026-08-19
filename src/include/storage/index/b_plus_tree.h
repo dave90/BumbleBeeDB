@@ -40,8 +40,6 @@ class Context {
   page_id_t root_page_id_{INVALID_PAGE_ID};
   std::deque<WritePageGuard> write_set_;
   std::deque<ReadPageGuard> read_set_;
-
-  auto IsRootPage(page_id_t page_id) -> bool { return page_id == root_page_id_; }
 };
 
 #define BPLUSTREE_TYPE BPlusTree<KeyType, ValueType, KeyComparator>
@@ -104,13 +102,13 @@ class BPlusTree {
   auto InitBPlusTree(const KeyType &key, const ValueType &value) -> page_id_t;
   auto RecursiveInsertLeaf(Context &ctx, const KeyType &key, const ValueType &value) -> InsertInternalResult;
   /** @brief Fast path: read-crab to the leaf, take one write latch; false ⇒ retry pessimistically. */
-  auto TryOptimisticInsert(const KeyType &key, const ValueType &value, bool &insert_result) -> bool;
+  [[nodiscard]] auto TryOptimisticInsert(const KeyType &key, const ValueType &value, bool &insert_result) -> bool;
 
   auto RecursiveDeleteLeaf(Context &ctx, const KeyType &key) -> bool;
   auto GetBestSiblingForMerge(InternalPage &parent_page, int pidx, int &sib_idx) -> WritePageGuard;
   auto RecursiveDelete(Context &ctx, const KeyType &key) -> bool;
   /** @brief Fast path: read-crab to the leaf, take one write latch; false ⇒ retry pessimistically. */
-  auto TryOptimisticDelete(const KeyType &key) -> bool;
+  [[nodiscard]] auto TryOptimisticDelete(const KeyType &key) -> bool;
 
   BufferPoolManager *bpm_;
   std::string index_name_;

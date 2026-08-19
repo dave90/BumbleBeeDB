@@ -26,8 +26,6 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** A chunk's packed key bytes plus the stride and inlined width the index reads them at. */
 struct GatheredKeys {
   std::vector<data_t> bytes;  // count * stride, zero-padded
@@ -38,7 +36,7 @@ struct GatheredKeys {
 };
 
 /** @brief Gather every row's key bytes with the same `ScatterKeys` recipe `CreateIndex` uses. */
-auto GatherKeys(IndexInfo &idx_info, DataChunk &chunk) -> GatheredKeys {
+static auto GatherKeys(IndexInfo &idx_info, DataChunk &chunk) -> GatheredKeys {
   auto *index = idx_info.index_.get();
   const auto &key_schema = idx_info.key_schema_;
   const auto &key_attrs = index->GetMetadata()->GetKeyAttrs();
@@ -60,8 +58,6 @@ auto GatherKeys(IndexInfo &idx_info, DataChunk &chunk) -> GatheredKeys {
   RowOperations::ScatterKeys(chunk, key_attrs, dst_offsets, key_types, out.bytes.data(), out.stride, count);
   return out;
 }
-
-}  // namespace
 
 auto FindPrimaryKeyIndex(Catalog &catalog, const TableInfo &info) -> std::shared_ptr<IndexInfo> {
   for (auto &idx : catalog.GetTableIndexes(info.name_)) {
@@ -93,8 +89,8 @@ void InsertOrRevive(TransactionManager *txn_mgr, Transaction *txn, table_oid_t o
     }
     if (found.empty()) {
       // A key the directory has never seen: append a fresh tuple and register it.
-      RID rid = heap.AppendRowBytes(TupleMeta{temp_ts, false}, scattered.RowAt(i),
-                                    static_cast<uint16_t>(scattered.sizes[i]));
+      RID rid =
+          heap.AppendRowBytes(TupleMeta{temp_ts, false}, scattered.RowAt(i), static_cast<uint16_t>(scattered.sizes[i]));
       txn->AppendWriteSet(oid, rid);
       index->InsertEntry(key, keys.width, rid);
       rid_out[i] = rid.Get();

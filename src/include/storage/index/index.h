@@ -35,7 +35,7 @@ class IndexMetadata {
         key_attrs_(std::move(key_attrs)) {}
 
   auto GetName() const -> const std::string & { return name_; }
-  auto GetTableName() const -> const std::string & { return table_name_; }
+
   auto GetKeySchema() const -> const Schema & { return key_schema_; }
   /** @return The index of each key column within the base table's schema. */
   auto GetKeyAttrs() const -> const std::vector<uint32_t> & { return key_attrs_; }
@@ -57,7 +57,10 @@ class Index {
  public:
   explicit Index(std::unique_ptr<IndexMetadata> metadata) : metadata_(std::move(metadata)) {}
   virtual ~Index() = default;
-  DISALLOW_COPY_AND_MOVE(Index);
+  Index(const Index &) = delete;
+  auto operator=(const Index &) -> Index & = delete;
+  Index(Index &&) = delete;
+  auto operator=(Index &&) -> Index & = delete;
 
   auto GetMetadata() const -> IndexMetadata * { return metadata_.get(); }
 

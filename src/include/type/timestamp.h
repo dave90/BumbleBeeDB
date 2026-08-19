@@ -85,7 +85,7 @@ class Timestamp {
    * @param result Receives the parsed timestamp.
    * @return True when the whole input parsed.
    */
-  static auto TryConvertTimestamp(const char *buf, idx_t len, timestamp_t &result) -> bool;
+  [[nodiscard]] static auto TryConvertTimestamp(const char *buf, idx_t len, timestamp_t &result) -> bool;
 
   /** @brief Break the microseconds-since-midnight `dtime` into hour, minute, second, micros. */
   static void Convert(int64_t dtime, int32_t &hour, int32_t &min, int32_t &sec, int32_t &micros);

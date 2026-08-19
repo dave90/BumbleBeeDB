@@ -28,16 +28,12 @@
 
 namespace bumblebee {
 
-namespace {
-
 struct RowSpec {
   int32_t a_;
   std::string s_;
   std::optional<int32_t> c_;  // nullable
   double d_;
 };
-
-}  // namespace
 
 TEST(RowLayoutTest, FixedWidthAndOffsets) {
   RowLayout layout;

@@ -27,44 +27,41 @@
 
 namespace bumblebee {
 
-namespace {
-
 using OptInt = std::optional<int32_t>;
 using OptStr = std::optional<std::string>;
 
-void SetIntCol(DataChunk &chunk, idx_t col, const std::vector<OptInt> &values) {
+static void SetIntCol(DataChunk &chunk, idx_t col, const std::vector<OptInt> &values) {
   for (idx_t i = 0; i < values.size(); i++) {
     chunk.SetValue(col, i, values[i].has_value() ? Value(*values[i]) : Value::Null(LogicalTypeId::INTEGER));
   }
 }
 
-void SetStrCol(DataChunk &chunk, idx_t col, const std::vector<OptStr> &values) {
+static void SetStrCol(DataChunk &chunk, idx_t col, const std::vector<OptStr> &values) {
   for (idx_t i = 0; i < values.size(); i++) {
     chunk.SetValue(col, i, values[i].has_value() ? Value(*values[i]) : Value::Null(LogicalTypeId::STRING));
   }
 }
 
-auto HashOf(DataChunk &keys) -> Vector {
+static auto HashOf(DataChunk &keys) -> Vector {
   Vector hashes{LogicalType{LogicalTypeId::UBIGINT}, keys.GetSize()};
   keys.Hash(hashes);
   return hashes;
 }
 
 /** The (probe row -> matched key col-0 values) view of a probe result, for order-free comparison. */
-auto PairsOf(const PRLHashTable &ht, const std::vector<data_ptr_t> &addrs, const std::vector<sel_t> &rows,
-             idx_t payload_col) -> std::multiset<std::pair<sel_t, int32_t>> {
+static auto PairsOf(const PRLHashTable &ht, const std::vector<data_ptr_t> &addrs, const std::vector<sel_t> &rows,
+                    idx_t payload_col) -> std::multiset<std::pair<sel_t, int32_t>> {
   std::multiset<std::pair<sel_t, int32_t>> out;
   SelectionVector identity;
   for (idx_t i = 0; i < addrs.size(); i++) {
-    Vector row_vec{LogicalType{LogicalTypeId::UBIGINT}, reinterpret_cast<data_ptr_t>(const_cast<data_ptr_t *>(&addrs[i]))};
+    Vector row_vec{LogicalType{LogicalTypeId::UBIGINT},
+                   reinterpret_cast<data_ptr_t>(const_cast<data_ptr_t *>(&addrs[i]))};
     Vector col{LogicalType{LogicalTypeId::INTEGER}, 1};
     RowOperations::Gather(ht.GetLayout(), row_vec, identity, col, identity, 1, payload_col);
     out.emplace(rows[i], col.GetValue(0).GetAs<int32_t>());
   }
   return out;
 }
-
-}  // namespace
 
 // ---------------------------------------------------------------------------------------------------
 // RowOperations::Gather / Match kernels
@@ -166,8 +163,8 @@ TEST(RowOperationsMatchTest, MultiColumnAndNullSemantics) {
 
   // GROUP BY semantics: (probe 1 = all-NULL) additionally matches the all-NULL stored row 2.
   no_match_count = 0;
-  n = RowOperations::Match(probe, col_data.get(), layout, 2, cand_rows, identity, col_sel, 6, match_sel,
-                           no_match_sel, no_match_count, /*null_equal=*/true);
+  n = RowOperations::Match(probe, col_data.get(), layout, 2, cand_rows, identity, col_sel, 6, match_sel, no_match_sel,
+                           no_match_count, /*null_equal=*/true);
   ASSERT_EQ(n, 2U);
   EXPECT_EQ(match_sel.GetIndex(0), 0U);
   EXPECT_EQ(match_sel.GetIndex(1), 5U);  // probe 1 x stored 2
@@ -303,8 +300,8 @@ TEST(PRLHashTableTest, AppendKeepsDuplicatesAndProbeCrossProduct) {
 
   DataChunk build;
   build.Initialize(types);
-  SetIntCol(build, 0, {1, 1, 2, 3});        // key 1 twice
-  SetIntCol(build, 1, {10, 11, 20, 30});    // payloads
+  SetIntCol(build, 0, {1, 1, 2, 3});      // key 1 twice
+  SetIntCol(build, 1, {10, 11, 20, 30});  // payloads
   build.SetCardinality(4);
   DataChunk keys;
   keys.InitializeEmpty({types[0]});
@@ -328,8 +325,7 @@ TEST(PRLHashTableTest, AppendKeepsDuplicatesAndProbeCrossProduct) {
   ht.Probe(probe_hashes, probe, identity, 3, addrs, rows, &matched);
 
   ASSERT_EQ(rows.size(), 3U);
-  EXPECT_EQ(PairsOf(ht, addrs, rows, 1),
-            (std::multiset<std::pair<sel_t, int32_t>>{{0, 10}, {0, 11}, {2, 20}}));
+  EXPECT_EQ(PairsOf(ht, addrs, rows, 1), (std::multiset<std::pair<sel_t, int32_t>>{{0, 10}, {0, 11}, {2, 20}}));
   EXPECT_EQ(matched, (std::vector<uint8_t>{1, 0, 1}));
   // Probe-row order: all of row 0's matches precede row 2's.
   EXPECT_TRUE(rows[0] == 0 && rows[1] == 0 && rows[2] == 2);

@@ -25,10 +25,8 @@
 
 namespace bumblebee {
 
-namespace {
-
 /** @brief Resolve a table's row-format heap from the catalog, or nullptr if it has no such backend. */
-auto GetTableHeap(Catalog *catalog, table_oid_t oid) -> TableHeap * {
+static auto GetTableHeap(Catalog *catalog, table_oid_t oid) -> TableHeap * {
   if (catalog == nullptr) {
     return nullptr;
   }
@@ -50,7 +48,7 @@ auto GetTableHeap(Catalog *catalog, table_oid_t oid) -> TableHeap * {
  *
  * @return True if a conflict was found.
  */
-auto RidConflictsWithReads(TransactionManager *mgr, Transaction *txn, table_oid_t oid, TableHeap *heap, RID rid)
+static auto RidConflictsWithReads(TransactionManager *mgr, Transaction *txn, table_oid_t oid, TableHeap *heap, RID rid)
     -> bool {
   auto read_ts = txn->GetReadTs();
   const auto &layout = heap->GetLayout();
@@ -101,8 +99,6 @@ auto RidConflictsWithReads(TransactionManager *mgr, Transaction *txn, table_oid_
   }
   return false;
 }
-
-}  // namespace
 
 auto TransactionManager::Begin(IsolationLevel isolation_level) -> Transaction * {
   std::unique_lock lock(txn_map_mutex_);
