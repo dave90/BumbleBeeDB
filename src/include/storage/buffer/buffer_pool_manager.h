@@ -159,7 +159,7 @@ class BufferPoolManager {
    * latch (`lk` is passed in and released around the I/O).
    *
    * The victim is detached from the page table and registered in `flushing_` before the lock is
-   * dropped, so a concurrent fetch of that same page waits on `flush_cv_` rather than racing a read
+   * dropped, so a concurrent fetch of that same page waits on `page_io_cv_` rather than racing a read
    * against the in-flight write. @return true if a frame was freed; false on out-of-memory / I/O error.
    */
   auto EvictOneLocked(std::unique_lock<std::mutex> &lk) -> bool;
@@ -173,15 +173,17 @@ class BufferPoolManager {
   std::mutex alloc_latch_;
   std::vector<page_id_t> free_pages_;
 
-  /** The pool latch: guards `page_table_`, `free_frames_`, `replacer_`, and `flushing_`. */
+  /** The pool latch: guards `page_table_`, `free_frames_`, `replacer_`, and page I/O state. */
   std::mutex latch_;
   std::vector<std::shared_ptr<FrameHeader>> frames_;
   std::unordered_map<page_id_t, frame_id_t> page_table_;
   std::list<frame_id_t> free_frames_;
   std::unique_ptr<ArcReplacer> replacer_;
-  /** Pages with an eviction write-back in flight; a fetch of one waits on `flush_cv_`. */
+  /** Pages whose initial read is in flight. Fetches wait until their frame is fully populated. */
+  std::unordered_set<page_id_t> loading_;
+  /** Pages with an eviction write-back in flight; a fetch of one waits on `page_io_cv_`. */
   std::unordered_set<page_id_t> flushing_;
-  std::condition_variable flush_cv_;
+  std::condition_variable page_io_cv_;
 
   std::unique_ptr<DiskScheduler> disk_scheduler_;
 };

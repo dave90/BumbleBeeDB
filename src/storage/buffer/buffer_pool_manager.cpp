@@ -127,9 +127,9 @@ auto BufferPoolManager::EvictOneLocked(std::unique_lock<std::mutex> &lk) -> bool
   }
 
   // Dirty victim: flush OUTSIDE the pool latch. Detach it and mark the page as flushing first, so a
-  // concurrent fetch of this same page blocks on flush_cv_ instead of scheduling a read that would
+  // concurrent fetch of this same page blocks on page_io_cv_ instead of scheduling a read that would
   // race the in-flight write. The victim is no longer in the page table, the free list, or the
-  // replacer, so no other thread can touch it except by waiting on flush_cv_.
+  // replacer, so no other thread can touch it except by waiting on page_io_cv_.
   page_table_.erase(page_id);
   flushing_.insert(page_id);
   lk.unlock();
@@ -143,7 +143,7 @@ auto BufferPoolManager::EvictOneLocked(std::unique_lock<std::mutex> &lk) -> bool
 
   lk.lock();
   flushing_.erase(page_id);
-  flush_cv_.notify_all();
+  page_io_cv_.notify_all();
   if (!ok) {
     // The write failed: the page is not safely on disk, so re-map it (data intact) and re-register
     // it in the replacer. The caller sees no free frame (out of memory) and can retry.
@@ -159,12 +159,14 @@ auto BufferPoolManager::EvictOneLocked(std::unique_lock<std::mutex> &lk) -> bool
 
 auto BufferPoolManager::CheckedPage(page_id_t page_id, AccessType access_type) -> std::shared_ptr<FrameHeader> {
   while (true) {
-    std::optional<std::future<bool>> future = std::nullopt;
     std::shared_ptr<FrameHeader> frame;
+    bool needs_read = false;
     {
       std::unique_lock<std::mutex> lk(latch_);
-      // If this page is being flushed out of the pool, wait until that finishes, then fetch it fresh.
-      flush_cv_.wait(lk, [&] { return flushing_.find(page_id) == flushing_.end(); });
+      // A loading page is already mapped to its reserved frame, but its bytes are not readable yet.
+      // An evicted page remains unavailable until its dirty write-back has completed.
+      page_io_cv_.wait(
+          lk, [&] { return loading_.find(page_id) == loading_.end() && flushing_.find(page_id) == flushing_.end(); });
 
       auto it = page_table_.find(page_id);
       if (it != page_table_.end()) {
@@ -181,24 +183,34 @@ auto BufferPoolManager::CheckedPage(page_id_t page_id, AccessType access_type) -
         free_frames_.pop_back();
         frame = frames_[frame_id];
         frame->EnsureData();  // the one point a frame goes from unused to holding a page
-
-        // Read the page's data into the frame.
-        DiskRequest request{false, frame->data_.get(), page_id, disk_scheduler_->CreatePromise()};
-        future = request.callback_.get_future();
-        disk_scheduler_->Schedule(request);
-
-        frame->rwlatch_.lock();
         page_table_[page_id] = frame_id;
         frame->page_id_ = page_id;
+        loading_.insert(page_id);
+        needs_read = true;
       }
       frame->pin_count_.fetch_add(1);
       replacer_->RecordAccess(frame->frame_id_, page_id, access_type);
       replacer_->SetEvictable(frame->frame_id_, false);
     }
 
-    if (future.has_value()) {
-      future->get();
+    if (needs_read) {
+      // The frame is reserved and hidden behind `loading_`, so it is safe to latch only after
+      // releasing the pool mutex. Keeping that lock order is important: callers commonly fetch a
+      // second page while already holding a page guard, which establishes frame -> pool ordering.
+      // Taking a frame latch under the pool mutex here would create the reverse edge and a potential
+      // deadlock (reported by ThreadSanitizer as a lock-order inversion).
+      frame->rwlatch_.lock();
+      DiskRequest request{false, frame->data_.get(), page_id, disk_scheduler_->CreatePromise()};
+      auto future = request.callback_.get_future();
+      disk_scheduler_->Schedule(request);
+      future.get();
       frame->rwlatch_.unlock();
+
+      {
+        std::lock_guard lk(latch_);
+        loading_.erase(page_id);
+      }
+      page_io_cv_.notify_all();
     }
     return frame;
   }
@@ -241,7 +253,8 @@ auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> R
 auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
   std::shared_ptr<FrameHeader> frame;
   {
-    std::lock_guard lk(latch_);
+    std::unique_lock<std::mutex> lk(latch_);
+    page_io_cv_.wait(lk, [&] { return loading_.find(page_id) == loading_.end(); });
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {
       return false;
