@@ -195,7 +195,7 @@ TEST_F(ParquetWriterTest, AllTypesAllCodecsRoundTrip) {
     chunk.SetValue(1, r, Value(static_cast<int8_t>(r % 100)));
     chunk.SetValue(2, r, Value(static_cast<int16_t>(r * 3)));
     chunk.SetValue(3, r, Value(static_cast<int32_t>(r * 1000)));
-    chunk.SetValue(4, r, Value(static_cast<int64_t>(r) * 100000000LL));
+    chunk.SetValue(4, r, Value(static_cast<int64_t>(r) * int64_t{100000000}));
     chunk.SetValue(5, r, Value(static_cast<float>(r) * 1.5F));
     chunk.SetValue(6, r, Value(static_cast<double>(r) * 2.25));
     chunk.SetValue(7, r, Value("row-" + std::to_string(r)));
