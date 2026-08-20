@@ -266,6 +266,7 @@ TEST(ExecutorTest, PeakTaskDemandDoesNotAddUpChainedPipelines) {
 // The same bound must not cost parallelism: a single wide pipeline still asks for its full width.
 TEST(ExecutorTest, PeakTaskDemandKeepsAWidePipelineWide) {
   Harness h;
+  h.client.config_.max_threads_ = 6;
   auto scan = std::make_unique<MockWideScan>(std::vector<int>{1, 2, 3, 4}, 1, /*threads=*/6);
   auto collector = std::make_unique<MockCollector>(std::move(scan));
 
@@ -284,6 +285,7 @@ TEST(ExecutorTest, PeakTaskDemandKeepsAWidePipelineWide) {
 // A chain of wide pipelines takes the MAX, not the sum: only one of them is ever runnable.
 TEST(ExecutorTest, PeakTaskDemandTakesTheWidestLinkOfAChain) {
   Harness h;
+  h.client.config_.max_threads_ = 5;
   auto scan = std::make_unique<MockWideScan>(std::vector<int>{1, 2, 3, 4}, 1, /*threads=*/5);
   auto breaker = std::make_unique<MockBreaker>(std::move(scan));
   auto collector = std::make_unique<MockCollector>(std::move(breaker));
