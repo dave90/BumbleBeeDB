@@ -26,22 +26,27 @@ jobs:
           - name: release
             cmake_args: -DCMAKE_BUILD_TYPE=Release
             build_dir: build
+            build_jobs: 2
           - name: asan
             cmake_args: -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=address
             build_dir: build-asan
+            build_jobs: 2
           - name: tsan
             cmake_args: -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=thread
             build_dir: build-tsan
+            build_jobs: 2
           # UBSan has never been run against this codebase (refactor.md W12).
           # CMakeLists passes -DSANITIZER straight to -fsanitize, so no build
           # change is needed. Advisory until the first findings are triaged.
           - name: ubsan
             cmake_args: -DCMAKE_BUILD_TYPE=Debug -DSANITIZER=undefined
             build_dir: build-ubsan
+            build_jobs: 1
             advisory: true
           - name: small-vector
             cmake_args: -DCMAKE_BUILD_TYPE=Release -DBBDB_VECTOR_SIZE=4
             build_dir: build-smallvec
+            build_jobs: 2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,7 +62,7 @@ jobs:
         # Ninja defaults to more workers than the two-vCPU hosted runner can sustain for these
         # template-heavy translation units. The resulting memory pressure has terminated release
         # builds with SIGTERM and made sanitizer runners lose contact with GitHub.
-        run: cmake --build ${{ matrix.build_dir }} --parallel 2
+        run: cmake --build ${{ matrix.build_dir }} --parallel ${{ matrix.build_jobs }}
       # Unit tests assume STANDARD_VECTOR_SIZE == 1024, so the small-vector build
       # runs only the e2e corpus (see CLAUDE.md).
       - name: Unit tests

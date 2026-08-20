@@ -75,7 +75,15 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         set(SANITIZER address)
     endif()
     message(STATUS "Building in Debug mode with -fsanitize=${SANITIZER}")
-    add_compile_options(-fsanitize=${SANITIZER} -O0 -g -fno-omit-frame-pointer)
+    # Full C++ template debug information makes GCC's UBSan compilation exceed the memory budget
+    # of GitHub's hosted runners. Level 1 keeps function and source-line information for sanitizer
+    # reports without emitting local-variable/type debug data for every template instantiation.
+    if(SANITIZER STREQUAL "undefined")
+        set(SANITIZER_DEBUG_FLAG -g1)
+    else()
+        set(SANITIZER_DEBUG_FLAG -g)
+    endif()
+    add_compile_options(-fsanitize=${SANITIZER} -O0 ${SANITIZER_DEBUG_FLAG} -fno-omit-frame-pointer)
     add_link_options(-fsanitize=${SANITIZER})
 endif()
 
