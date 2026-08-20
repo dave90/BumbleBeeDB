@@ -48,6 +48,9 @@ jobs:
         with: { python-version: '3.12' }
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y uuid-dev ninja-build
+      - name: Install Python test dependencies
+        if: matrix.name == 'release' || matrix.name == 'small-vector'
+        run: python3 -m pip install --disable-pip-version-check pytest==8.3.5
       - name: Configure
         run: cmake -S . -B ${{ matrix.build_dir }} -G Ninja ${{ matrix.cmake_args }}
       - name: Build
