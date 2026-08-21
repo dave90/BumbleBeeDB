@@ -67,7 +67,11 @@ class FrameHeader {
   /** The index of this frame in the buffer pool. */
   const frame_id_t frame_id_;
 
-  /** The reader/writer latch — a read guard holds it shared, a write guard exclusive. */
+  /**
+   * The reader/writer latch — a read guard holds it shared, a write guard exclusive.
+   * Reconstructed by `Reset` whenever this frame is rebound, so its synchronization identity belongs
+   * to the current logical page rather than accumulating lock-order history across unrelated pages.
+   */
   std::shared_mutex rwlatch_;
 
   /** How many guards currently pin this frame in memory. */

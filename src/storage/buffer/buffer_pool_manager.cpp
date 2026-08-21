@@ -37,6 +37,12 @@ auto FrameHeader::GetData() const -> const_data_ptr_t { return data_.get(); }
 auto FrameHeader::GetDataMut() -> data_ptr_t { return data_.get(); }
 
 void FrameHeader::Reset() {
+  // A frame's latch protects whichever logical page is currently bound to the frame. Reconstructing
+  // the unlocked latch on reuse gives the next page a fresh synchronization identity as well as a
+  // fresh lock-order history. Without this, TSan joins unrelated page-lock orders across evictions
+  // and reports ever-growing false deadlock cycles for a finite pool of recycled frame mutexes.
+  std::destroy_at(&rwlatch_);
+  std::construct_at(&rwlatch_);
   pin_count_.store(0);
   is_dirty_ = false;
   page_id_ = std::nullopt;

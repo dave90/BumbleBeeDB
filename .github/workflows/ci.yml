@@ -66,8 +66,13 @@ jobs:
       # Unit tests assume STANDARD_VECTOR_SIZE == 1024, so the small-vector build
       # runs only the e2e corpus (see CLAUDE.md).
       - name: Unit tests
-        if: matrix.name != 'small-vector'
+        if: matrix.name != 'small-vector' && matrix.name != 'tsan'
         continue-on-error: ${{ matrix.advisory == true }}
+        run: ./${{ matrix.build_dir }}/unit_tests
+      - name: Unit tests (TSan, fail fast)
+        if: matrix.name == 'tsan'
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: ./${{ matrix.build_dir }}/unit_tests
       - name: E2E
         if: matrix.name == 'release'
