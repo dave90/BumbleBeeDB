@@ -106,6 +106,8 @@ class WritePageGuard {
  private:
   explicit WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> frame, ArcReplacer *replacer,
                           std::mutex *bpm_latch, DiskScheduler *disk_scheduler);
+  explicit WritePageGuard(std::try_to_lock_t, page_id_t page_id, std::shared_ptr<FrameHeader> frame,
+                          ArcReplacer *replacer, std::mutex *bpm_latch, DiskScheduler *disk_scheduler);
 
   page_id_t page_id_{INVALID_PAGE_ID};
   std::shared_ptr<FrameHeader> frame_;

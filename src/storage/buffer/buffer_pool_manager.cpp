@@ -17,6 +17,9 @@
 #include <memory>
 #include <mutex>  // NOLINT
 #include <optional>
+#if defined(__linux__) && defined(__GLIBCXX__)
+#include <pthread.h>
+#endif
 #include <utility>
 #include <vector>
 
@@ -25,6 +28,13 @@
 namespace bumblebee {
 
 FrameHeader::FrameHeader(frame_id_t frame_id) : frame_id_(frame_id) { Reset(); }
+
+FrameHeader::~FrameHeader() {
+#if defined(__linux__) && defined(__GLIBCXX__)
+  auto *native_latch = static_cast<pthread_rwlock_t *>(rwlatch_.native_handle());
+  BUMBLEBEE_ENSURE(pthread_rwlock_destroy(native_latch) == 0, "failed to destroy frame latch");
+#endif
+}
 
 void FrameHeader::EnsureData() {
   if (data_ == nullptr) {
@@ -36,13 +46,23 @@ auto FrameHeader::GetData() const -> const_data_ptr_t { return data_.get(); }
 
 auto FrameHeader::GetDataMut() -> data_ptr_t { return data_.get(); }
 
-void FrameHeader::Reset() {
-  // A frame's latch protects whichever logical page is currently bound to the frame. Reconstructing
-  // the unlocked latch on reuse gives the next page a fresh synchronization identity as well as a
-  // fresh lock-order history. Without this, TSan joins unrelated page-lock orders across evictions
-  // and reports ever-growing false deadlock cycles for a finite pool of recycled frame mutexes.
+void FrameHeader::ResetLatch() {
+  // A frame's latch protects whichever logical page is currently bound to the frame. Resetting the
+  // unlocked latch on reuse gives the next page a fresh synchronization identity and lock history.
+  // Linux libstdc++ statically initializes its pthread rwlock, so reconstructing std::shared_mutex
+  // alone emits no pthread destroy/init events and TSan retains the old page's lock-order edges.
+#if defined(__linux__) && defined(__GLIBCXX__)
+  auto *native_latch = static_cast<pthread_rwlock_t *>(rwlatch_.native_handle());
+  BUMBLEBEE_ENSURE(pthread_rwlock_destroy(native_latch) == 0, "failed to destroy recycled frame latch");
+  BUMBLEBEE_ENSURE(pthread_rwlock_init(native_latch, nullptr) == 0, "failed to initialize recycled frame latch");
+#else
   std::destroy_at(&rwlatch_);
   std::construct_at(&rwlatch_);
+#endif
+}
+
+void FrameHeader::Reset() {
+  ResetLatch();
   pin_count_.store(0);
   is_dirty_ = false;
   page_id_ = std::nullopt;
@@ -138,6 +158,9 @@ auto BufferPoolManager::EvictOneLocked(std::unique_lock<std::mutex> &lk) -> bool
   // replacer, so no other thread can touch it except by waiting on page_io_cv_.
   page_table_.erase(page_id);
   flushing_.insert(page_id);
+  // The victim is unpinned and now unreachable, so its unlocked latch can shed the old page's lock
+  // history before this thread acquires it while possibly holding unrelated caller page latches.
+  frame->ResetLatch();
   lk.unlock();
 
   frame->rwlatch_.lock();  // exclusive; the victim is unpinned so no guard contends here
@@ -245,6 +268,29 @@ auto BufferPoolManager::WritePage(page_id_t page_id, AccessType access_type) -> 
     std::abort();
   }
   return std::move(guard_opt).value();
+}
+
+auto BufferPoolManager::TryWritePage(page_id_t page_id, AccessType access_type) -> std::optional<WritePageGuard> {
+  auto frame = CheckedPage(page_id, access_type);
+  if (frame == nullptr) {
+    std::fprintf(stderr, "\n`TryWritePage` failed to bring in page %d\n", page_id);
+    std::abort();
+  }
+
+  WritePageGuard guard(std::try_to_lock, page_id, frame, replacer_.get(), &latch_, disk_scheduler_.get());
+  if (guard.is_valid_) {
+    return std::move(guard);
+  }
+
+  // CheckedPage pinned the frame before the non-blocking latch attempt. Undo that pin on failure so
+  // a retry does not leak pins or make the frame permanently ineligible for eviction.
+  std::lock_guard lk(latch_);
+  auto pin = frame->pin_count_.fetch_sub(1);
+  BUMBLEBEE_ASSERT(pin > 0, "Pin underflow");
+  if (pin == 1) {
+    replacer_->SetEvictable(frame->frame_id_, true);
+  }
+  return std::nullopt;
 }
 
 auto BufferPoolManager::ReadPage(page_id_t page_id, AccessType access_type) -> ReadPageGuard {

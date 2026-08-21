@@ -59,6 +59,21 @@ TEST(BufferPoolManagerTest, PinCountTracksGuards) {
   EXPECT_EQ(bpm.GetPinCount(page_id), std::optional<size_t>{0});
 }
 
+TEST(BufferPoolManagerTest, TryWritePageDoesNotWaitOrLeakAPin) {
+  MemoryDiskManager dm(64);
+  BufferPoolManager bpm(4, &dm);
+  auto page_id = bpm.NewPage();
+
+  auto held = bpm.WritePage(page_id);
+  EXPECT_FALSE(bpm.TryWritePage(page_id).has_value());
+  EXPECT_EQ(bpm.GetPinCount(page_id), std::optional<size_t>{1});
+
+  held.Drop();
+  auto acquired = bpm.TryWritePage(page_id);
+  ASSERT_TRUE(acquired.has_value());
+  EXPECT_EQ(bpm.GetPinCount(page_id), std::optional<size_t>{1});
+}
+
 // Bug #2a: a dirty page evicted under memory pressure must be written back (awaited) before its
 // frame is recycled — so reading it back later returns the written contents.
 TEST(BufferPoolManagerTest, DirtyEvictionThenRereadSurvives) {

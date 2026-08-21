@@ -307,6 +307,9 @@ auto TableHeap::AppendRowBytes(const TupleMeta &meta, const_data_ptr_t row_data,
     // Otherwise link a fresh page and retry there.
     auto new_page_id = bpm_->NewPage();
     page->SetNextPageId(new_page_id);
+    // Keep heap growth to one page latch at a time. The heap latch still serializes appenders and
+    // protects the page chain while the old page is released before the new page is fetched.
+    guard.Drop();
     auto new_guard = bpm_->WritePage(new_page_id);
     new_guard.AsMut<TablePage>()->Init();
     last_page_id_ = new_page_id;

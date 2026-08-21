@@ -47,10 +47,12 @@ class FrameHeader {
 
  public:
   explicit FrameHeader(frame_id_t frame_id);
+  ~FrameHeader();
 
  private:
   auto GetData() const -> const_data_ptr_t;
   auto GetDataMut() -> data_ptr_t;
+  void ResetLatch();
   void Reset();
 
   /**
@@ -69,8 +71,8 @@ class FrameHeader {
 
   /**
    * The reader/writer latch — a read guard holds it shared, a write guard exclusive.
-   * Reconstructed by `Reset` whenever this frame is rebound, so its synchronization identity belongs
-   * to the current logical page rather than accumulating lock-order history across unrelated pages.
+   * Reset whenever this frame is recycled, so its synchronization identity belongs to the current
+   * logical page rather than accumulating lock-order history across unrelated pages.
    */
   std::shared_mutex rwlatch_;
 
@@ -141,6 +143,15 @@ class BufferPoolManager {
 
   /** @brief Acquire a write guard, aborting the process if the pool is out of frames. */
   auto WritePage(page_id_t page_id, AccessType access_type = AccessType::Unknown) -> WritePageGuard;
+
+  /**
+   * @brief Try once to acquire an exclusive guard without waiting on the page latch.
+   *
+   * Returns nullopt when another guard holds the page. Like WritePage, aborts if the pool is out of
+   * frames; callers may therefore retry nullopt only when their higher-level locking guarantees that
+   * the current holder will make progress.
+   */
+  auto TryWritePage(page_id_t page_id, AccessType access_type = AccessType::Unknown) -> std::optional<WritePageGuard>;
 
   /** @brief Acquire a read guard, aborting the process if the pool is out of frames. */
   auto ReadPage(page_id_t page_id, AccessType access_type = AccessType::Unknown) -> ReadPageGuard;

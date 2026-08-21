@@ -105,6 +105,15 @@ WritePageGuard::WritePageGuard(page_id_t page_id, std::shared_ptr<FrameHeader> f
   is_valid_ = true;
 }
 
+WritePageGuard::WritePageGuard(std::try_to_lock_t /*tag*/, page_id_t page_id, std::shared_ptr<FrameHeader> frame,
+                               ArcReplacer *replacer, std::mutex *bpm_latch, DiskScheduler *disk_scheduler)
+    : page_id_(page_id),
+      frame_(std::move(frame)),
+      replacer_(replacer),
+      bpm_latch_(bpm_latch),
+      disk_scheduler_(disk_scheduler),
+      is_valid_(frame_->rwlatch_.try_lock()) {}
+
 WritePageGuard::WritePageGuard(WritePageGuard &&that) noexcept {
   page_id_ = that.page_id_;
   frame_ = std::move(that.frame_);

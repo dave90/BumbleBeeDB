@@ -12,6 +12,7 @@
 
 #include "storage/index/b_plus_tree.h"
 
+#include <thread>  // NOLINT
 #include <utility>
 
 #include "common/macros.h"
@@ -269,16 +270,29 @@ auto BPLUSTREE_TYPE::Insert(const KeyType &key, const ValueType &value) -> bool 
 INDEX_TEMPLATE_ARGUMENTS
 auto BPLUSTREE_TYPE::GetBestSiblingForMerge(InternalPage &parent_page, int pidx, int &sib_idx) -> WritePageGuard {
   BUMBLEBEE_ASSERT(parent_page.GetSize() > 1, "GetBestSiblingForMerge needs >= 2 children");
+  // The current child is already write-latched, and different children can select their siblings in
+  // opposite orders. Never wait for a sibling while holding the current child. The exclusive parent
+  // latch keeps this sibling set structurally stable, and non-structural leaf writers do not wait on
+  // either child, so retrying the non-blocking acquisition always makes progress.
+  auto write_sibling = [this](page_id_t page_id) -> WritePageGuard {
+    while (true) {
+      auto guard = bpm_->TryWritePage(page_id);
+      if (guard.has_value()) {
+        return std::move(guard).value();
+      }
+      std::this_thread::yield();
+    }
+  };
   if (pidx == 0) {
     sib_idx = 1;
-    return bpm_->WritePage(parent_page.ValueAt(1));
+    return write_sibling(parent_page.ValueAt(1));
   }
   if (pidx >= parent_page.GetSize() - 1) {
     sib_idx = pidx - 1;
-    return bpm_->WritePage(parent_page.ValueAt(pidx - 1));
+    return write_sibling(parent_page.ValueAt(pidx - 1));
   }
-  auto right = bpm_->WritePage(parent_page.ValueAt(pidx + 1));
-  auto left = bpm_->WritePage(parent_page.ValueAt(pidx - 1));
+  auto right = write_sibling(parent_page.ValueAt(pidx + 1));
+  auto left = write_sibling(parent_page.ValueAt(pidx - 1));
   if (right.template As<BPlusTreePage>()->GetSize() > left.template As<BPlusTreePage>()->GetSize()) {
     sib_idx = pidx + 1;
     return right;
