@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/dave90/BumbleBee/main/logo/bumblebee6.png" alt="BumbleBee logo" width="180">
+<img src="./logo/bumblebee6.png" alt="BumbleBee logo" width="180">
 
 <h1>BumbleBeeDB</h1>
 
