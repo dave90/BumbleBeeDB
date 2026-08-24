@@ -1,6 +1,8 @@
 <div align="center">
 
-<h1>🐝 BumbleBeeDB</h1>
+<img src="https://raw.githubusercontent.com/dave90/BumbleBee/main/logo/bumblebee6.png" alt="BumbleBee logo" width="180">
+
+<h1>BumbleBeeDB</h1>
 
 <p><strong>A compact embedded SQL database, built from scratch in C++20.</strong></p>
 
@@ -39,27 +41,42 @@ from Python or the interactive shell, and query ordinary tables alongside Parque
 
 ## Quick start with Python
 
-Python 3.10–3.13, CMake 3.31+, and a C++20 compiler are required when installing from source. Linux
-also needs the `libuuid` development headers (`uuid-dev` on Ubuntu/Debian).
+Install BumbleBeeDB from PyPI:
 
 ```bash
-git clone https://github.com/dave90/BumbleBeeDB.git
-cd BumbleBeeDB
-python -m pip install ".[dataframe]"
+pip install bumblebeedb
+pip install pandas  # optional: DataFrame input/output used below
 ```
 
 ```python
 import bumblebeedb as bb
+import pandas as pd
+
+sales = pd.DataFrame({
+    "sale_id": [1, 2, 3, 4],
+    "region": ["Zurich", "Bern", "Zurich", "Bern"],
+    "amount": [120.0, 85.5, 64.0, 220.0],
+})
 
 with bb.db() as db:  # pass "analytics.bbdb" here to persist the database
-    db.sql("CREATE TABLE readings(sensor_id INT PRIMARY KEY, value DOUBLE)")
-    db.sql("INSERT INTO readings VALUES (1, 18.5), (2, NULL)")
+    db.load_df(sales, "sales", primary_key="sale_id")  # DataFrame → native table
+    summary = db.sql("""
+        SELECT region AS region, COUNT(*) AS orders, SUM(amount) AS revenue
+        FROM sales
+        GROUP BY region
+        ORDER BY revenue DESC
+    """).to_df()  # query result → new DataFrame
 
-    result = db.sql("SELECT sensor_id, value FROM readings ORDER BY sensor_id")
-    print(result.tuples())       # [(1, 18.5), (2, None)]
-    frame = result.to_df()       # independent pandas DataFrame
+print(summary.to_string(index=False))
 ```
 
+```text
+region  orders  revenue
+  Bern       2    305.5
+Zurich       2    184.0
+```
+
+DataFrame inputs are copied into native storage, and every output DataFrame is independent.
 Row tables always have a primary key. If you do not declare one, BumbleBeeDB adds and fills a
 generated `BIGINT _id` column.
 
