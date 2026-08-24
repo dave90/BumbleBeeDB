@@ -36,6 +36,7 @@ struct PGSelectStmt;
 struct PGAConst;
 struct PGAStar;
 struct PGFuncCall;
+struct PGArrayExpr;
 struct PGNode;
 struct PGColumnRef;
 struct PGResTarget;
@@ -82,6 +83,9 @@ class Binder {
    * @param query The SQL text.
    */
   void ParseAndSave(const std::string &query);
+
+  /** @return The parser's byte offset for the most recent parse failure, or a negative value. */
+  auto ParserErrorLocation() const -> int { return parser_.error_location; }
 
   /** @brief Is `text` a keyword of the SQL grammar? */
   static auto IsKeyword(const std::string &text) -> bool;
@@ -148,6 +152,8 @@ class Binder {
 
   auto BindConstant(duckdb_libpgquery::PGAConst *node) -> std::unique_ptr<BoundExpression>;
 
+  auto BindArray(duckdb_libpgquery::PGArrayExpr *node) -> std::unique_ptr<BoundExpression>;
+
   auto BindColumnRef(duckdb_libpgquery::PGColumnRef *node) -> std::unique_ptr<BoundExpression>;
 
   auto BindResTarget(duckdb_libpgquery::PGResTarget *root) -> std::unique_ptr<BoundExpression>;
@@ -199,8 +205,7 @@ class Binder {
 
   auto BindLimitOffset(duckdb_libpgquery::PGNode *root) -> std::unique_ptr<BoundExpression>;
 
-  auto BindSort(duckdb_libpgquery::PGList *list,
-                const std::vector<std::unique_ptr<BoundExpression>> &select_list)
+  auto BindSort(duckdb_libpgquery::PGList *list, const std::vector<std::unique_ptr<BoundExpression>> &select_list)
       -> std::vector<std::unique_ptr<BoundOrderBy>>;
 
   auto ResolveOrderByFromSelectList(const std::vector<std::unique_ptr<BoundExpression>> &select_list,
@@ -255,8 +260,7 @@ class Binder {
    */
   class OuterScopeGuard {
    public:
-    explicit OuterScopeGuard(std::vector<const BoundTableRef *> *stack, const BoundTableRef *scope)
-        : stack_(stack) {
+    explicit OuterScopeGuard(std::vector<const BoundTableRef *> *stack, const BoundTableRef *scope) : stack_(stack) {
       stack_->push_back(scope);
     }
     ~OuterScopeGuard() { stack_->pop_back(); }

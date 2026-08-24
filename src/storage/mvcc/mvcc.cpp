@@ -27,7 +27,7 @@ namespace bumblebee {
 /** @brief Taint the txn and raise a write-write conflict. */
 [[noreturn]] static void ThrowWriteWriteConflict(Transaction *txn) {
   txn->SetTainted();
-  throw ExecutionException("write-write conflict: a concurrent transaction modified this row");
+  throw ConflictException("write-write conflict: a concurrent transaction modified this row");
 }
 
 /**

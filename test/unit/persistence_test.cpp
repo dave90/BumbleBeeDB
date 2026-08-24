@@ -193,7 +193,7 @@ TEST(PersistenceTest, IndexSurvivesRestartAndIsFunctional) {
     }
 
     // The reopened tree is live: insert a new key, delete an existing one, and both take effect.
-    info->index_->InsertEntry(make_key(100).data(), ks.GetInlinedStorageSize(), RID(123, 4));
+    ASSERT_TRUE(info->index_->InsertEntry(make_key(100).data(), ks.GetInlinedStorageSize(), RID(123, 4)));
     EXPECT_EQ(lookup(100).size(), 1U) << "insert on the reopened tree works";
     info->index_->DeleteEntry(make_key(5).data(), ks.GetInlinedStorageSize(), RID(0, 0));
     EXPECT_TRUE(lookup(5).empty()) << "delete on the reopened tree works";

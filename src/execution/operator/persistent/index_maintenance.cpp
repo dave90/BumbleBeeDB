@@ -23,6 +23,7 @@
 #include "storage/mvcc/mvcc.h"
 #include "storage/row/row_operations.h"
 #include "storage/table/table_heap.h"
+#include "type/vector/operations/vector_operations.h"
 
 namespace bumblebee {
 
@@ -68,6 +69,46 @@ auto FindPrimaryKeyIndex(Catalog &catalog, const TableInfo &info) -> std::shared
   return NULL_INDEX_INFO;
 }
 
+auto InsertTableChunk(Catalog &catalog, TransactionManager *txn_mgr, Transaction *txn, TableInfo &table,
+                      DataChunk &chunk) -> idx_t {
+  const idx_t count = chunk.GetSize();
+  if (count == 0) {
+    return 0;
+  }
+  if (table.storage_ == nullptr || table.storage_->GetFormat() != StorageFormat::ROW) {
+    throw ExecutionException(fmt::format("Insert: table '{}' is not a row-format heap", table.name_));
+  }
+  auto &heap = static_cast<TableHeap &>(*table.storage_);
+
+  DataChunk widened;
+  DataChunk *to_insert = &chunk;
+  if (table.auto_id_) {
+    const int64_t start = table.next_id_.fetch_add(static_cast<int64_t>(count));
+    std::vector<LogicalType> types;
+    types.reserve(table.schema_.GetColumnCount());
+    for (const auto &column : table.schema_.GetColumns()) {
+      types.push_back(column.GetType());
+    }
+    widened.Initialize(types);
+    VectorOperations::GenerateSequence(widened.data_[0], count, start, /*increment=*/1);
+    for (idx_t column = 0; column < chunk.ColumnCount(); column++) {
+      widened.data_[column + 1].Reference(chunk.data_[column]);
+    }
+    widened.SetCardinality(count);
+    to_insert = &widened;
+  }
+
+  Vector rids{LogicalType{LogicalTypeId::BIGINT}};
+  auto primary_key = FindPrimaryKeyIndex(catalog, table);
+  if (primary_key != nullptr) {
+    InsertOrRevive(txn_mgr, txn, table.oid_, heap, *primary_key, *to_insert, rids,
+                   /*keys_are_fresh=*/table.auto_id_);
+  } else {
+    MvccInsert(txn_mgr, txn, table.oid_, heap, *to_insert, rids);
+  }
+  return count;
+}
+
 void InsertOrRevive(TransactionManager *txn_mgr, Transaction *txn, table_oid_t oid, TableHeap &heap, IndexInfo &pk,
                     DataChunk &chunk, Vector &out_rids, bool keys_are_fresh) {
   const idx_t count = chunk.GetSize();
@@ -92,14 +133,18 @@ void InsertOrRevive(TransactionManager *txn_mgr, Transaction *txn, table_oid_t o
       RID rid =
           heap.AppendRowBytes(TupleMeta{temp_ts, false}, scattered.RowAt(i), static_cast<uint16_t>(scattered.sizes[i]));
       txn->AppendWriteSet(oid, rid);
-      index->InsertEntry(key, keys.width, rid);
+      // The B+ tree checks and publishes under its leaf write latch. A concurrent winner makes this
+      // return false; the caller aborts the transaction and MVCC tombstones this provisional row.
+      if (!index->InsertEntry(key, keys.width, rid)) {
+        throw ConflictException(fmt::format("duplicate key violates primary key '{}'", pk.name_));
+      }
       rid_out[i] = rid.Get();
       continue;
     }
     // The directory already points somewhere for this key; the tuple decides whether it is a duplicate.
     const RID rid = found.front();
     if (CollectVisibleVersion(txn_mgr, txn, heap, rid).has_value()) {
-      throw ExecutionException(fmt::format("duplicate key violates primary key '{}'", pk.name_));
+      throw ConflictException(fmt::format("duplicate key violates primary key '{}'", pk.name_));
     }
     // Deleted / not-visible-to-me: revive the slot in place (ApplyMvccModify handles write-write conflicts
     // and versions the deleted pre-image, so an abort tombstones it again).

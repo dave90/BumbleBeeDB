@@ -70,6 +70,10 @@ class TransactionManager {
   /** @brief Start a transaction; its read snapshot is the latest committed timestamp. */
   auto Begin(IsolationLevel isolation_level = IsolationLevel::SNAPSHOT_ISOLATION) -> Transaction *;
 
+  /** @brief Start a transaction and return a lifetime-safe owning handle. */
+  auto BeginShared(IsolationLevel isolation_level = IsolationLevel::SNAPSHOT_ISOLATION)
+      -> std::shared_ptr<Transaction>;
+
   /** @brief Commit a transaction: assign a commit ts, publish its writes, advance the watermark. */
   auto Commit(Transaction *txn) -> bool;
 

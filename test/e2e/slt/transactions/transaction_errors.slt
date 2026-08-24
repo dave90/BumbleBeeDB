@@ -1,5 +1,5 @@
 # Error and edge-case handling for explicit transactions: nested BEGIN, stray COMMIT/ROLLBACK, a failed
-# statement aborting the whole transaction, and the current (non-transactional) treatment of DDL.
+# statement aborting the whole transaction, and rejection of non-transactional DDL.
 
 statement ok
 CREATE TABLE t(id INT PRIMARY KEY, v INT);
@@ -47,23 +47,18 @@ SELECT id, v FROM t;
 ----
 1 10
 
-# --- DDL is NOT transactional (known limitation): the catalog is mutated immediately ---------------
-# A table created inside a transaction is NOT undone by ROLLBACK.
+# --- DDL is rejected until catalog mutations become transactional ----------------------------------
+# This preserves the transaction's long-lived shared schema lease and avoids irreversible catalog work.
 
 statement ok
 BEGIN;
 
-statement ok
+statement error
 CREATE TABLE ephemeral(x INT);
 
 statement ok
 ROLLBACK;
 
-# The table still exists despite the ROLLBACK (catalog DDL bypasses the transaction).
-statement ok
-INSERT INTO ephemeral VALUES (1);
-
-query
-SELECT x FROM ephemeral;
-----
-1
+# Nothing was created.
+statement error
+SELECT * FROM ephemeral;

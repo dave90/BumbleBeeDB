@@ -1,0 +1,55 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.13",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "bumblebeedb"
+version = "0.1.0"
+description = "Embedded relational database with a native C++20 execution engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Davide Fuscà" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: C++",
+]
+
+[project.optional-dependencies]
+dataframe = ["numpy>=1.26", "pandas>=2.1"]
+test = ["pytest>=8", "numpy>=1.26", "pandas>=2.1"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+build-dir = "build-python"
+cmake.args = [
+  "-DBUMBLEBEE_BUILD_PYTHON=ON",
+  "-DBUMBLEBEE_BUILD_SHELL=OFF",
+  "-DBUMBLEBEE_BUILD_TESTS=OFF",
+]
+wheel.packages = ["python/bumblebeedb"]
+sdist.include = [
+  "CMakeLists.txt",
+  "src/**",
+  "third_party/**",
+  "python/**",
+  "README.md",
+  "LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["python/test"]
+markers = [
+  "memory: in-memory engine tests",
+  "durable: durable database tests",
+  "small_vector: small-vector native build tests",
+  "concurrency: true multi-threaded API tests",
+  "slow: long-running stress or corpus tests",
+  "gil: verifies native work does not retain the Python GIL",
+]

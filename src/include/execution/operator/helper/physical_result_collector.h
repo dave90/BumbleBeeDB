@@ -42,6 +42,15 @@ class ResultCollectorGlobalState : public GlobalSinkState {
     }
     return n;
   }
+
+  /**
+   * @brief Move the finalized, normalized chunks into an owning QueryResult.
+   * @return The chunks in stable source-batch order.
+   */
+  auto TakeChunks() -> data_chunk_vector_t {
+    tagged_.clear();
+    return std::move(chunks_);
+  }
 };
 
 /** @brief One worker's private buffer of result chunks, moved into the global set at Combine. */

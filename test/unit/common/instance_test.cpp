@@ -34,13 +34,13 @@ TEST(InstanceTest, CreateTable) {
   BumbleBeeInstance instance;
   auto out = RunSql(instance, "CREATE TABLE t1(v1 INT, v2 INT);");
   EXPECT_NE(out.find("Table created with id ="), std::string::npos);
-  EXPECT_NE(instance.catalog_->GetTable("t1"), NULL_TABLE_INFO);
+  EXPECT_NE(instance.GetCatalog().GetTable("t1"), NULL_TABLE_INFO);
 }
 
 TEST(InstanceTest, CreateTableWithArrayColumns) {
   BumbleBeeInstance instance;
   RunSql(instance, "CREATE TABLE t1(id INT, tags INT[], fixed INT[3]);");
-  auto table = instance.catalog_->GetTable("t1");
+  auto table = instance.GetCatalog().GetTable("t1");
   ASSERT_NE(table, NULL_TABLE_INFO);
   // Column 0 is the auto "_id" primary key, so the declared columns start at index 1.
   EXPECT_EQ(table->schema_.GetColumn(0).GetName(), "_id");
@@ -157,8 +157,8 @@ TEST(InstanceTest, ErrorsAreThrownNotSwallowed) {
 TEST(InstanceTest, MultipleStatementsInOneString) {
   BumbleBeeInstance instance;
   auto out = RunSql(instance, "CREATE TABLE t1(v1 INT); CREATE TABLE t2(v2 INT);");
-  EXPECT_NE(instance.catalog_->GetTable("t1"), NULL_TABLE_INFO);
-  EXPECT_NE(instance.catalog_->GetTable("t2"), NULL_TABLE_INFO);
+  EXPECT_NE(instance.GetCatalog().GetTable("t1"), NULL_TABLE_INFO);
+  EXPECT_NE(instance.GetCatalog().GetTable("t2"), NULL_TABLE_INFO);
 }
 
 TEST(InstanceTest, DisplayRowCapTruncatesWithNotice) {

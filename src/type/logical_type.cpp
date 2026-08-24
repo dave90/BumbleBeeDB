@@ -414,6 +414,18 @@ auto LogicalType::FromString(const std::string &type_name) -> LogicalType {
   if (name == "int8" || name == "bigint" || name == "long") {
     return LogicalTypeId::BIGINT;
   }
+  if (name == "uint1" || name == "utinyint") {
+    return LogicalTypeId::UTINYINT;
+  }
+  if (name == "uint2" || name == "usmallint") {
+    return LogicalTypeId::USMALLINT;
+  }
+  if (name == "uint4" || name == "uinteger") {
+    return LogicalTypeId::UINTEGER;
+  }
+  if (name == "uint8" || name == "ubigint") {
+    return LogicalTypeId::UBIGINT;
+  }
   if (name == "float4" || name == "float" || name == "real") {
     return LogicalTypeId::FLOAT;
   }

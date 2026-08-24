@@ -30,11 +30,21 @@ class TransactionManager;
 //  - a tombstoned slot          -> revived in place (no new index entry);
 //  - no entry at all            -> a fresh tuple is appended and (key -> RID) registered.
 // DELETE only tombstones the tuple (no index change). Abort needs NO index undo: reverting the tuple (the
-// existing heap rollback) restores each key's liveness. What is still NOT handled is cross-transaction
-// isolation (two concurrent txns can both see a key as free and both revive/insert it).
+// existing heap rollback) restores each key's liveness. The B+ tree's atomic InsertEntry result
+// arbitrates concurrent first publication: the loser aborts and its provisional heap row is
+// tombstoned. Once a directory entry exists, normal MVCC write-conflict handling arbitrates
+// concurrent attempts to revive that key.
 
 /** @return The table's primary-key index (key columns == the PK), or nullptr if it has none. */
 auto FindPrimaryKeyIndex(Catalog &catalog, const TableInfo &info) -> std::shared_ptr<IndexInfo>;
+
+/**
+ * @brief Insert one user-width chunk through the same auto-id, MVCC, and primary-key maintenance
+ * path used by PhysicalInsert. The chunk excludes column 0 when `table.auto_id_` is true.
+ * @return The number of rows inserted.
+ */
+auto InsertTableChunk(Catalog &catalog, TransactionManager *txn_mgr, Transaction *txn, TableInfo &table,
+                      DataChunk &chunk) -> idx_t;
 
 /**
  * @brief Insert `chunk`'s rows into `heap`, maintaining the unique primary-key index `pk`; RIDs of the

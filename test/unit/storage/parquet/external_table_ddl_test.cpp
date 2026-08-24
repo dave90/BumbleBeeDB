@@ -55,7 +55,7 @@ class ExternalTableDdlTest : public ::testing::Test {
 TEST_F(ExternalTableDdlTest, InferenceAdoptsFilesAndMaterializesManifest) {
   Run("CREATE TABLE t () WITH (format='parquet', location='" + Loc() + "');");
 
-  auto info = instance_.catalog_->GetTable("t");
+  auto info = instance_.GetCatalog().GetTable("t");
   ASSERT_NE(info, NULL_TABLE_INFO);
   EXPECT_EQ(info->storage_->GetFormat(), StorageFormat::PARQUET);
   // Inferred schema: exactly the file's columns — no auto _id, no PK.
@@ -66,7 +66,7 @@ TEST_F(ExternalTableDdlTest, InferenceAdoptsFilesAndMaterializesManifest) {
   EXPECT_EQ(info->schema_.GetColumn(1).GetType().GetTypeId(), LogicalTypeId::STRING);
   EXPECT_TRUE(info->pk_attrs_.empty());
   EXPECT_FALSE(info->auto_id_);
-  EXPECT_TRUE(instance_.catalog_->GetTableIndexes("t").empty());
+  EXPECT_TRUE(instance_.GetCatalog().GetTableIndexes("t").empty());
 
   // Adoption materialized manifest 0 listing the file with its footer row count.
   auto manifest = ParquetManifestIO::ReadLatest(Loc());
@@ -84,11 +84,10 @@ TEST_F(ExternalTableDdlTest, DeclaredColumnsMustMatchFiles) {
   // Wrong count.
   EXPECT_THROW(Run("CREATE TABLE t (i INT) WITH (format='parquet', location='" + Loc() + "');"), Exception);
   // Wrong name.
-  EXPECT_THROW(Run("CREATE TABLE t (i INT, k VARCHAR) WITH (format='parquet', location='" + Loc() + "');"),
-               Exception);
+  EXPECT_THROW(Run("CREATE TABLE t (i INT, k VARCHAR) WITH (format='parquet', location='" + Loc() + "');"), Exception);
   // Matching declaration (names case-insensitive, INT32 -> INTEGER) succeeds.
   Run("CREATE TABLE t (I INT, J VARCHAR) WITH (format='parquet', location='" + Loc() + "');");
-  EXPECT_NE(instance_.catalog_->GetTable("t"), NULL_TABLE_INFO);
+  EXPECT_NE(instance_.GetCatalog().GetTable("t"), NULL_TABLE_INFO);
 }
 
 TEST_F(ExternalTableDdlTest, EmptyFolderNeedsDeclaredColumns) {
@@ -108,8 +107,7 @@ TEST_F(ExternalTableDdlTest, OptionValidation) {
   EXPECT_THROW(Run("CREATE TABLE t (a INT) WITH (format='parquet');"), BinderException);
   EXPECT_THROW(Run("CREATE TABLE t (a INT) WITH (location='/tmp/x');"), BinderException);
   EXPECT_THROW(Run("CREATE TABLE t (a INT) WITH (whatever='x');"), BinderException);
-  EXPECT_THROW(Run("CREATE TABLE t (a INT PRIMARY KEY) WITH (format='parquet', location='/tmp/x');"),
-               BinderException);
+  EXPECT_THROW(Run("CREATE TABLE t (a INT PRIMARY KEY) WITH (format='parquet', location='/tmp/x');"), BinderException);
   // Empty column list without external format stays an error (and must not crash).
   EXPECT_THROW(Run("CREATE TABLE t ();"), BinderException);
 }
@@ -141,7 +139,7 @@ TEST_F(ExternalTableDdlTest, ExternalTableSurvivesReopen) {
   }
   // Reopen: the external table comes back with its schema, format and location intact.
   BumbleBeeInstance durable(db_file, 64, std::chrono::hours(2));
-  auto info = durable.catalog_->GetTable("ext");
+  auto info = durable.GetCatalog().GetTable("ext");
   ASSERT_NE(info, NULL_TABLE_INFO);
   ASSERT_NE(info->storage_, nullptr);
   EXPECT_EQ(info->storage_->GetFormat(), StorageFormat::PARQUET);
@@ -149,13 +147,13 @@ TEST_F(ExternalTableDdlTest, ExternalTableSurvivesReopen) {
   ASSERT_EQ(info->schema_.GetColumnCount(), 2u);
   EXPECT_EQ(info->schema_.GetColumn(0).GetName(), "i");
   // The row-format table reloaded alongside it.
-  EXPECT_NE(durable.catalog_->GetTable("plain"), NULL_TABLE_INFO);
+  EXPECT_NE(durable.GetCatalog().GetTable("plain"), NULL_TABLE_INFO);
 }
 
 TEST_F(ExternalTableDdlTest, DropKeepsDataFiles) {
   Run("CREATE TABLE t () WITH (format='parquet', location='" + Loc() + "');");
   Run("DROP TABLE t;");
-  EXPECT_EQ(instance_.catalog_->GetTable("t"), NULL_TABLE_INFO);
+  EXPECT_EQ(instance_.GetCatalog().GetTable("t"), NULL_TABLE_INFO);
   // External semantics: dropping the table never deletes the data.
   EXPECT_TRUE(fs::exists(dir_ / "t1.parquet"));
 }

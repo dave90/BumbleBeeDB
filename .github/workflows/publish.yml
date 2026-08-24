@@ -1,0 +1,128 @@
+name: Build and publish Python distributions
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheels:
+    name: Wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cibuildwheel
+        run: python -m pip install --disable-pip-version-check cibuildwheel==3.4.0
+
+      - name: Build and test wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "*-manylinux_i686 *-musllinux_* pp*"
+          CIBW_ARCHS_LINUX: "x86_64"
+          CIBW_ARCHS_MACOS: "native"
+
+          # The manylinux_2_34 image is Fedora-based. Install the same LLVM/libc++ toolchain used by
+          # BumbleBee DataLog and let auditwheel bundle its non-platform runtime dependencies.
+          CIBW_BEFORE_ALL_LINUX: >
+            dnf install -y libuuid-devel wget tar xz &&
+            ARCH=$(uname -m) && if [ "$ARCH" = "x86_64" ]; then LLVM_ARCH=X64; else LLVM_ARCH=ARM64; fi &&
+            wget -qO /tmp/llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.0/LLVM-20.1.0-Linux-${LLVM_ARCH}.tar.xz" &&
+            mkdir -p /opt/llvm && tar -xf /tmp/llvm.tar.xz -C /opt/llvm --strip-components=1 &&
+            rm /tmp/llvm.tar.xz
+          CIBW_BEFORE_BUILD_LINUX: "python -m pip install pybind11"
+          CIBW_ENVIRONMENT_LINUX: >
+            PATH=/opt/llvm/bin:$PATH
+            CC=clang CXX=clang++
+            CFLAGS="-fPIC"
+            CXXFLAGS="-stdlib=libc++ -fPIC"
+            LDFLAGS="-fuse-ld=lld --rtlib=compiler-rt -stdlib=libc++ -L/opt/llvm/lib -L/opt/llvm/lib/$(uname -m)-unknown-linux-gnu -Wl,-rpath,/opt/llvm/lib -Wl,-rpath,/opt/llvm/lib/$(uname -m)-unknown-linux-gnu"
+            LD_LIBRARY_PATH="/opt/llvm/lib:/opt/llvm/lib/$(uname -m)-unknown-linux-gnu"
+            CMAKE_ARGS="-DCMAKE_C_COMPILER=/opt/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/llvm/bin/clang++"
+            CMAKE_BUILD_PARALLEL_LEVEL=2
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            LD_LIBRARY_PATH=/opt/llvm/lib:/opt/llvm/lib/$(uname -m)-unknown-linux-gnu
+            auditwheel repair -w {dest_dir} {wheel}
+          CIBW_MANYLINUX_X86_64_IMAGE: "quay.io/pypa/manylinux_2_34_x86_64"
+
+          CIBW_BEFORE_ALL_MACOS: >
+            brew install llvm@20 &&
+            /opt/homebrew/opt/llvm@20/bin/clang --version
+          CIBW_BEFORE_BUILD_MACOS: "python -m pip install pybind11"
+          CIBW_ENVIRONMENT_MACOS: >
+            MACOSX_DEPLOYMENT_TARGET=14.0
+            SDKROOT=$(xcrun --show-sdk-path)
+            CC=/opt/homebrew/opt/llvm@20/bin/clang
+            CXX=/opt/homebrew/opt/llvm@20/bin/clang++
+            CXXFLAGS="-stdlib=libc++"
+            LDFLAGS="-stdlib=libc++ -L/opt/homebrew/opt/llvm@20/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm@20/lib/c++"
+            CMAKE_ARGS="-DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm@20/bin/clang -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm@20/bin/clang++"
+            CMAKE_BUILD_PARALLEL_LEVEL=2
+
+          CIBW_TEST_COMMAND: >-
+            python -c "import bumblebeedb as bb; database = bb.db(frames=64); assert database.sql('SELECT 42').tuples() == [(42,)]; database.close()"
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions-wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and check source distribution
+        run: |
+          python -m pip install --disable-pip-version-check build twine
+          python -m build --sdist
+          python -m twine check dist/*
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish bumblebeedb to PyPI
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'release'
+    environment:
+      name: pypi
+      url: https://pypi.org/p/bumblebeedb
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-distributions-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

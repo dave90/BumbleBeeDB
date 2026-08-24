@@ -37,9 +37,16 @@ namespace bumblebee {
 const std::vector<LogicalType> kIdTwoInt{LogicalType(LogicalTypeId::BIGINT), LogicalType(LogicalTypeId::INTEGER),
                                          LogicalType(LogicalTypeId::INTEGER)};
 
+static auto QueryConfig(idx_t max_memory, bool prefer_external = false) -> DatabaseConfig {
+  DatabaseConfig config;
+  config.max_memory_ = max_memory;
+  config.prefer_external_ = prefer_external;
+  return config;
+}
+
 /** @brief Append `rows` of (x, y) INT pairs into table `name`'s heap, prefixed with a sequential _id. */
 static void SeedTable(BumbleBeeInstance &db, const std::string &name, const std::vector<std::pair<int, int>> &rows) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   DataChunk chunk;
@@ -57,7 +64,7 @@ static void SeedTable(BumbleBeeInstance &db, const std::string &name, const std:
 
 /** @brief Seed `n` rows of (g = i % groups, v = 1) straight into `name`'s heap, spanning many pages. */
 static void SeedManyRows(BumbleBeeInstance &db, const std::string &name, int n, int groups) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   int written = 0;
@@ -80,7 +87,7 @@ static void SeedManyRows(BumbleBeeInstance &db, const std::string &name, int n, 
 
 /** @brief Seed `n` rows of (x = pseudo-random, id = i) into `name`'s heap. */
 static void SeedVaried(BumbleBeeInstance &db, const std::string &name, int n) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   int written = 0;
@@ -114,7 +121,7 @@ static auto RunColumn(BumbleBeeInstance &db, const std::string &sql, int col) ->
 
 /** @brief Seed `n` rows of (k = i % distinct, val = i) into `name`'s heap. */
 static void SeedKeyed(BumbleBeeInstance &db, const std::string &name, int n, int distinct) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   int written = 0;
@@ -141,7 +148,7 @@ static void SeedKeyed(BumbleBeeInstance &db, const std::string &name, int n, int
  * a block nested loop for it — this exercises the NLJ leaf of the recursion tree.
  */
 static void SeedHot(BumbleBeeInstance &db, const std::string &name, int n, int hot) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   int written = 0;
@@ -291,8 +298,7 @@ TEST(EndToEndTest, LeftJoinLargePreservesEveryLeftRow) {
 TEST(EndToEndTest, RuntimeSwitchToExternalSortOnOverflow) {
   // prefer_external_ = false, so the FIRST attempt is the in-memory sort. A tiny budget makes it overflow
   // and throw; the driver must re-lower to the external merge sort and retry, returning correct results.
-  BumbleBeeInstance db;
-  db.max_memory_ = 4096;  // forces the in-memory sort to overflow on the first chunk
+  BumbleBeeInstance db(QueryConfig(4096));
   StringVectorWriter w;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE s(x INT, id INT);", w));
   SeedVaried(db, "s", 8000);
@@ -303,8 +309,7 @@ TEST(EndToEndTest, RuntimeSwitchToExternalSortOnOverflow) {
 }
 
 TEST(EndToEndTest, RuntimeSwitchToGraceJoinOnOverflow) {
-  BumbleBeeInstance db;
-  db.max_memory_ = 4096;  // forces the in-memory hash-join build to overflow -> retry as grace join
+  BumbleBeeInstance db(QueryConfig(4096));
   auto got = RunJoinMultiset(db);
   ASSERT_FALSE(got.empty());
 
@@ -318,9 +323,7 @@ TEST(EndToEndTest, GraceHashJoinMatchesInMemoryJoin) {
   auto expected = RunJoinMultiset(mem_db);
   ASSERT_FALSE(expected.empty());
 
-  BumbleBeeInstance ext_db;
-  ext_db.prefer_external_ = true;
-  ext_db.max_memory_ = 8192;
+  BumbleBeeInstance ext_db(QueryConfig(8192, true));
   auto got = RunJoinMultiset(ext_db);
 
   EXPECT_EQ(got, expected);  // same multiset of joined rows
@@ -346,9 +349,7 @@ TEST(EndToEndTest, GraceHashJoinRecursesOnOversizedPartitions) {
   ASSERT_FALSE(expected.empty());
 
   {
-    BumbleBeeInstance ext_db;  // in-memory: 4096 scratch pages — only passes with eager reclamation
-    ext_db.prefer_external_ = true;
-    ext_db.max_memory_ = 8192;  // budget_rows floors at STANDARD_VECTOR_SIZE -> partitions overflow
+    BumbleBeeInstance ext_db(QueryConfig(8192, true));  // in-memory: 4096 scratch pages
     auto got = run(ext_db);
     EXPECT_EQ(got, expected);
   }
@@ -356,9 +357,7 @@ TEST(EndToEndTest, GraceHashJoinRecursesOnOversizedPartitions) {
   const auto db_path = std::filesystem::temp_directory_path() / "bbdb_grace_recursion_test.db";
   std::filesystem::remove(db_path);
   {
-    BumbleBeeInstance ext_db(db_path);
-    ext_db.prefer_external_ = true;
-    ext_db.max_memory_ = 8192;
+    BumbleBeeInstance ext_db(db_path, QueryConfig(8192, true));
     auto got = run(ext_db);
     EXPECT_EQ(got, expected);
   }
@@ -370,9 +369,7 @@ TEST(EndToEndTest, GraceHashJoinLeftMatchesInMemoryJoin) {
   auto expected = RunLeftJoinRows(mem_db);
   ASSERT_FALSE(expected.empty());
 
-  BumbleBeeInstance ext_db;
-  ext_db.prefer_external_ = true;
-  ext_db.max_memory_ = 8192;
+  BumbleBeeInstance ext_db(QueryConfig(8192, true));
   auto got = RunLeftJoinRows(ext_db);
 
   EXPECT_EQ(got, expected);  // same multiset, including the NULL-padded preserved rows
@@ -381,8 +378,7 @@ TEST(EndToEndTest, GraceHashJoinLeftMatchesInMemoryJoin) {
 TEST(EndToEndTest, LeftJoinOverflowSwitchesToGraceJoin) {
   // The in-memory LEFT build now reserves against the budget too: on overflow the driver re-lowers
   // this join to the grace variant, which since the LEFT path landed is a correct target.
-  BumbleBeeInstance db;
-  db.max_memory_ = 4096;  // forces the in-memory build to overflow -> retry as grace LEFT
+  BumbleBeeInstance db(QueryConfig(4096));
   auto got = RunLeftJoinRows(db);
   ASSERT_FALSE(got.empty());
 
@@ -399,9 +395,7 @@ TEST(EndToEndTest, GraceLeftJoinHotKeyFallsBackToNestedLoop) {
   auto expected = RunHotLeftJoinRows(mem_db);
   ASSERT_FALSE(expected.empty());
 
-  BumbleBeeInstance ext_db;
-  ext_db.prefer_external_ = true;
-  ext_db.max_memory_ = 8192;
+  BumbleBeeInstance ext_db(QueryConfig(8192, true));
   auto got = RunHotLeftJoinRows(ext_db);
 
   EXPECT_EQ(got, expected);
@@ -414,9 +408,7 @@ TEST(EndToEndTest, GraceHashJoinFallsBackToNestedLoopOnHotKey) {
   auto expected = RunHotJoinMultiset(mem_db);
   ASSERT_FALSE(expected.empty());
 
-  BumbleBeeInstance ext_db;
-  ext_db.prefer_external_ = true;
-  ext_db.max_memory_ = 8192;  // hot partition (5000 rows) far exceeds the resident row budget -> NLJ
+  BumbleBeeInstance ext_db(QueryConfig(8192, true));
   auto got = RunHotJoinMultiset(ext_db);
 
   EXPECT_EQ(got, expected);
@@ -436,9 +428,7 @@ TEST(EndToEndTest, ExternalMergeSortMatchesInMemorySort) {
   ASSERT_TRUE(std::is_sorted(expected.begin(), expected.end()));
 
   // External merge sort with a tiny budget -> many runs -> a real multi-run merge.
-  BumbleBeeInstance ext_db;
-  ext_db.prefer_external_ = true;
-  ext_db.max_memory_ = 8192;
+  BumbleBeeInstance ext_db(QueryConfig(8192, true));
   ASSERT_TRUE(ext_db.ExecuteSql("CREATE TABLE s(x INT, id INT);", w));
   SeedVaried(ext_db, "s", kRows);
   auto got = RunColumn(ext_db, kQuery, 0);
@@ -734,7 +724,7 @@ TEST(EndToEndTest, AutoIdPrimaryKeyGeneratedAndIndexed) {
   auto got = RunRows(db, "SELECT * FROM t;");  // _id, a
   std::multiset<std::vector<std::string>> expected{{"0", "10"}, {"1", "20"}, {"2", "30"}};
   EXPECT_EQ(got, expected);
-  EXPECT_NE(db.catalog_->GetIndex("_pk_t", "t"), NULL_INDEX_INFO) << "the primary-key index must exist";
+  EXPECT_NE(db.GetCatalog().GetIndex("_pk_t", "t"), NULL_INDEX_INFO) << "the primary-key index must exist";
 }
 
 // `_id` is a normal identifier, so it is usable unquoted in queries: projected, filtered, and ordered by.
@@ -761,7 +751,7 @@ TEST(EndToEndTest, ExplicitPrimaryKeyEnforcesUniqueness) {
   auto got = RunRows(db, "SELECT id, v FROM u;");
   std::multiset<std::vector<std::string>> expected{{"1", "10"}, {"2", "20"}};  // the dup left no trace
   EXPECT_EQ(got, expected);
-  EXPECT_NE(db.catalog_->GetIndex("_pk_u", "u"), NULL_INDEX_INFO);
+  EXPECT_NE(db.GetCatalog().GetIndex("_pk_u", "u"), NULL_INDEX_INFO);
 }
 
 // Index maintenance is transactional: a failed multi-row INSERT rolls its index entries back, so the

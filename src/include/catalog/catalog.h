@@ -72,8 +72,7 @@ static constexpr auto NULL_TABLE_INFO = nullptr;
 
 /** The metadata BumbleBeeDB keeps about an index. */
 struct IndexInfo {
-  IndexInfo(Schema key_schema, std::string name, std::unique_ptr<Index> index, index_oid_t oid,
-            std::string table_name)
+  IndexInfo(Schema key_schema, std::string name, std::unique_ptr<Index> index, index_oid_t oid, std::string table_name)
       : key_schema_{std::move(key_schema)},
         name_{std::move(name)},
         index_{std::move(index)},
@@ -113,8 +112,7 @@ class Catalog {
    *         if a table with that name already exists.
    */
   auto CreateTable(const std::string &table_name, const Schema &schema, StorageFormat format = StorageFormat::ROW,
-                   const std::vector<uint32_t> &pk_attrs = {}, bool auto_id = false,
-                   const std::string &location = "")
+                   const std::vector<uint32_t> &pk_attrs = {}, bool auto_id = false, const std::string &location = "")
       -> std::shared_ptr<TableInfo> {
     std::lock_guard lk(latch_);
     if (table_names_.find(table_name) != table_names_.end()) {
@@ -185,8 +183,7 @@ class Catalog {
     switch (format) {
       case StorageFormat::ROW:
         if (bpm_ != nullptr) {
-          storage =
-              std::make_unique<TableHeap>(bpm_, std::make_shared<Schema>(schema), first_page_id, last_page_id);
+          storage = std::make_unique<TableHeap>(bpm_, std::make_shared<Schema>(schema), first_page_id, last_page_id);
         }
         break;
       case StorageFormat::PARQUET:
@@ -270,8 +267,8 @@ class Catalog {
    * @return The new index's metadata, or NULL_INDEX_INFO if the table is missing / has no storage.
    */
   template <size_t KeySize>
-  auto CreateIndex(const std::string &index_name, const std::string &table_name,
-                   const std::vector<uint32_t> &key_attrs) -> std::shared_ptr<IndexInfo> {
+  auto CreateIndex(const std::string &index_name, const std::string &table_name, const std::vector<uint32_t> &key_attrs)
+      -> std::shared_ptr<IndexInfo> {
     std::lock_guard lk(latch_);
     auto table_info = GetTable(table_name);
     if (table_info == NULL_TABLE_INFO || table_info->storage_ == nullptr) {
@@ -317,7 +314,10 @@ class Catalog {
       // gathered (key, RID) batch by the comparator, then build packed leaves left-to-right and the
       // internal levels bottom-up, instead of N independent descents-with-splits.
       for (idx_t row = 0; row < count; row++) {
-        index->InsertEntry(keys.data() + row * KeySize, key_width, RID(rid_data[row]));
+        if (!index->InsertEntry(keys.data() + row * KeySize, key_width, RID(rid_data[row]))) {
+          index->FreeAllPages();
+          throw ExecutionException("cannot create unique index '" + index_name + "': duplicate key");
+        }
       }
     }
 

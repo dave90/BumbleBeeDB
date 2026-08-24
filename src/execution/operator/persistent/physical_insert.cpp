@@ -17,28 +17,15 @@
 #include <vector>
 
 #include "catalog/catalog.h"
-#include "execution/operator/resolve_table_storage.h"
 #include "common/exception.h"
 #include "execution/operator/persistent/index_maintenance.h"
 #include "fmt/format.h"
 #include "parallel/pipeline.h"
 #include "parallel/pipeline_builder.h"
-#include "storage/mvcc/mvcc.h"
-#include "storage/table/table_heap.h"
 #include "type/value.h"
-#include "type/vector/operations/vector_operations.h"
 #include "type/vector/vector.h"
 
 namespace bumblebee {
-
-static auto SchemaTypes(const Schema &schema) -> std::vector<LogicalType> {
-  std::vector<LogicalType> types;
-  types.reserve(schema.GetColumnCount());
-  for (const auto &c : schema.GetColumns()) {
-    types.push_back(c.GetType());
-  }
-  return types;
-}
 
 /** @brief The running count of inserted rows (a per-task atomic add). */
 struct InsertGlobalSinkState : GlobalSinkState {
@@ -81,46 +68,14 @@ auto PhysicalInsert::Sink(ExecutionContext & /*context*/, DataChunk &input, Glob
 void PhysicalInsert::Combine(ExecutionContext &context, GlobalSinkState &gstate, LocalSinkState &lstate) const {
   auto &ls = static_cast<InsertLocalSinkState &>(lstate);
   auto info = context.client_.catalog_.GetTable(table_oid_);
-  auto *heap = ResolveTableStorage<TableHeap>(context.client_, table_oid_, "Insert", "a row-format heap");
-  auto pk = FindPrimaryKeyIndex(context.client_.catalog_, *info);
+  if (info == nullptr) {
+    throw ExecutionException("Insert: table disappeared during execution");
+  }
 
   idx_t total = 0;
   for (auto &batch : ls.batches_) {
-    const idx_t n = batch->GetSize();
-    total += n;
-
-    // Auto `_id` primary key: the VALUES supply the user columns; we prepend column 0 with the next block
-    // of the per-table counter, producing the full-width row the heap expects.
-    DataChunk widened;
-    DataChunk *to_insert = batch.get();
-    if (info->auto_id_) {
-      const int64_t start = info->next_id_.fetch_add(static_cast<int64_t>(n));
-      widened.Initialize(SchemaTypes(info->schema_));
-      // Column 0 (`_id`, BIGINT): the contiguous sequence [start, start + n) written in one vectorized,
-      // type-templated pass — a tight linear store, no per-row Value boxing.
-      VectorOperations::GenerateSequence(widened.data_[0], n, start, /*increment=*/1);
-      // Columns 1..k: the user columns referenced zero-copy from the buffered batch (no per-cell copy) —
-      // the same vectors the non-auto-id path feeds straight to MvccInsert.
-      for (idx_t c = 0; c < batch->ColumnCount(); c++) {
-        widened.data_[c + 1].Reference(batch->data_[c]);
-      }
-      widened.SetCardinality(n);
-      to_insert = &widened;
-    }
-
-    Vector rids{LogicalType{LogicalTypeId::BIGINT}};
-
-    // The primary-key index is a stable key -> RID directory: route the insert through it so a key whose
-    // tuple was deleted revives that slot, a live key is rejected as a duplicate, and a fresh key appends a
-    // new tuple + index entry. A table with no PK index (legacy, direct-catalog) just appends.
-    if (pk != nullptr) {
-      // An auto `_id` was just minted from the table's monotonic counter, so the index cannot already
-      // hold it: the probe that classifies duplicate/revive/new is skippable (see InsertOrRevive).
-      InsertOrRevive(&context.client_.txn_mgr_, context.client_.txn_, table_oid_, *heap, *pk, *to_insert, rids,
-                     /*keys_are_fresh=*/info->auto_id_);
-    } else {
-      MvccInsert(&context.client_.txn_mgr_, context.client_.txn_, table_oid_, *heap, *to_insert, rids);
-    }
+    total += InsertTableChunk(context.client_.catalog_, &context.client_.txn_mgr_, context.client_.txn_, *info,
+                              *batch);
   }
 
   static_cast<InsertGlobalSinkState &>(gstate).count_.fetch_add(total, std::memory_order_relaxed);

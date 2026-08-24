@@ -1,5 +1,29 @@
 # Coding Style Guide
 
+## Python binding boundary
+
+The frozen Python API, ownership contract, and exception hierarchy live in `python/API.md`.
+
+Python and pybind11 headers are confined to `python/`. Core engine code must not hold Python
+objects, call Python, or acquire the GIL. Binding methods copy Python inputs at the boundary and
+release the GIL around parsing, binding, planning, execution, transaction work, blocking waits,
+I/O, native result preparation, native ingestion, and close. Only argument inspection, conversion
+of Python-owned scalar objects, Python result construction, and exception translation may hold the
+GIL. Any exception to this policy must be documented in both the binding source and
+`python/API.md` and receive a dedicated GIL progress test.
+
+The binding layout mirrors the established BumbleBee Datalog package. `python/src/bindings.cpp`
+contains only pybind11 class/function registration and `PYBIND11_MODULE`. Wrapper declarations live
+under `python/src/include/`; `PyResult`, `PyConnection`, and `PyDatabase` behavior lives in matching
+translation units. DataFrame conversion, native/Python value conversion, exception translation, and
+Python-only utilities remain separate implementation units. Do not grow a second monolithic binding
+file or move implementation bodies back into the module entry point.
+
+Shared ownership must be passed explicitly at native factory and binding boundaries. Production code
+must not use `std::enable_shared_from_this` or recover ownership with `shared_from_this()`; connection
+creation, operation admission, and Python transaction contexts receive their existing holders from
+their callers.
+
 ## Naming
 
 | Entity | Case | Example                    |

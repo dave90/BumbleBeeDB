@@ -222,7 +222,7 @@ TEST(MvccWriteTest, WriteWriteConflictSecondAborts) {
   auto *t3 = f.tm.Begin();
   f.Update(t2, rid, 1, "t2");  // t2 grabs the row (temp-stamps the base); same-length name
 
-  EXPECT_THROW(f.Update(t3, rid, 1, "t3"), ExecutionException);
+  EXPECT_THROW(f.Update(t3, rid, 1, "t3"), ConflictException);
   EXPECT_EQ(t3->GetTransactionState(), TransactionState::TAINTED) << "conflicting writer is tainted";
 
   ASSERT_TRUE(f.tm.Commit(t2));
@@ -511,7 +511,7 @@ TEST(MvccWriteTest, ConcurrentWriteWriteExactlyOneWins) {
         if (f.tm.Commit(txn)) {
           committed.fetch_add(1);
         }
-      } catch (const ExecutionException &) {
+      } catch (const ConflictException &) {
         f.tm.Abort(txn);  // write-write conflict — this loser rolls back
       }
     });

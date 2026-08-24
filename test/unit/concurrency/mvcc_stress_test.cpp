@@ -172,7 +172,7 @@ TEST(MvccStressTest, ConcurrentTransfersConserveTotal) {
           } else {
             aborted.fetch_add(1);
           }
-        } catch (const ExecutionException &) {
+        } catch (const ConflictException &) {
           f.tm.Abort(txn);  // write-write conflict — this transfer is rolled back
           aborted.fetch_add(1);
         }

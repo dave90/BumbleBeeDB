@@ -10,7 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <atomic>
+#include <barrier>
 #include <memory>
+#include <thread>  // NOLINT
 #include <vector>
 
 #include "catalog/catalog.h"
@@ -162,6 +165,64 @@ TEST(CatalogIndexTest, CompositeKeyIndexBuildsAndScans) {
   std::vector<RID> none;
   index_info->index_->ScanKey(miss.data(), ks.GetInlinedStorageSize(), &none);
   EXPECT_TRUE(none.empty());
+}
+
+TEST(CatalogIndexTest, ConcurrentUniqueInsertHasExactlyOnePublisher) {
+  MemoryDiskManager dm(1024);
+  BufferPoolManager bpm(32, &dm);
+  Catalog catalog(&bpm);
+  auto table = catalog.CreateTable("t", MakeSchema());
+  ASSERT_NE(table->storage_, nullptr);
+  auto index_info = catalog.CreateIndex<8>("t_id_idx", "t", {0});
+  ASSERT_NE(index_info, NULL_INDEX_INFO);
+
+  std::vector<data_t> key(8, 0);
+  Store<int32_t>(42, key.data() + index_info->key_schema_.GetColumn(0).GetOffset());
+
+  constexpr int kThreads = 8;
+  std::barrier start(kThreads);
+  std::atomic<int> publishers{0};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int thread = 0; thread < kThreads; thread++) {
+    threads.emplace_back([&, thread] {
+      start.arrive_and_wait();
+      if (index_info->index_->InsertEntry(key.data(), index_info->key_schema_.GetInlinedStorageSize(),
+                                          RID(100 + thread, 0))) {
+        publishers.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(publishers.load(), 1);
+  std::vector<RID> result;
+  index_info->index_->ScanKey(key.data(), index_info->key_schema_.GetInlinedStorageSize(), &result);
+  EXPECT_EQ(result.size(), 1U);
+}
+
+TEST(CatalogIndexTest, UniqueIndexBuildRejectsDuplicateKeys) {
+  MemoryDiskManager dm(1024);
+  BufferPoolManager bpm(32, &dm);
+  Catalog catalog(&bpm);
+  auto schema = MakeSchema();
+  auto table = catalog.CreateTable("t", schema);
+  ASSERT_NE(table->storage_, nullptr);
+
+  DataChunk chunk;
+  chunk.Initialize(schema.GetTypes());
+  chunk.SetValue(0, 0, Value(7));
+  chunk.SetValue(1, 0, Value(10));
+  chunk.SetValue(0, 1, Value(7));
+  chunk.SetValue(1, 1, Value(20));
+  chunk.SetCardinality(2);
+  Vector rids{LogicalType{LogicalTypeId::BIGINT}};
+  table->storage_->Append(chunk, rids);
+
+  EXPECT_THROW(static_cast<void>(catalog.CreateIndex<8>("t_id_idx", "t", {0})), ExecutionException);
+  EXPECT_EQ(catalog.GetIndex("t_id_idx", "t"), NULL_INDEX_INFO);
 }
 
 }  // namespace bumblebee

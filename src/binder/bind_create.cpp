@@ -123,6 +123,22 @@ auto Binder::ResolveTypeName(duckdb_libpgquery::PGTypeName *type_name) -> Logica
       base_type = LogicalType::Decimal(static_cast<int>(*width), static_cast<int>(*scale));
     }
   }
+
+  // Array bounds belong to the type itself, not only to CREATE TABLE columns: the same resolver is
+  // used by CAST, so keeping them here makes CAST(ARRAY[...] AS INT[3]) preserve the fixed type.
+  if (type_name->arrayBounds != nullptr) {
+    if (type_name->arrayBounds->length != 1) {
+      throw NotImplementedException("only one-dimensional arrays are supported");
+    }
+    const auto *bound =
+        reinterpret_cast<duckdb_libpgquery::PGValue *>(type_name->arrayBounds->head->data.ptr_value);
+    int64_t size = -1;
+    if (bound != nullptr && bound->type == duckdb_libpgquery::T_PGInteger) {
+      size = static_cast<int64_t>(bound->val.ival);
+    }
+    base_type =
+        size >= 0 ? LogicalType::Array(base_type, static_cast<idx_t>(size)) : LogicalType::List(base_type);
+  }
   return base_type;
 }
 
@@ -147,21 +163,9 @@ auto Binder::BindColumnDefinition(duckdb_libpgquery::PGColumnDef *cdef) -> Colum
     }
   }
 
-  // A non-null arrayBounds means the column was declared as an array: `INT[]` or `INT[3]`.
-  // Postgres gives `INT[]` an arrayBounds list with a single element whose value is -1.
-  if (type_name->arrayBounds != nullptr) {
-    if (type_name->arrayBounds->length != 1) {
-      throw NotImplementedException("only one-dimensional arrays are supported");
-    }
-    const auto *bound = reinterpret_cast<duckdb_libpgquery::PGValue *>(type_name->arrayBounds->head->data.ptr_value);
-    int64_t size = -1;
-    if (bound != nullptr && bound->type == duckdb_libpgquery::T_PGInteger) {
-      size = static_cast<int64_t>(bound->val.ival);
-    }
-    auto array_type =
-        size >= 0 ? LogicalType::Array(base_type, static_cast<idx_t>(size)) : LogicalType::List(base_type);
+  if (base_type.GetTypeId() == LogicalTypeId::LIST || base_type.GetTypeId() == LogicalTypeId::ARRAY) {
     // LIST and ARRAY payloads live outside the row, so the column is variable-length.
-    return Column{colname, array_type, 0};
+    return Column{colname, base_type, 0};
   }
 
   if (base_type.GetTypeId() == LogicalTypeId::STRING) {

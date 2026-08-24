@@ -17,6 +17,19 @@ project(BumbleBee LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2")
 
+if(SKBUILD)
+    set(BUMBLEBEE_DEFAULT_SHELL OFF)
+    set(BUMBLEBEE_DEFAULT_TESTS OFF)
+    set(BUMBLEBEE_DEFAULT_PYTHON ON)
+else()
+    set(BUMBLEBEE_DEFAULT_SHELL ON)
+    set(BUMBLEBEE_DEFAULT_TESTS ON)
+    set(BUMBLEBEE_DEFAULT_PYTHON OFF)
+endif()
+option(BUMBLEBEE_BUILD_SHELL "Build the BumbleBee interactive shell" ${BUMBLEBEE_DEFAULT_SHELL})
+option(BUMBLEBEE_BUILD_TESTS "Build the native GoogleTest suite" ${BUMBLEBEE_DEFAULT_TESTS})
+option(BUMBLEBEE_BUILD_PYTHON "Build the private Python extension" ${BUMBLEBEE_DEFAULT_PYTHON})
+
 # ============================================================================
 # Third-party dependencies.
 #
@@ -44,13 +57,21 @@ FetchContent_Declare(
         fmt
         URL https://github.com/fmtlib/fmt/archive/refs/tags/11.1.3.zip
 )
+# A wheel must not inherit fmt's install rules: doing so bundles its static library,
+# headers, pkg-config file, and CMake package metadata under site-packages/lib and
+# site-packages/include. BumbleBeeDB links fmt into its private extension instead.
+if(SKBUILD)
+    set(FMT_INSTALL OFF CACHE BOOL "Do not install bundled fmt into Python wheels" FORCE)
+endif()
 FetchContent_MakeAvailable(fmt)
 
-FetchContent_Declare(
-        googletest
-        URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
-FetchContent_MakeAvailable(googletest)
+if(BUMBLEBEE_BUILD_TESTS)
+    FetchContent_Declare(
+            googletest
+            URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+    )
+    FetchContent_MakeAvailable(googletest)
+endif()
 
 # ============================================================================
 # Project-wide compile options. Everything below here is OUR code.
@@ -107,6 +128,7 @@ list(FILTER SRC_FILES EXCLUDE REGEX ".*main\\.cpp")
 list(FILTER SRC_FILES EXCLUDE REGEX ".*/third_party/libpg_query/.*")
 
 add_library(bumblebee_lib ${SRC_FILES})
+set_target_properties(bumblebee_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(bumblebee_lib PUBLIC
         ${PROJECT_SOURCE_DIR}/src/include
 )
@@ -129,40 +151,51 @@ target_compile_definitions(bumblebee_lib
 set(BBDB_VECTOR_SIZE 1024 CACHE STRING "STANDARD_VECTOR_SIZE for this build (lower it for multi-chunk tests)")
 target_compile_definitions(bumblebee_lib PUBLIC BUMBLEBEE_STANDARD_VECTOR_SIZE=${BBDB_VECTOR_SIZE})
 
-# ----------------------------------------
-# linenoise: vendored single-file C line editor for the interactive shell (arrow keys + history).
-# Built as its own C target so the C++ prelude/force-include never reaches it.
-# ----------------------------------------
-add_library(linenoise STATIC third_party/linenoise/linenoise.c)
-target_include_directories(linenoise PUBLIC ${PROJECT_SOURCE_DIR}/third_party/linenoise)
+if(BUMBLEBEE_BUILD_SHELL)
+    # linenoise is a C target so the C++ force-include prelude never reaches it.
+    add_library(linenoise STATIC third_party/linenoise/linenoise.c)
+    target_include_directories(linenoise PUBLIC ${PROJECT_SOURCE_DIR}/third_party/linenoise)
+
+    add_executable(${PROJECT_NAME} src/main/main.cpp)
+    target_link_libraries(${PROJECT_NAME} PRIVATE bumblebee_lib linenoise)
+endif()
 
 # ----------------------------------------
-# Main application executable
+# Optional private Python extension (wheel builds enable this and disable shell/tests).
 # ----------------------------------------
-add_executable(${PROJECT_NAME} src/main/main.cpp)
-target_link_libraries(${PROJECT_NAME} PRIVATE bumblebee_lib linenoise)
+if(BUMBLEBEE_BUILD_PYTHON)
+    find_package(pybind11 CONFIG REQUIRED)
+    file(GLOB_RECURSE PYTHON_SRC_FILES CONFIGURE_DEPENDS
+            ${PROJECT_SOURCE_DIR}/python/src/*.cpp
+    )
+    pybind11_add_module(_native MODULE ${PYTHON_SRC_FILES})
+    target_link_libraries(_native PRIVATE bumblebee_lib)
+    target_include_directories(_native PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/include
+            ${PROJECT_SOURCE_DIR}/python/src
+    )
+    target_compile_definitions(_native PRIVATE BUMBLEBEEDB_VERSION="0.1.0")
+    install(TARGETS _native
+            LIBRARY DESTINATION bumblebeedb
+            RUNTIME DESTINATION bumblebeedb)
+endif()
 
 # ----------------------------------------
 # Unit tests
 # ----------------------------------------
-enable_testing()
+if(BUMBLEBEE_BUILD_TESTS)
+    enable_testing()
 
-# Unit test sources
-file(GLOB_RECURSE UNIT_TEST_SOURCES
-        ${PROJECT_SOURCE_DIR}/test/unit/*.cpp
-)
+    file(GLOB_RECURSE UNIT_TEST_SOURCES
+            ${PROJECT_SOURCE_DIR}/test/unit/*.cpp
+    )
 
-add_executable(unit_tests ${UNIT_TEST_SOURCES} )
+    add_executable(unit_tests ${UNIT_TEST_SOURCES})
+    target_link_libraries(unit_tests bumblebee_lib gtest_main)
+    target_include_directories(unit_tests PRIVATE
+            ${PROJECT_SOURCE_DIR}/src/include
+            ${PROJECT_SOURCE_DIR}/test/unit/include)
 
-target_link_libraries(unit_tests
-        bumblebee_lib
-        gtest_main
-)
-
-target_include_directories(unit_tests PRIVATE
-        ${PROJECT_SOURCE_DIR}/src/include
-        ${PROJECT_SOURCE_DIR}/test/unit/include
-)
-
-include(GoogleTest)
-gtest_discover_tests(unit_tests)
+    include(GoogleTest)
+    gtest_discover_tests(unit_tests)
+endif()

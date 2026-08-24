@@ -48,7 +48,7 @@ class ExternalTableWriteTest : public ::testing::Test {
   auto Loc() -> std::string { return dir_.string(); }
 
   auto Storage() -> ParquetTable * {
-    return static_cast<ParquetTable *>(instance_.catalog_->GetTable("t")->storage_.get());
+    return static_cast<ParquetTable *>(instance_.GetCatalog().GetTable("t")->storage_.get());
   }
 
   auto Manifest() -> ParquetManifest {
@@ -121,11 +121,13 @@ TEST_F(ExternalTableWriteTest, CrossProcessLockFileBlocksAndGoesStale) {
   Run("INSERT INTO t VALUES (1,'x');");
   // A foreign (fresh) lock file blocks the write even though the in-process mutex is free.
   auto lock_path = dir_ / ParquetManifestIO::LOCK_FILE;
-  { std::ofstream(lock_path) << "held"; }
+  {
+    std::ofstream(lock_path) << "held";
+  }
   EXPECT_THROW(Run("INSERT INTO t VALUES (2,'y');"), ExecutionException);
 
   // Backdate it beyond the staleness threshold: it is treated as leaked by a crash and replaced.
-  struct utimbuf old_times {};
+  struct utimbuf old_times{};
   old_times.actime = old_times.modtime = time(nullptr) - ExternalWriteGuard::STALE_LOCK_SECONDS - 5;
   ASSERT_EQ(utime(lock_path.c_str(), &old_times), 0);
   Run("INSERT INTO t VALUES (2,'y');");

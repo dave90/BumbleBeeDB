@@ -46,18 +46,18 @@ class BPlusTreeIndex : public Index {
   BPlusTreeIndex(std::unique_ptr<IndexMetadata> metadata, BufferPoolManager *bpm, page_id_t header_page_id)
       : Index(std::move(metadata)),
         comparator_(&metadata_->GetKeySchema()),
-        tree_(std::make_unique<TreeType>(typename TreeType::OpenExisting{}, metadata_->GetName(), header_page_id,
-                                         bpm, comparator_)) {}
+        tree_(std::make_unique<TreeType>(typename TreeType::OpenExisting{}, metadata_->GetName(), header_page_id, bpm,
+                                         comparator_)) {}
 
   auto GetHeaderPageId() const -> page_id_t override { return tree_->GetHeaderPageId(); }
   auto GetKeySize() const -> size_t override { return KeySize; }
 
   void FreeAllPages() override { tree_->FreeAllPages(); }
 
-  void InsertEntry(const_data_ptr_t key, uint32_t key_len, RID rid) override {
+  [[nodiscard]] auto InsertEntry(const_data_ptr_t key, uint32_t key_len, RID rid) -> bool override {
     KeyType index_key;
     index_key.SetFromKey(key, key_len);
-    tree_->Insert(index_key, rid);
+    return tree_->Insert(index_key, rid);
   }
 
   void DeleteEntry(const_data_ptr_t key, uint32_t key_len, RID /*rid*/) override {

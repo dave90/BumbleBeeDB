@@ -84,6 +84,65 @@ jobs:
         if: matrix.name == 'small-vector'
         run: BBDB_SLT_BIN=${{ matrix.build_dir }}/BumbleBee BBDB_SLT_SMALL_VECTOR=1 python3 -m pytest test/e2e -q
 
+  # Build an actual wheel for every first-release CPython/platform pair, install that artifact, and
+  # run the public API plus the in-process SQL corpus. Linux 3.12 also runs the durable/restart mode.
+  python-wheel:
+    name: wheel (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '${{ matrix.python }}' }
+      - name: Install system build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev ninja-build
+      - name: Install wheel and test tooling
+        run: python -m pip install --disable-pip-version-check build twine pytest numpy pandas
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+      - name: Install built artifact
+        run: python -m pip install --force-reinstall dist/*.whl
+      - name: Import and metadata smoke test
+        run: python -c "import importlib.metadata, bumblebeedb; assert bumblebeedb.__version__ == importlib.metadata.version('bumblebeedb')"
+      - name: Python tests and in-process SQL corpus
+        run: python -m pytest python/test -q
+      - name: Python durable/restart corpus
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: BBDB_PY_SLT_DURABLE=1 python -m pytest python/test/e2e/test_slt_python.py -q
+
+  # STANDARD_VECTOR_SIZE is compiled into the extension. This independent wheel proves the Python
+  # result/DataFrame paths and direct SQL adapter against the production code at width four.
+  python-small-vector:
+    name: wheel (small-vector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y uuid-dev ninja-build
+          python -m pip install --disable-pip-version-check build pytest numpy pandas
+      - name: Build and install small-vector wheel
+        env:
+          CMAKE_ARGS: -DBBDB_VECTOR_SIZE=4
+        run: |
+          python -m build --wheel
+          python -m pip install --force-reinstall dist/*.whl
+      - name: Small-vector Python matrix
+        env:
+          BBDB_PY_SLT_SMALL_VECTOR: '1'
+        run: |
+          python -m pytest python/test/e2e/test_slt_python.py -q
+          python -m pytest python/test/test_result.py python/test/test_result_types.py python/test/test_dataframe.py python/test/test_dataframe_types.py -q
+
   # ---------------------------------------------------------------------------
   # Style. Scoped to lines the PR actually changes: the tree still carries ~700
   # lines of pre-existing formatting drift (refactor.md W1), so a whole-tree gate
@@ -101,7 +160,7 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
           git-clang-format --diff "$base" -- \
-            $(git diff --name-only "$base" -- 'src/*' 'test/*' \
+            $(git diff --name-only "$base" -- 'src/*' 'test/*' 'python/src/*' \
               | grep -E '\.(cpp|h)$' || true) > fmt.diff || true
           if [ -s fmt.diff ] && ! grep -q "no modified files\|did not modify" fmt.diff; then
             echo "::error::clang-format would change these lines:"; cat fmt.diff; exit 1

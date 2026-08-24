@@ -38,9 +38,8 @@ namespace bumblebee {
  * pipeline that touches it" is a structural invariant. The registry is touched only
  * during `Initialize`, on the client thread; the hot path reads the cached raw pointers on each Pipeline.
  *
- * This version runs single-threaded (the client thread drains each pipeline in dependency order). The
- * counter-based parallel scheduler slots in behind the same `Pipeline`/`PipelineExecutor` without
- * changing them.
+ * A counter-based scheduler runs ready pipeline tasks on the client thread and its bounded native worker
+ * pool, while dependency counters release downstream pipelines without changing their executor shape.
  */
 class Executor {
  public:

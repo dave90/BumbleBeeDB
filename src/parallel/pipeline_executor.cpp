@@ -158,6 +158,9 @@ auto PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t initial_idx) 
 void PipelineExecutor::Run() {
   auto &source_chunk = *intermediate_chunks_[0];
   while (!finished_) {
+    if (context_.client_.txn_ != nullptr) {
+      context_.client_.txn_->ThrowIfCancellationRequested();
+    }
     if (pipeline_.stop_.load(std::memory_order_relaxed) || pipeline_.executor_.HasError()) {
       break;  // cancellation latency is bounded by one chunk
     }
@@ -179,6 +182,9 @@ void PipelineExecutor::Run() {
     if (ExecutePushInternal(source_chunk) == OperatorResultType::FINISHED) {
       finished_ = true;
     }
+  }
+  if (context_.client_.txn_ != nullptr) {
+    context_.client_.txn_->ThrowIfCancellationRequested();
   }
   PushFinalize();  // Combine — runs even on an early LIMIT exit
 }

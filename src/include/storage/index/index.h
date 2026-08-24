@@ -64,8 +64,11 @@ class Index {
 
   auto GetMetadata() const -> IndexMetadata * { return metadata_.get(); }
 
-  /** @brief Insert a (key, rid) entry. */
-  virtual void InsertEntry(const_data_ptr_t key, uint32_t key_len, RID rid) = 0;
+  /**
+   * @brief Atomically insert a unique (key, rid) entry.
+   * @return True when this call published the key; false when the key already exists.
+   */
+  [[nodiscard]] virtual auto InsertEntry(const_data_ptr_t key, uint32_t key_len, RID rid) -> bool = 0;
 
   /** @brief Delete the entry for `key`. */
   virtual void DeleteEntry(const_data_ptr_t key, uint32_t key_len, RID rid) = 0;

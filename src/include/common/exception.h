@@ -49,6 +49,14 @@ enum class ExceptionType {
   PLANNER = 12,
   /** Execution error. */
   EXECUTION = 13,
+  /** Work was attempted after database shutdown began. */
+  DATABASE_CLOSED = 14,
+  /** Invalid API/session usage. */
+  PROGRAMMING = 15,
+  /** Transaction or write conflict. */
+  CONFLICT = 16,
+  /** Invalid application data. */
+  DATA = 17,
 };
 
 /** Set to true to silence the exception messages the constructors print in debug builds. */
@@ -120,6 +128,14 @@ class Exception : public std::runtime_error {
         return "Planner";
       case ExceptionType::EXECUTION:
         return "Execution";
+      case ExceptionType::DATABASE_CLOSED:
+        return "Database Closed";
+      case ExceptionType::PROGRAMMING:
+        return "Programming";
+      case ExceptionType::CONFLICT:
+        return "Conflict";
+      case ExceptionType::DATA:
+        return "Data";
       default:
         return "Unknown";
     }
@@ -158,6 +174,31 @@ class NotImplementedException : public Exception {
 class ExecutionException : public Exception {
  public:
   explicit ExecutionException(const std::string &message) : Exception(ExceptionType::EXECUTION, message) {}
+};
+
+/** @brief Thrown when admission is attempted after database shutdown begins. */
+class DatabaseClosedException : public Exception {
+ public:
+  explicit DatabaseClosedException(const std::string &message)
+      : Exception(ExceptionType::DATABASE_CLOSED, message) {}
+};
+
+/** @brief Thrown for deterministic API/session misuse rather than SQL execution failure. */
+class ProgrammingException : public Exception {
+ public:
+  explicit ProgrammingException(const std::string &message) : Exception(ExceptionType::PROGRAMMING, message) {}
+};
+
+/** @brief Thrown for MVCC, uniqueness, or serialization conflicts. */
+class ConflictException : public Exception {
+ public:
+  explicit ConflictException(const std::string &message) : Exception(ExceptionType::CONFLICT, message) {}
+};
+
+/** @brief Thrown for invalid values supplied through a bulk/native data boundary. */
+class DataException : public Exception {
+ public:
+  explicit DataException(const std::string &message) : Exception(ExceptionType::DATA, message) {}
 };
 
 /**

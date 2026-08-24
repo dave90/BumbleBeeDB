@@ -98,6 +98,46 @@ class Transaction {
   auto GetReadTs() const -> timestamp_t { return read_ts_.load(); }
   auto GetCommitTs() const -> timestamp_t { return commit_ts_.load(); }
 
+  /**
+   * @brief Mark the transaction cooperatively cancelled if it is still open.
+   * @return True only for the caller that first requested cancellation.
+   */
+  auto RequestCancellation() -> bool {
+    std::lock_guard lock(finalize_mutex_);
+    const auto state = state_.load(std::memory_order_acquire);
+    if (state != TransactionState::RUNNING && state != TransactionState::TAINTED) {
+      return false;
+    }
+    bool expected = false;
+    return cancellation_requested_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+  }
+
+  auto IsCancellationRequested() const -> bool {
+    return cancellation_requested_.load(std::memory_order_acquire);
+  }
+
+  /** @brief Enter/leave an executing statement so timeout GC never rolls back underneath it. */
+  void EnterStatement() {
+    if (IsCancellationRequested()) {
+      throw ExecutionException("transaction was cancelled by its timeout");
+    }
+    active_statements_.fetch_add(1, std::memory_order_acq_rel);
+    const auto state = state_.load(std::memory_order_acquire);
+    if (IsCancellationRequested() || (state != TransactionState::RUNNING && state != TransactionState::TAINTED)) {
+      active_statements_.fetch_sub(1, std::memory_order_acq_rel);
+      throw ExecutionException("transaction is no longer active");
+    }
+  }
+
+  void LeaveStatement() { active_statements_.fetch_sub(1, std::memory_order_acq_rel); }
+  auto ActiveStatementCount() const -> size_t { return active_statements_.load(std::memory_order_acquire); }
+
+  void ThrowIfCancellationRequested() const {
+    if (IsCancellationRequested()) {
+      throw ExecutionException("transaction was cancelled by its timeout");
+    }
+  }
+
   /** @return True if the txn has been alive at least `timeout` as of `now` (a timeout candidate). */
   auto IsExpired(duration_t timeout, time_point_t now) const -> bool { return now - start_time_ >= timeout; }
 
@@ -168,6 +208,11 @@ class Transaction {
   std::atomic<TransactionState> state_{TransactionState::RUNNING};
   std::atomic<timestamp_t> read_ts_{0};
   std::atomic<timestamp_t> commit_ts_{INVALID_TXN_ID};
+  std::atomic<bool> cancellation_requested_{false};
+  std::atomic<size_t> active_statements_{0};
+
+  /** Serializes cancellation admission with commit/rollback finalization. */
+  std::mutex finalize_mutex_;
 
   std::mutex latch_;  // protects undo_logs_, write_set_, scan_predicates_
   std::vector<UndoLog> undo_logs_;

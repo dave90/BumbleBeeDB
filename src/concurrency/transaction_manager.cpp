@@ -100,23 +100,34 @@ static auto RidConflictsWithReads(TransactionManager *mgr, Transaction *txn, tab
   return false;
 }
 
-auto TransactionManager::Begin(IsolationLevel isolation_level) -> Transaction * {
+auto TransactionManager::BeginShared(IsolationLevel isolation_level) -> std::shared_ptr<Transaction> {
   std::unique_lock lock(txn_map_mutex_);
   auto txn_id = next_txn_id_.fetch_add(1);
   auto read_ts = last_commit_ts_.load();
   auto txn = std::make_shared<Transaction>(txn_id, isolation_level);
   txn->read_ts_.store(read_ts);
-  auto *txn_ref = txn.get();
-  txn_map_.insert({txn_id, std::move(txn)});
+  txn_map_.insert({txn_id, txn});
   running_txns_.AddTxn(read_ts);
-  return txn_ref;
+  return txn;
+}
+
+auto TransactionManager::Begin(IsolationLevel isolation_level) -> Transaction * {
+  return BeginShared(isolation_level).get();
 }
 
 auto TransactionManager::Commit(Transaction *txn) -> bool {
+  std::unique_lock finalize_lock(txn->finalize_mutex_);
+  if (txn->IsCancellationRequested()) {
+    finalize_lock.unlock();
+    Abort(txn);
+    throw ExecutionException("cannot commit: transaction was cancelled by its timeout");
+  }
+
   // Serializable backward validation. A fast pre-check outside the commit lock fails obvious
   // conflicts early; the authoritative check runs under commit_mutex_, which serializes commits so
   // the committed-txn set cannot change under us.
   if (txn->GetIsolationLevel() == IsolationLevel::SERIALIZABLE && !VerifyTxn(txn)) {
+    finalize_lock.unlock();
     Abort(txn);
     return false;
   }
@@ -129,6 +140,7 @@ auto TransactionManager::Commit(Transaction *txn) -> bool {
 
   if (txn->GetIsolationLevel() == IsolationLevel::SERIALIZABLE && !VerifyTxn(txn)) {
     commit_lock.unlock();
+    finalize_lock.unlock();
     Abort(txn);
     return false;
   }
@@ -161,7 +173,11 @@ auto TransactionManager::Commit(Transaction *txn) -> bool {
 }
 
 void TransactionManager::Abort(Transaction *txn) {
+  std::unique_lock finalize_lock(txn->finalize_mutex_);
   auto state = txn->state_.load();
+  if (state == TransactionState::ABORTED) {
+    return;
+  }
   if (state != TransactionState::RUNNING && state != TransactionState::TAINTED) {
     throw Exception("only a RUNNING or TAINTED transaction can abort");
   }
@@ -223,16 +239,9 @@ auto TransactionManager::GarbageCollection() -> GcStats {
   // drive it so old versions are reclaimed — and, per below, timed-out txns aborted — without an
   // explicit call.
 
-  // Phase 0 — enforce the transaction timeout. Abort any RUNNING/TAINTED txn older than txn_timeout_.
-  // Collect candidates under a shared lock, release it (Abort re-locks the map), then abort; each one
-  // becomes ABORTED and is therefore reclaimed by the sweep below in this same pass.
-  //
-  // TODO(async-cancellation): this is best-effort for a txn that is ACTIVELY executing on another
-  // thread at the instant it is reaped — the reaper rolls the write set back while the txn's own
-  // thread may still be adding writes, so a write appended after SnapshotWriteSets() escapes rollback.
-  // Safe for the intended target (idle/abandoned txns, no concurrent activity). A fully robust fix is
-  // cooperative cancellation: an atomic `aborted_` flag on Transaction that the reaper sets, which the
-  // write path (ApplyMvccModify etc.) and Commit check mid-operation and bail out on before mutating.
+  // Phase 0 — enforce the transaction timeout cooperatively. Active statements are only marked
+  // cancelled; their workers observe that flag at a chunk boundary and the owning Connection rolls
+  // back after execution reaches a safe exit. Idle transactions can be rolled back immediately.
   std::vector<std::shared_ptr<Transaction>> expired;
   {
     std::shared_lock lock(txn_map_mutex_);
@@ -248,8 +257,12 @@ auto TransactionManager::GarbageCollection() -> GcStats {
   for (auto &txn : expired) {
     auto state = txn->state_.load();
     if (state == TransactionState::RUNNING || state == TransactionState::TAINTED) {
-      Abort(txn.get());
-      stats.timed_out_++;
+      if (txn->RequestCancellation()) {
+        stats.timed_out_++;
+      }
+      if (txn->ActiveStatementCount() == 0) {
+        Abort(txn.get());
+      }
     }
   }
 

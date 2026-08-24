@@ -46,7 +46,7 @@ const std::vector<LogicalType> kIdTwoInt{LogicalType(LogicalTypeId::BIGINT), Log
 /** @brief Append `n` rows of (k = fk(i), v = fv(i)) into `name`'s heap, spanning many pages. */
 static void SeedHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fk,
                      const std::function<int(int)> &fv) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   int written = 0;
@@ -68,9 +68,12 @@ static void SeedHeap(BumbleBeeInstance &db, const std::string &name, int n, cons
 }
 
 /** @brief Force intra-query parallelism: several workers and one heap page per parallel-scan morsel. */
-static void ConfigureParallel(BumbleBeeInstance &db) {
-  db.max_threads_ = 8;   // clamped to [1, MAX_THREADS]; spawns this many query workers
-  db.morsel_pages_ = 1;  // one page per morsel => many morsels => real parallel build
+static auto ParallelConfig(idx_t aggregate_partition_threshold = 0) -> DatabaseConfig {
+  DatabaseConfig config;
+  config.worker_threads_ = 8;  // database cap; one query may borrow all eight while they are idle
+  config.morsel_pages_ = 1;    // one page per morsel => many morsels => real parallel build
+  config.aggregate_partition_threshold_ = aggregate_partition_threshold;
+  return config;
 }
 
 /** @brief Run `sql` and collect the result as `num_cols`-wide integer rows. */
@@ -94,7 +97,7 @@ static auto RunIntRows(BumbleBeeInstance &db, const std::string &sql, int num_co
  *  The chunk types come from the table's own schema, so the VARCHAR column matches exactly. */
 static void SeedStringHeap(BumbleBeeInstance &db, const std::string &name, int n, const std::function<int(int)> &fg,
                            const std::function<std::string(int)> &fs) {
-  auto info = db.catalog_->GetTable(name);
+  auto info = db.GetCatalog().GetTable(name);
   auto *heap = dynamic_cast<TableHeap *>(info->storage_.get());
   ASSERT_NE(heap, nullptr);
   std::vector<LogicalType> types;  // [_id BIGINT, g INT, s VARCHAR]
@@ -174,8 +177,7 @@ TEST(ParallelExecutionTest, ParallelHashJoinMatchesSerial) {
     }
   }
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE a(k INT, v INT);", noop));
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE b(k INT, v INT);", noop));
@@ -190,6 +192,8 @@ TEST(ParallelExecutionTest, ParallelHashJoinMatchesSerial) {
     }
     ASSERT_EQ(got, expected) << "mismatch on repeat " << rep;
   }
+  EXPECT_GT(db.GetDatabase()->PeakWorkerSlots(), 1U)
+      << "the database worker budget never reached the executor's wide hash-join pipelines";
 }
 
 // Parallel SEMI/ANTI hash join (IN / NOT IN subquery): the subquery side builds across workers, the
@@ -209,8 +213,7 @@ TEST(ParallelExecutionTest, ParallelSemiAntiJoinMatchesSerial) {
     (key_a(i) < 128 ? expected_semi : expected_anti).insert(val_a(i));
   }
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE a(k INT, v INT);", noop));
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE b(k INT, v INT);", noop));
@@ -249,8 +252,7 @@ TEST(ParallelExecutionTest, ParallelHashAggregateMatchesSerial) {
     e.second += val(i);
   }
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(g INT, v INT);", noop));
   SeedHeap(db, "t", kRows, grp, val);
@@ -292,8 +294,7 @@ TEST(ParallelExecutionTest, ParallelGroupedStringMinMaxMatchesSerial) {
     }
   }
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(g INT, s VARCHAR);", noop));
   SeedStringHeap(db, "t", kRows, grp, sval);
@@ -318,8 +319,7 @@ TEST(ParallelExecutionTest, ParallelUngroupedAggregateMatchesSerial) {
     expected_sum += val(i);
   }
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(k INT, v INT);", noop));
   SeedHeap(db, "t", kRows, [](int i) { return i; }, val);
@@ -339,9 +339,7 @@ TEST(ParallelExecutionTest, ParallelUngroupedAggregateMatchesSerial) {
 TEST(ParallelExecutionTest, ParallelHighCardinalityAggregateMatchesSerial) {
   const int kRows = 600000;  // every row its own group; ~75k groups per worker
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
-  db.agg_partition_threshold_ = 10000;  // far below each task's group count: all tasks partition
+  BumbleBeeInstance db(ParallelConfig(10000));
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(k INT, v INT);", noop));
   // Every row its own group; v = k % 97 gives a checkable SUM.
@@ -378,9 +376,7 @@ TEST(ParallelExecutionTest, HighCardinalityStringMinMaxSurvivesRepartition) {
     return std::string(5 - s.size(), '0') + s;
   };
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
-  db.agg_partition_threshold_ = 10000;  // force the partitioned path
+  BumbleBeeInstance db(ParallelConfig(10000));
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(g INT, s VARCHAR);", noop));
   SeedStringHeap(db, "t", kRows, grp, sval);
@@ -410,8 +406,7 @@ TEST(ParallelExecutionTest, HighCardinalityStringMinMaxSurvivesRepartition) {
 TEST(ParallelExecutionTest, ParallelScanCollectorPreservesSerialOrder) {
   const int kRows = 6000;
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(k INT, v INT);", noop));
   SeedHeap(db, "t", kRows, [](int i) { return i; }, [](int i) { return i * 3; });
@@ -439,8 +434,7 @@ TEST(ParallelExecutionTest, ParallelSortIsFullyOrdered) {
   }
   std::sort(expected.begin(), expected.end());
 
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE t(k INT, v INT);", noop));
   SeedHeap(db, "t", kRows, key, [](int i) { return i; });
@@ -464,8 +458,7 @@ TEST(ParallelExecutionTest, ParallelSortIsFullyOrdered) {
 // but this must succeed and stay unique.
 TEST(ParallelExecutionTest, ParallelUpdateKeyPermutationSucceeds) {
   const int kRows = 3000;
-  BumbleBeeInstance db;
-  ConfigureParallel(db);
+  BumbleBeeInstance db(ParallelConfig());
   NoopWriter noop;
   ASSERT_TRUE(db.ExecuteSql("CREATE TABLE p(id INT PRIMARY KEY, v INT);", noop));
 

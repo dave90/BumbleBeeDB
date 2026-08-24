@@ -476,6 +476,34 @@ auto Binder::BindConstant(duckdb_libpgquery::PGAConst *node) -> std::unique_ptr<
   throw NotImplementedException(fmt::format("unsupported pg value: {}", Binder::NodeTagToString(val.type)));
 }
 
+auto Binder::BindArray(duckdb_libpgquery::PGArrayExpr *node) -> std::unique_ptr<BoundExpression> {
+  if (node->multidims) {
+    throw NotImplementedException("multidimensional ARRAY literals are not supported");
+  }
+  if (node->elements == nullptr || node->elements->length == 0) {
+    throw BinderException("an empty ARRAY literal needs an explicit element type");
+  }
+
+  std::vector<Value> values;
+  LogicalType element_type{LogicalTypeId::UNKNOWN};
+  for (auto cell = node->elements->head; cell != nullptr; cell = cell->next) {
+    auto expression = BindExpression(reinterpret_cast<duckdb_libpgquery::PGNode *>(cell->data.ptr_value));
+    const auto *constant = dynamic_cast<const BoundConstant *>(expression.get());
+    if (constant == nullptr) {
+      throw NotImplementedException("ARRAY literals currently support constant elements only");
+    }
+    element_type = LogicalType::CommonType(element_type, constant->val_.GetType());
+    values.push_back(constant->val_);
+  }
+  if (element_type.GetTypeId() == LogicalTypeId::UNKNOWN) {
+    throw BinderException("an all-NULL ARRAY literal needs an explicit element type");
+  }
+  for (auto &value : values) {
+    value = value.CastAs(element_type);
+  }
+  return std::make_unique<BoundConstant>(Value::List(LogicalType::List(element_type), std::move(values)));
+}
+
 auto Binder::BindColumnRef(duckdb_libpgquery::PGColumnRef *node) -> std::unique_ptr<BoundExpression> {
   BUMBLEBEE_ASSERT(node != nullptr, "nullptr");
   auto *fields = node->fields;
@@ -540,6 +568,33 @@ auto Binder::BindFuncCall(duckdb_libpgquery::PGFuncCall *root) -> std::unique_pt
     for (auto node = root->args->head; node != nullptr; node = node->next) {
       children.push_back(BindExpression(static_cast<duckdb_libpgquery::PGNode *>(node->data.ptr_value)));
     }
+  }
+
+  // libpg_query normalizes SQL ARRAY[...] syntax to a construct_array(...) function call.
+  // Fold a literal array into one owning Value at bind time so the ordinary constant-vector path
+  // can carry LIST/ARRAY values without adding Python- or frontend-specific execution behavior.
+  if (function_name == "construct_array") {
+    if (children.empty()) {
+      throw BinderException("an empty ARRAY literal needs an explicit element type");
+    }
+    LogicalType element_type{LogicalTypeId::UNKNOWN};
+    std::vector<Value> values;
+    values.reserve(children.size());
+    for (const auto &child : children) {
+      const auto *constant = dynamic_cast<const BoundConstant *>(child.get());
+      if (constant == nullptr) {
+        throw NotImplementedException("ARRAY literals currently support constant elements only");
+      }
+      element_type = LogicalType::CommonType(element_type, constant->val_.GetType());
+      values.push_back(constant->val_);
+    }
+    if (element_type.GetTypeId() == LogicalTypeId::UNKNOWN) {
+      throw BinderException("an all-NULL ARRAY literal needs an explicit element type");
+    }
+    for (auto &value : values) {
+      value = value.CastAs(element_type);
+    }
+    return std::make_unique<BoundConstant>(Value::List(LogicalType::List(element_type), std::move(values)));
   }
 
   if (function_name == "min" || function_name == "max" || function_name == "first" || function_name == "last" ||
@@ -945,6 +1000,8 @@ auto Binder::BindExpression(duckdb_libpgquery::PGNode *node) -> std::unique_ptr<
       return BindColumnRef(reinterpret_cast<duckdb_libpgquery::PGColumnRef *>(node));
     case duckdb_libpgquery::T_PGAConst:
       return BindConstant(reinterpret_cast<duckdb_libpgquery::PGAConst *>(node));
+    case duckdb_libpgquery::T_PGArrayExpr:
+      return BindArray(reinterpret_cast<duckdb_libpgquery::PGArrayExpr *>(node));
     case duckdb_libpgquery::T_PGResTarget:
       return BindResTarget(reinterpret_cast<duckdb_libpgquery::PGResTarget *>(node));
     case duckdb_libpgquery::T_PGAStar:
@@ -975,6 +1032,22 @@ auto Binder::BindExpression(duckdb_libpgquery::PGNode *node) -> std::unique_ptr<
 auto Binder::BindTypeCast(duckdb_libpgquery::PGTypeCast *root) -> std::unique_ptr<BoundExpression> {
   auto child = BindExpression(root->arg);
   auto target = ResolveTypeName(root->typeName);
+  if (const auto *constant = dynamic_cast<const BoundConstant *>(child.get());
+      constant != nullptr &&
+      (constant->val_.GetType().GetTypeId() == LogicalTypeId::LIST ||
+       constant->val_.GetType().GetTypeId() == LogicalTypeId::ARRAY) &&
+      (target.GetTypeId() == LogicalTypeId::LIST || target.GetTypeId() == LogicalTypeId::ARRAY)) {
+    if (target.GetTypeId() == LogicalTypeId::ARRAY &&
+        constant->val_.GetChildren().size() != target.GetListData().size_) {
+      throw BinderException("ARRAY literal length does not match the fixed target type");
+    }
+    std::vector<Value> values;
+    values.reserve(constant->val_.GetChildren().size());
+    for (const auto &value : constant->val_.GetChildren()) {
+      values.push_back(value.CastAs(target.GetChildType()));
+    }
+    return std::make_unique<BoundConstant>(Value::List(target, std::move(values)));
+  }
   return std::make_unique<BoundTypeCast>(std::move(child), std::move(target));
 }
 

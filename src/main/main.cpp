@@ -151,18 +151,20 @@ static auto FindOneShotSql(int argc, char **argv) -> const char * {
 
 /** @brief Open the database `opts` describes and apply the session settings to it. */
 static auto MakeInstance(const ShellOptions &opts) -> std::unique_ptr<bumblebee::BumbleBeeInstance> {
-  auto instance = opts.in_memory
-                      ? std::make_unique<bumblebee::BumbleBeeInstance>(opts.txn_timeout)
-                      : std::make_unique<bumblebee::BumbleBeeInstance>(opts.db_path, opts.num_frames, opts.txn_timeout);
-  instance->prefer_external_ = opts.prefer_external;
-  instance->max_memory_ = opts.max_memory;
-  instance->max_threads_ = opts.max_threads;
-  instance->morsel_pages_ = opts.morsel_pages;
-  instance->morsel_size_ = opts.morsel_size;
+  bumblebee::DatabaseConfig config;
+  config.transaction_timeout_ = opts.txn_timeout;
+  config.frames_ = opts.num_frames;
+  config.prefer_external_ = opts.prefer_external;
+  config.max_memory_ = opts.max_memory;
+  config.worker_threads_ = opts.max_threads;
+  config.morsel_pages_ = opts.morsel_pages;
+  config.morsel_size_ = opts.morsel_size;
+  auto instance = opts.in_memory ? std::make_unique<bumblebee::BumbleBeeInstance>(config)
+                                 : std::make_unique<bumblebee::BumbleBeeInstance>(opts.db_path, config);
   // Seed the demo tables only when the catalog is empty and seeding is not suppressed — always for an
   // in-memory instance, and for a brand-new file so reopening an existing database does not fail on a
   // duplicate CREATE. The e2e harness passes `--no-seed` so each `.slt` file starts from a clean catalog.
-  if (!opts.no_seed && instance->catalog_->GetTableNames().empty()) {
+  if (!opts.no_seed && instance->GetCatalog().GetTableNames().empty()) {
     instance->GenerateMockTable();
   }
   return instance;
