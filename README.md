@@ -124,7 +124,7 @@ SELECT payload FROM events WHERE id > 1;
 ```
 
 External Parquet writes are copy-on-write and intentionally unavailable inside explicit
-transactions. `DROP TABLE` only removes the catalog entry—your Parquet files remain yours.
+transactions. `DROP TABLE` only removes the catalog entry, your Parquet files remain yours.
 
 ## Project map
 
