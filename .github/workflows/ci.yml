@@ -71,8 +71,12 @@ jobs:
         run: ./${{ matrix.build_dir }}/unit_tests
       - name: Unit tests (TSan, fail fast)
         if: matrix.name == 'tsan'
+        timeout-minutes: 120
         env:
-          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+          # BumbleBeeDB legitimately holds more locks than TSan's fixed 64-lock
+          # deadlock graph can represent. Keep race detection fail-fast, but disable
+          # that separate lock-order detector so its internal CHECK cannot hang CI.
+          TSAN_OPTIONS: halt_on_error=1:detect_deadlocks=0
         run: ./${{ matrix.build_dir }}/unit_tests
       - name: E2E
         if: matrix.name == 'release'

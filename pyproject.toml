@@ -1,13 +1,14 @@
 [build-system]
 requires = [
-  "scikit-build-core>=0.10",
+  "scikit-build-core>=1.0",
   "pybind11>=2.13",
+  "setuptools-scm>=8",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "bumblebeedb"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Embedded relational database with a native C++20 execution engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +27,7 @@ dataframe = ["numpy>=1.26", "pandas>=2.1"]
 test = ["pytest>=8", "numpy>=1.26", "pandas>=2.1"]
 
 [tool.scikit-build]
+minimum-version = "1.0"
 cmake.build-type = "Release"
 build-dir = "build-python"
 cmake.args = [
@@ -42,6 +44,12 @@ sdist.include = [
   "README.md",
   "LICENSE",
 ]
+
+[[tool.dynamic-metadata]]
+provider = "scikit_build_core.metadata.setuptools_scm"
+
+# The Git tag checked out by the release workflow is the package version.
+[tool.setuptools_scm]
 
 [tool.pytest.ini_options]
 testpaths = ["python/test"]

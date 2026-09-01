@@ -15,12 +15,15 @@ import bumblebeedb as bb
 
 def _assert_python_counter_progress(operation: Callable[[], None], minimum: int = 5_000) -> None:
     starting = threading.Event()
+    observing = threading.Event()
     finished = threading.Event()
     errors: list[BaseException] = []
 
     def run() -> None:
         starting.set()
         try:
+            if not observing.wait(timeout=2):
+                raise TimeoutError("the GIL observer did not start")
             operation()
         except BaseException as error:  # surface worker failures in the test thread
             errors.append(error)
@@ -31,6 +34,8 @@ def _assert_python_counter_progress(operation: Callable[[], None], minimum: int 
     worker.start()
     assert starting.wait(timeout=2)
     progress = 0
+    # Do not let a fast native operation finish before this thread is ready to observe it.
+    observing.set()
     while not finished.is_set():
         progress += 1
     worker.join(timeout=10)

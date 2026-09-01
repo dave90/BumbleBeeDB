@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version as distribution_version
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ import bumblebeedb as bb
 
 
 def test_import_version_and_default_constructor() -> None:
-    assert bb.__version__ == "0.1.0"
+    assert bb.__version__ == distribution_version("bumblebeedb")
     database = bb.db(frames=64)
     try:
         assert database.sql("SELECT 42 AS answer").tuples() == [(42,)]

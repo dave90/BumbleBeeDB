@@ -65,6 +65,12 @@ if(SKBUILD)
 endif()
 FetchContent_MakeAvailable(fmt)
 
+# The Python extension is a shared module.  Every static archive linked into it must be
+# position-independent on ELF platforms; fmt does not enable PIC for static builds by default.
+if(BUMBLEBEE_BUILD_PYTHON)
+    set_target_properties(fmt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
 if(BUMBLEBEE_BUILD_TESTS)
     FetchContent_Declare(
             googletest
@@ -165,6 +171,15 @@ endif()
 # ----------------------------------------
 if(BUMBLEBEE_BUILD_PYTHON)
     find_package(pybind11 CONFIG REQUIRED)
+
+    # scikit-build-core resolves the setuptools-scm version before configuring CMake. Keep a
+    # deterministic fallback for direct CMake builds of the private extension.
+    if(DEFINED SKBUILD_PROJECT_VERSION_FULL)
+        set(BUMBLEBEEDB_VERSION "${SKBUILD_PROJECT_VERSION_FULL}")
+    elseif(NOT DEFINED BUMBLEBEEDB_VERSION)
+        set(BUMBLEBEEDB_VERSION "0.0.0")
+    endif()
+
     file(GLOB_RECURSE PYTHON_SRC_FILES CONFIGURE_DEPENDS
             ${PROJECT_SOURCE_DIR}/python/src/*.cpp
     )
@@ -174,7 +189,7 @@ if(BUMBLEBEE_BUILD_PYTHON)
             ${PROJECT_SOURCE_DIR}/src/include
             ${PROJECT_SOURCE_DIR}/python/src
     )
-    target_compile_definitions(_native PRIVATE BUMBLEBEEDB_VERSION="0.1.0")
+    target_compile_definitions(_native PRIVATE BUMBLEBEEDB_VERSION="${BUMBLEBEEDB_VERSION}")
     install(TARGETS _native
             LIBRARY DESTINATION bumblebeedb
             RUNTIME DESTINATION bumblebeedb)
